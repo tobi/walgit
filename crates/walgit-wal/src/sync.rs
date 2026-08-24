@@ -26,6 +26,44 @@ impl<'a> ReadGuard<'a> {
     }
 }
 
+fn symlink_file(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(windows)]
+    {
+        if std::os::windows::fs::symlink_file(target, link).is_ok() {
+            return Ok(());
+        }
+        std::fs::copy(target, link).map(|_| ())
+    }
+}
+
+fn write_all_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut written = 0usize;
+        while written < buf.len() {
+            let n = file.seek_write(&buf[written..], offset + written as u64)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "write_all_at",
+                ));
+            }
+            written += n;
+        }
+        Ok(())
+    }
+}
+
 /// How much of the WAL a sync must bring to the local copy.
 ///
 /// `Refs` applies the checkpoint ref snapshot and every log entry's ref
@@ -282,7 +320,7 @@ pub(crate) async fn link_and_install_pack(
     idx_r?;
     let link = tmp_dir.join(format!("pack-{checksum}.pack"));
     let _ = std::fs::remove_file(&link);
-    std::os::unix::fs::symlink(target, &link)?;
+    symlink_file(target, &link)?;
     local
         .install_pack(&link, &idx_path, &extra)
         .instrument(span.clone())
@@ -335,7 +373,6 @@ pub(crate) async fn download_object(
     progress: Option<ProgressFn<'_>>,
 ) -> Result<(), WalError> {
     use futures::{StreamExt, TryStreamExt};
-    use std::os::unix::fs::FileExt;
     const CHUNK: u64 = 32 * 1024 * 1024;
     // 16 stripes in flight: one gRPC stream tops out around 10–20 MB/s from
     // a serverless host, the NIC well beyond 100 MB/s (a large repository's 2.1 GB idx took 217 s
@@ -412,7 +449,7 @@ pub(crate) async fn download_object(
                     )));
                 }
                 let n = bytes.len() as u64;
-                tokio::task::spawn_blocking(move || file.write_all_at(&bytes, start))
+                tokio::task::spawn_blocking(move || write_all_at(&file, &bytes, start))
                     .await
                     .map_err(|e| WalError::Corrupt(format!("write task failed: {e}")))??;
                 report(n);

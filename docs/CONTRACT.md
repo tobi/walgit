@@ -23,7 +23,7 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
   `GetResult::{NotModified,Object}`, `PutMode::{Overwrite,Create,Update(Version)}`, `PutBody::{Bytes,Stream,File}`,
   `PutOptions`, `StoreError::{NotFound,PreconditionFailed{current},Retryable,InvalidArgument,Other}`,
   `ObjectStoreExt`, `Prefixed`, `memory::MemoryStore`, `util::{collect,once,file_stream,backoff,retry}`),
-  placeholder modules `coord.rs`, `gcs.rs`, `s3.rs`.
+  placeholder modules `coord.rs`, `gcs.rs`, `s3.rs`, `azure.rs`.
 - `walgit-config`: `Config` for walgit.toml (+ `WALGIT__` env overrides, `PORT`); `Config::with_settings` accepts
   only `[bundles]`, `[maintenance]`, `[compaction]`, `[upstream]`, and `[integrations]` in repo-scoped settings.
 
@@ -159,12 +159,15 @@ pub enum CoordError { Store(StoreError), Decode(prost::DecodeError), Aborted, Re
 pub struct S3Store; impl S3Store { pub async fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self>; }
 // gcs.rs
 pub struct GcsStore; impl GcsStore { pub async fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self>; }
+// azure.rs
+pub struct AzureStore; impl AzureStore { pub async fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self>; }
 // lib.rs
 pub async fn open_store(cfg: &walgit_config::Config) -> anyhow::Result<DynStore>; // by cfg.store.backend, applies Prefixed(cfg.store_prefix())
 ```
 Contract tests: `crates/walgit-store/tests/contract.rs` with a `run_contract(store: DynStore)` suite executed for
 memory always, for s3 when `WALGIT_TEST_S3_ENDPOINT` set (bucket `WALGIT_TEST_BUCKET`, default "walgit-test"),
-for gcs when `WALGIT_TEST_GCS_BUCKET` set.
+for gcs when `WALGIT_TEST_GCS_BUCKET` set, for azure when `WALGIT_TEST_AZURE_ENDPOINT` set (account
+`WALGIT_TEST_AZURE_ACCOUNT`, default `devstoreaccount1`; key `AZURE_STORAGE_ACCOUNT_KEY`).
 
 ## walgit-wal (owner: Wal)
 

@@ -119,21 +119,66 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<u64> {
             // A mount-linked base (`pack-<sha>.pack` → store mount) is never rebuilt here:
             // the rebuild needs real files (compact_repo syncs Full first).
             let target = std::fs::read_link(&from)?;
+            #[cfg(unix)]
             std::os::unix::fs::symlink(target, &to)?;
+            #[cfg(windows)]
+            {
+                if std::os::windows::fs::symlink_file(&target, &to).is_err()
+                    && std::os::windows::fs::symlink_dir(&target, &to).is_err()
+                {
+                    // Last resort: skip mount-linked packs on Windows without symlink privilege.
+                }
+            }
         }
     }
     Ok(bytes)
 }
 
 fn disk_avail(path: &Path) -> Option<u64> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        Some(st.f_bavail as u64 * st.f_frsize as u64)
+    }
+    #[cfg(windows)]
+    {
+        disk_avail_windows(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+#[cfg(windows)]
+fn disk_avail_windows(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lp_directory_name: *const u16,
+            lp_free_bytes_available: *mut u64,
+            lp_total_number_of_bytes: *mut u64,
+            lp_total_number_of_free_bytes: *mut u64,
+        ) -> i32;
+    }
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let mut avail = 0u64;
+    let mut total = 0u64;
+    let mut free = 0u64;
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) };
+    if ok == 0 {
         return None;
     }
-    Some(st.f_bavail as u64 * st.f_frsize as u64)
+    Some(avail)
 }
 
 /// Hard-link (or copy) every side-file of `pack` from `from` into `into`'s pack dir; existing

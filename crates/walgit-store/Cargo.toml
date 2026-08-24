@@ -5,9 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["gcs", "s3"]
+default = ["gcs", "s3", "azure"]
 gcs = ["dep:google-cloud-storage", "dep:google-cloud-gax", "dep:google-cloud-auth", "dep:reqwest"]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:aws-smithy-types", "dep:reqwest"]
+azure = ["dep:reqwest", "dep:hmac", "dep:sha2", "dep:base64", "dep:chrono", "dep:azure_identity", "dep:azure_core"]
 
 [dependencies]
 walgit-proto.workspace = true
@@ -36,6 +37,12 @@ aws-config = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
 aws-smithy-types = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+azure_identity = { workspace = true, optional = true }
+azure_core = { workspace = true, optional = true }
 [dev-dependencies]
 axum.workspace = true
 tempfile.workspace = true

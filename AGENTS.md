@@ -396,6 +396,16 @@ decision in §4 — or the PR is; never "fix later".
   + chain) is for clones, **`bundles/catchup`** (no fulls) is what recipes record in `fetch.bundleURI`. Measured: a
   catch-up is exactly the slots missed; for a client fetching several times a day, upload-pack's thin pack is
   smaller than an hourly bundle — bundles pay off for fresh clones and far-behind clients.
+- **D42** **Azure Blob Storage is a first-class ObjectStore backend** (2026-08-23), alongside S3 and GCS.
+  `store.backend = "azure"`; the container is `store.bucket`. Credentials come from env — account key
+  (`store.azure.account_key_env`, default `AZURE_STORAGE_ACCOUNT_KEY`), connection string
+  (`store.azure.connection_string_env`), or Microsoft Entra ID (`store.azure.use_aad`). The endpoint is
+  empty for `https://{account}.blob.core.windows.net`, or `http://127.0.0.1:10000` for Azurite. Version
+  tokens are blob ETags (opaque, quotes stripped). Compose is Put Block From URL + Put Block List
+  (`supports_compose = true`, `compose_is_native = false`); `signed_get_url` / `accel_target` mint a
+  service SAS (account key) or user-delegation SAS (Entra). The Blob REST API is used directly: the
+  official `azure_storage_blob` 1.x client is TokenCredential-only and cannot sign Azurite/account-key
+  requests. Local bar: `just test-azure` against Azurite.
 
 Decision identifiers are stable; gaps in the numbering are intentional.
 
@@ -420,8 +430,9 @@ Decision identifiers are stable; gaps in the numbering are intentional.
 - **Standalone first (D39):** a feature must work with walgit hit directly (no edge, in-process TLS, bytes
   streamed by walgit). Anything an edge takes over is announced per request in `X-Walgit-Capabilities`; never
   infer an edge from config, never hardcode a hostname in `crates/` or `web/`.
-- **S3 and GCS are both first class.** Every store feature has both implementations and runs in the contract
-  suite (`just test-s3` against rustfs, `just test-gcs <bucket>`); "GCS only" is a bug.
+- **S3, GCS and Azure Blob are all first class.** Every store feature has all three implementations and
+  runs in the contract suite (`just test-s3` against rustfs, `just test-gcs <bucket>`, `just test-azure`
+  against Azurite); "GCS only" (or any single-backend path) is a bug.
 - **Use the rig before prod** (`just dev-store` → `walgit-server --config walgit.standalone.toml`). Per-repo
   settings (D24) with minute-scale slots compress a week of bundle behaviour into 30 minutes.
 - No new auth paths (§1.3). No LIST on hot paths. No unbounded buffering of packs in memory. No full

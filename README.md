@@ -1,13 +1,13 @@
 # walgit — a git server that is one binary in front of an object store
 
 walgit hosts git repositories with **no database, no leader and no local state that matters**. You run a
-single binary, point it at an S3 or GCS bucket, and you have: smart HTTP (v0/v2) fetch and push, `bundle-uri`
+single binary, point it at an S3, GCS or Azure Blob bucket, and you have: smart HTTP (v0/v2) fetch and push, `bundle-uri`
 clones served as static files, Git LFS, a browsing web UI, a JSON API with an SDK, per-repository push policy,
 webhooks — and a server that scales to repositories **larger than the machine it runs on**. Every machine that
 runs walgit is a disposable cache; the bucket is the repository.
 
 ```sh
-# 1. a bucket (any S3-compatible store or GCS) and a config
+# 1. a bucket (any S3-compatible store, GCS, or Azure Blob) and a config
 cat > walgit.toml <<'EOF'
 [server]
 listen = "0.0.0.0:8080"
@@ -158,6 +158,7 @@ just warnings      # zero rustc warnings across all targets
 just ci            # all of the above
 cargo test -p walgit-server --test sim     # fault-injection simulation (crashes, partitions, stale reads)
 just test-s3       # store contract against local rustfs
+just test-azure    # store contract against local Azurite
 ```
 
 Code map:
@@ -165,7 +166,7 @@ Code map:
 ```
 crates/
   walgit-proto    protobuf schema (wal.proto), log framing, store keys
-  walgit-store    ObjectStore trait (CAS versions, conditional GET, range, compose); backends s3, gcs, memory; leases
+  walgit-store    ObjectStore trait (CAS versions, conditional GET, range, compose); backends s3, gcs, azure, memory; leases
   walgit-git      bare repos on disk, receive-pack, pack ingest, refs ↔ packed-refs, advertisements, upload-pack drivers
   walgit-wal      RepoHandle: sync levels, publish (group commit + CAS), checkpoints, log reader, remote reader, tasks
   walgit-bundle   bundle-uri: slots and chains, building, header ∘ pack composition, lists, retention

@@ -61,12 +61,23 @@ dev-store:
 dev-store-stop:
     podman compose down
 
+# Start Azurite (Azure Blob emulator) on :10000. Well-known account/key.
+dev-azurite:
+    podman compose up -d azurite
+    echo "Azurite blob is running on http://127.0.0.1:10000"
+    echo "Account: devstoreaccount1"
+    echo "Key: (Azurite well-known key; AZURE_STORAGE_ACCOUNT_KEY in just test-azure)"
+
+dev-azurite-stop:
+    podman compose stop azurite
+
 # --- tests -------------------------------------------------------------------
 # Tiers (all hermetic: in-memory store, tempdir caches, real `git` binary):
 #   test       fast tier, < 30 s: every unit/integration test not marked #[ignore]
 #   test-slow  benches/soak: #[ignore]d tests (20k-ref push, 466k-ref render, ...)
 #   test-s3    store contract against local rustfs (just dev-store)
 #   test-gcs   store contract against a real bucket (writes under a unique prefix)
+#   test-azure store contract against local Azurite (just dev-azurite)
 
 # Fast hermetic tier (< 30 s): every test not marked #[ignore].
 # Fast tier (default, < 1 min): unit tests + the quick integration suites.
@@ -119,6 +130,16 @@ store-test-s3:
     AWS_ACCESS_KEY_ID=walgit-dev \
     AWS_SECRET_ACCESS_KEY=walgit-dev-secret \
     cargo test -p walgit-store --test contract -- --nocapture
+
+# Store contract against local Azurite (run `just dev-azurite` first).
+test-azure: store-test-azure
+
+store-test-azure:
+    WALGIT_TEST_AZURE_ENDPOINT=http://127.0.0.1:10000 \
+    WALGIT_TEST_AZURE_ACCOUNT=devstoreaccount1 \
+    WALGIT_TEST_BUCKET=walgit-test \
+    AZURE_STORAGE_ACCOUNT_KEY=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw== \
+    cargo test -p walgit-store --features azure --test contract -- azure --nocapture
 
 # Run all walgit-store tests (memory + S3 if env set).
 store-test-all:

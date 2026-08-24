@@ -443,7 +443,6 @@ fn parse_object_format(s: &str) -> ObjectFormat {
 /// as their link size, hard links (the pack index shared between the Serve
 /// level and the remote reader) once.
 fn dir_size(path: &std::path::Path) -> u64 {
-    use std::os::unix::fs::MetadataExt;
     fn walk(p: &std::path::Path, seen: &mut std::collections::HashSet<(u64, u64)>) -> u64 {
         let mut total = 0;
         if let Ok(entries) = std::fs::read_dir(p) {
@@ -454,7 +453,18 @@ fn dir_size(path: &std::path::Path) -> u64 {
                 let Ok(meta) = entry.metadata() else { continue };
                 if meta.is_dir() {
                     total += walk(&path, seen);
-                } else if meta.nlink() <= 1 || seen.insert((meta.dev(), meta.ino())) {
+                    continue;
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if meta.nlink() <= 1 || seen.insert((meta.dev(), meta.ino())) {
+                        total += meta.len();
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = seen;
                     total += meta.len();
                 }
             }
@@ -464,16 +474,52 @@ fn dir_size(path: &std::path::Path) -> u64 {
     walk(path, &mut std::collections::HashSet::new())
 }
 
-/// (used, total) bytes of the filesystem holding `path` (statvfs).
+/// (used, total) bytes of the filesystem holding `path` (statvfs / GetDiskFreeSpaceEx).
 fn disk_usage(path: &std::path::Path) -> Option<(u64, u64)> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        let total = st.f_blocks as u64 * st.f_frsize as u64;
+        let avail = st.f_bavail as u64 * st.f_frsize as u64;
+        Some((total.saturating_sub(avail), total))
+    }
+    #[cfg(windows)]
+    {
+        disk_usage_windows(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+#[cfg(windows)]
+fn disk_usage_windows(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lp_directory_name: *const u16,
+            lp_free_bytes_available: *mut u64,
+            lp_total_number_of_bytes: *mut u64,
+            lp_total_number_of_free_bytes: *mut u64,
+        ) -> i32;
+    }
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let mut avail = 0u64;
+    let mut total = 0u64;
+    let mut free = 0u64;
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) };
+    if ok == 0 || total == 0 {
         return None;
     }
-    let total = st.f_blocks as u64 * st.f_frsize as u64;
-    let avail = st.f_bavail as u64 * st.f_frsize as u64;
     Some((total.saturating_sub(avail), total))
 }

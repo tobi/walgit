@@ -992,7 +992,16 @@ pub fn verify_refs_in_packs(
     let objects = scratch.path().join("objects");
     std::fs::create_dir_all(objects.join("info"))?;
     std::fs::create_dir_all(scratch.path().join("refs"))?;
-    std::os::unix::fs::symlink(std::fs::canonicalize(pack_dir)?, objects.join("pack"))?;
+    let pack_src = std::fs::canonicalize(pack_dir)?;
+    let pack_dst = objects.join("pack");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&pack_src, &pack_dst)?;
+    #[cfg(windows)]
+    {
+        if std::os::windows::fs::symlink_dir(&pack_src, &pack_dst).is_err() {
+            copy_dir_all(&pack_src, &pack_dst)?;
+        }
+    }
     std::fs::write(scratch.path().join("HEAD"), "ref: refs/heads/main\n")?;
     std::fs::write(
         scratch.path().join("config"),
@@ -1043,6 +1052,22 @@ pub fn verify_refs_in_packs(
             .map(|l| l.split(' ').next().unwrap_or("").to_string()),
     );
     Ok(missing)
+}
+
+#[cfg(windows)]
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for ent in std::fs::read_dir(src)? {
+        let ent = ent?;
+        let from = ent.path();
+        let to = dst.join(ent.file_name());
+        if ent.file_type()?.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 fn scan_packs(dir: &Path) -> Result<Vec<LocalPack>> {
