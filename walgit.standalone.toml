@@ -66,6 +66,12 @@ force_path_style = true
 # backend = "gcs"
 # bucket = "my-walgit-bucket"
 # prefix = ""
+# Azure Blob (Azurite: just dev-azurite; account key in AZURE_STORAGE_ACCOUNT_KEY):
+# backend = "azure"
+# bucket = "walgit-test"
+# [store.azure]
+# endpoint = "http://127.0.0.1:10000"
+# account = "devstoreaccount1"
 
 # Bundles (docs/BUNDLE_URI_DESIGN.md): one weekly full, then **chained** incrementals — each daily on the
 # previous daily (the first on the weekly), each hourly on the previous hourly (restarting from every new

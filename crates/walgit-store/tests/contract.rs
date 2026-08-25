@@ -6,9 +6,10 @@
 //! isolation, large streamed put/get roundtrip with checksum, and the
 //! multipart upload path.
 //!
-//! The suite is executed against `MemoryStore` always, and against `S3Store`
-//! when `WALGIT_TEST_S3_ENDPOINT` is set. `GcsStore` is tested when
-//! `WALGIT_TEST_GCS_BUCKET` is set (StoreGcs adds that wrapper).
+//! The suite is executed against `MemoryStore` always, against `S3Store`
+//! when `WALGIT_TEST_S3_ENDPOINT` is set, against `GcsStore` when
+//! `WALGIT_TEST_GCS_BUCKET` is set, and against `AzureStore` when
+//! `WALGIT_TEST_AZURE_ENDPOINT` is set.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -766,6 +767,102 @@ async fn gcs_contract() {
         let _ = store.delete(&m.key, None).await;
     }
     eprintln!("[gcs_contract] cleanup done ({count} objects deleted)");
+}
+
+#[cfg(feature = "azure")]
+#[tokio::test]
+async fn azure_contract() {
+    let endpoint = match std::env::var("WALGIT_TEST_AZURE_ENDPOINT") {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("skipping azure_contract: WALGIT_TEST_AZURE_ENDPOINT not set");
+            return;
+        }
+    };
+    let account =
+        std::env::var("WALGIT_TEST_AZURE_ACCOUNT").unwrap_or_else(|_| "devstoreaccount1".into());
+    let bucket = std::env::var("WALGIT_TEST_BUCKET").unwrap_or_else(|_| "walgit-test".into());
+    let _key = std::env::var("AZURE_STORAGE_ACCOUNT_KEY")
+        .expect("AZURE_STORAGE_ACCOUNT_KEY required for Azure tests");
+
+    let prefix = format!("contract-test-{}", uuid::Uuid::new_v4().simple());
+    eprintln!(
+        "[azure_contract] endpoint={endpoint} account={account} container={bucket} prefix={prefix}"
+    );
+
+    let cfg = walgit_config::StoreConfig {
+        backend: walgit_config::StoreBackend::Azure,
+        bucket: bucket.clone(),
+        prefix: prefix.clone(),
+        azure: walgit_config::AzureConfig {
+            endpoint: endpoint.clone(),
+            account: account.clone(),
+            account_key_env: "AZURE_STORAGE_ACCOUNT_KEY".into(),
+            connection_string_env: "AZURE_STORAGE_CONNECTION_STRING_UNUSED".into(),
+            use_aad: false,
+        },
+        multipart_threshold: bytesize::ByteSize::mib(5),
+        multipart_part_size: bytesize::ByteSize::mib(4),
+        ..Default::default()
+    };
+
+    let store = walgit_store::azure::AzureStore::new(&cfg)
+        .await
+        .expect("AzureStore::new");
+    store
+        .ensure_container()
+        .await
+        .expect("ensure azure container");
+    let store: DynStore = Arc::new(store);
+
+    run_contract(store.clone(), &prefix).await;
+
+    // SAS: a URL without the account key must return the put bytes.
+    let sas_key = format!("{prefix}/sas-probe");
+    store
+        .put(
+            &sas_key,
+            PutBody::Bytes(Bytes::from_static(b"sas-body")),
+            PutOptions::from(PutMode::Overwrite),
+        )
+        .await
+        .expect("put sas probe");
+    let url = store
+        .signed_get_url(&sas_key, std::time::Duration::from_secs(3600))
+        .await
+        .expect("signed_get_url");
+    let url = url.expect("azure signed_get_url must return Some");
+    eprintln!(
+        "[azure_contract] sas url minted ({} bytes of url)",
+        url.len()
+    );
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .expect("sas GET");
+    let status = resp.status();
+    let body = resp.bytes().await.expect("sas body");
+    assert!(
+        status.is_success(),
+        "sas GET status {status} body {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(&body[..], b"sas-body", "sas GET body mismatch");
+
+    let to_delete: Vec<_> = futures::stream::iter(
+        walgit_store::ObjectStore::list(store.as_ref(), &prefix, None)
+            .collect::<Vec<_>>()
+            .await,
+    )
+    .filter_map(|r| async move { r.ok() })
+    .collect::<Vec<_>>()
+    .await;
+    let count = to_delete.len();
+    for m in &to_delete {
+        let _ = store.delete(&m.key, None).await;
+    }
+    eprintln!("[azure_contract] cleanup done ({count} objects deleted)");
 }
 
 /// Control plane must stay fast under bulk load (prod 2026-08-20: a 184-byte

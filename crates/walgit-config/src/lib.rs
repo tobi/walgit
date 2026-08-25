@@ -228,6 +228,7 @@ pub struct StoreConfig {
     pub prefix: String,
     pub gcs: GcsConfig,
     pub s3: S3Config,
+    pub azure: AzureConfig,
     pub max_retries: u32,
     /// Objects larger than this use resumable/multipart upload.
     pub multipart_threshold: ByteSize,
@@ -240,6 +241,8 @@ pub enum StoreBackend {
     #[default]
     Gcs,
     S3,
+    /// Azure Blob Storage (Azurite locally, `*.blob.core.windows.net` in Azure).
+    Azure,
     /// Tests only.
     Memory,
 }
@@ -278,6 +281,25 @@ pub struct S3Config {
     pub access_key_env: String,
     pub secret_key_env: String,
     pub force_path_style: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AzureConfig {
+    /// Blob endpoint. Empty = `https://{account}.blob.core.windows.net`.
+    /// Azurite: `http://127.0.0.1:10000`.
+    pub endpoint: String,
+    /// Storage account name. Azurite: `devstoreaccount1`.
+    pub account: String,
+    /// Env var holding the account key (Shared Key). Unset = not used.
+    pub account_key_env: String,
+    /// Env var holding a connection string (`AccountName`/`AccountKey`/`BlobEndpoint`).
+    /// When that var is set it wins over `account` / `account_key_env` / `endpoint`.
+    pub connection_string_env: String,
+    /// Use Microsoft Entra ID. Credential resolution tries AKS workload
+    /// identity, managed identity, then developer tools.
+    /// Account key is required for Azurite.
+    pub use_aad: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1078,6 +1100,7 @@ impl Default for StoreConfig {
             prefix: String::new(),
             gcs: GcsConfig::default(),
             s3: S3Config::default(),
+            azure: AzureConfig::default(),
             max_retries: 8,
             multipart_threshold: ByteSize::mib(64),
             multipart_part_size: ByteSize::mib(32),
@@ -1103,6 +1126,17 @@ impl Default for S3Config {
             access_key_env: "AWS_ACCESS_KEY_ID".into(),
             secret_key_env: "AWS_SECRET_ACCESS_KEY".into(),
             force_path_style: true,
+        }
+    }
+}
+impl Default for AzureConfig {
+    fn default() -> Self {
+        AzureConfig {
+            endpoint: String::new(),
+            account: String::new(),
+            account_key_env: "AZURE_STORAGE_ACCOUNT_KEY".into(),
+            connection_string_env: "AZURE_STORAGE_CONNECTION_STRING".into(),
+            use_aad: false,
         }
     }
 }
@@ -1383,6 +1417,19 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(!self.store.bucket.is_empty(), "store.bucket must be set");
         let t = &self.server.tls;
+        if self.store.backend == StoreBackend::Azure {
+            let azure = &self.store.azure;
+            anyhow::ensure!(
+                !azure.account.is_empty() || !azure.connection_string_env.is_empty(),
+                "store.azure.account or store.azure.connection_string_env must be set"
+            );
+            anyhow::ensure!(
+                azure.use_aad
+                    || !azure.account_key_env.is_empty()
+                    || !azure.connection_string_env.is_empty(),
+                "Azure credentials require store.azure.use_aad, store.azure.account_key_env, or store.azure.connection_string_env"
+            );
+        }
         match t.mode {
             TlsMode::Files => anyhow::ensure!(
                 t.cert.is_some() && t.key.is_some(),
@@ -1983,6 +2030,114 @@ schedule = "@daily"
 keep = 3
 "#;
         assert!(Config::parse(text).is_err());
+    }
+
+    #[test]
+    fn azure_backend_from_toml() {
+        let c: Config = toml::from_str(
+            r#"
+[store]
+backend = "azure"
+bucket = "walgit-test"
+[store.azure]
+endpoint = "http://127.0.0.1:10000"
+account = "devstoreaccount1"
+account_key_env = "AZURE_STORAGE_ACCOUNT_KEY"
+connection_string_env = "AZURE_STORAGE_CONNECTION_STRING"
+use_aad = false
+"#,
+        )
+        .unwrap();
+        assert_eq!(c.store.backend, StoreBackend::Azure);
+        assert_eq!(c.store.bucket, "walgit-test");
+        assert_eq!(c.store.azure.endpoint, "http://127.0.0.1:10000");
+        assert_eq!(c.store.azure.account, "devstoreaccount1");
+        assert_eq!(c.store.azure.account_key_env, "AZURE_STORAGE_ACCOUNT_KEY");
+        assert!(!c.store.azure.use_aad);
+    }
+
+    #[test]
+    fn azure_backend_from_env_overrides() {
+        let mut c = Config::default();
+        c.apply_env(
+            vec![
+                ("WALGIT__STORE__BACKEND".to_string(), "azure".to_string()),
+                (
+                    "WALGIT__STORE__AZURE__ENDPOINT".to_string(),
+                    "http://127.0.0.1:10000".to_string(),
+                ),
+                (
+                    "WALGIT__STORE__AZURE__ACCOUNT".to_string(),
+                    "devstoreaccount1".to_string(),
+                ),
+                (
+                    "WALGIT__STORE__AZURE__ACCOUNT_KEY_ENV".to_string(),
+                    "AZURE_STORAGE_ACCOUNT_KEY".to_string(),
+                ),
+                (
+                    "WALGIT__STORE__AZURE__USE_AAD".to_string(),
+                    "true".to_string(),
+                ),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(c.store.backend, StoreBackend::Azure);
+        assert_eq!(c.store.azure.endpoint, "http://127.0.0.1:10000");
+        assert_eq!(c.store.azure.account, "devstoreaccount1");
+        assert_eq!(c.store.azure.account_key_env, "AZURE_STORAGE_ACCOUNT_KEY");
+        assert!(c.store.azure.use_aad);
+    }
+
+    #[test]
+    fn azure_section_denies_unknown_fields() {
+        let err = toml::from_str::<Config>(
+            r#"
+[store.azure]
+not_a_real_key = "nope"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unknown field") && err.contains("not_a_real_key"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn azure_validation_accepts_workload_identity() {
+        let mut c = Config::default();
+        c.store.backend = StoreBackend::Azure;
+        c.store.bucket = "walgit".into();
+        c.store.azure.account = "walgitprod".into();
+        c.store.azure.account_key_env.clear();
+        c.store.azure.connection_string_env.clear();
+        c.store.azure.use_aad = true;
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn azure_validation_requires_account_source() {
+        let mut c = Config::default();
+        c.store.backend = StoreBackend::Azure;
+        c.store.bucket = "walgit".into();
+        c.store.azure.account.clear();
+        c.store.azure.connection_string_env.clear();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("store.azure.account"), "{err}");
+    }
+
+    #[test]
+    fn azure_validation_requires_credentials() {
+        let mut c = Config::default();
+        c.store.backend = StoreBackend::Azure;
+        c.store.bucket = "walgit".into();
+        c.store.azure.account = "walgitprod".into();
+        c.store.azure.account_key_env.clear();
+        c.store.azure.connection_string_env.clear();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("Azure credentials require"), "{err}");
     }
 }
 

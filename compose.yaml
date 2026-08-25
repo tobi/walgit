@@ -1,4 +1,4 @@
-# compose file for walgit local dev (podman compose): rustfs (S3-compatible) + bucket creation.
+# compose file for walgit local dev (podman compose): rustfs (S3-compatible) + Azurite (Azure Blob) + bucket creation.
 #
 # Usage:
 #   podman compose up -d rustfs           # start rustfs
@@ -28,6 +28,14 @@ services:
       timeout: 3s
       retries: 10
 
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite
+    command: ["azurite-blob", "--blobHost", "0.0.0.0", "--blobPort", "10000", "--skipApiVersionCheck"]
+    ports:
+      - "10000:10000"
+    volumes:
+      - azurite-data:/data
+
   # One-shot: create the walgit-test bucket after rustfs is healthy.
   create-bucket:
     image: amazon/aws-cli:latest
@@ -48,3 +56,4 @@ services:
 
 volumes:
   rustfs-data:
+  azurite-data:

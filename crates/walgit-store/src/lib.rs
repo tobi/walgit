@@ -7,7 +7,7 @@
 //! * conditional writes (`Create` = if-absent, `Update(v)` = CAS on version),
 //! * conditional deletes, range reads, streaming bodies, prefix listing.
 //!
-//! [`Version`] is opaque to callers: GCS generation, S3/rustfs ETag, or a
+//! [`Version`] is opaque to callers: GCS generation, S3/Azure ETag, or a
 //! counter in [`memory::MemoryStore`]. Callers must never parse it.
 
 use std::{fmt, ops::Range, pin::Pin, sync::Arc};
@@ -18,6 +18,8 @@ use tracing::Instrument;
 
 pub mod coord;
 pub use coord::CoordError;
+#[cfg(feature = "azure")]
+pub mod azure;
 pub mod fault;
 #[cfg(feature = "gcs")]
 pub mod gcs;
@@ -200,7 +202,7 @@ pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 
 #[async_trait::async_trait]
 pub trait ObjectStore: Send + Sync + 'static {
-    /// Human-readable backend id for logs/metrics ("gcs", "s3", "memory").
+    /// Human-readable backend id for logs/metrics ("gcs", "s3", "azure", "memory").
     fn backend(&self) -> &'static str;
     /// Whether this store is a prefixing wrapper. Used to avoid duplicate
     /// operation spans when prefixes are nested.
@@ -656,6 +658,16 @@ pub async fn open_store(cfg: &walgit_config::Config) -> anyhow::Result<DynStore>
             #[cfg(not(feature = "gcs"))]
             {
                 anyhow::bail!("gcs backend requires the `gcs` feature")
+            }
+        }
+        walgit_config::StoreBackend::Azure => {
+            #[cfg(feature = "azure")]
+            {
+                Arc::new(azure::AzureStore::new(&cfg.store).await?)
+            }
+            #[cfg(not(feature = "azure"))]
+            {
+                anyhow::bail!("azure backend requires the `azure` feature")
             }
         }
     };
