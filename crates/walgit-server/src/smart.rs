@@ -4,7 +4,7 @@
 //! * https://git-scm.com/docs/http-protocol
 //! * https://git-scm.com/docs/protocol-v2
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
@@ -346,6 +346,14 @@ async fn upload_pack_v2(
                     e => return Err(wal_err(e)),
                 });
             }
+            if !st.cfg.git.allow_any_sha1_in_want
+                && !wants_are_reachable(handle, &req.wants).await?
+            {
+                return Ok(git_err_response(
+                    "git-upload-pack",
+                    "requested object is not advertised or reachable from an advertised ref",
+                ));
+            }
             let (writer, body) = write_body_pipe(256 * 1024);
             // Move the Arc<RepoHandle> into the spawned task so the ReadGuard
             // from sync() lives for the entire streaming response — packs must
@@ -652,6 +660,7 @@ async fn narrated_fetch(
     let cache_max = st.cfg.cache_budget_bytes();
     let engine = st.cfg.git.upload_pack_engine;
     let max_wants = st.cfg.git.max_wants;
+    let allow_any_sha1_in_want = st.cfg.git.allow_any_sha1_in_want;
     tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
         let t0 = std::time::Instant::now();
@@ -742,6 +751,24 @@ async fn narrated_fetch(
             }
         };
         let local = guard.local().clone();
+        if !allow_any_sha1_in_want {
+            match wants_are_reachable(&handle, &req.wants).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = writer
+                        .write_all(&sideband_pkt(
+                            3,
+                            "requested object is not advertised or reachable from an advertised ref",
+                        ))
+                        .await;
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(error = ?error, "upload_pack reachability check failed");
+                    return;
+                }
+            }
+        }
         let packs = local.packs().map(|p| p.len()).unwrap_or(0);
         let remote = handle.remote_served();
         let _ = say(
@@ -1242,7 +1269,13 @@ async fn receive_pack_process(
             }
         }
     }
-    let ev = crate::policy::evaluate(&policy, &principal.name, &txn, |u| forces.contains(&u.name));
+    let ev = crate::policy::evaluate(
+        &policy,
+        &principal.name,
+        &txn,
+        &st.cfg.git.protected_ref_prefixes,
+        |u| forces.contains(&u.name),
+    );
     if !ev.any_allowed() {
         let report = build_report(&caps, unpack_result, &ev.per_ref).await;
         return Ok(report);
@@ -1385,6 +1418,31 @@ fn push_meta(
 
 fn is_zero_oid(hex: &str) -> bool {
     hex.chars().all(|c| c == '0') && !hex.is_empty()
+}
+async fn wants_are_reachable(
+    handle: &Arc<walgit_wal::RepoHandle>,
+    wants: &[walgit_git::ObjectId],
+) -> Result<bool, ApiError> {
+    let refs = handle.local().refs().map_err(git_err)?;
+    let advertised: HashSet<&str> = refs
+        .refs
+        .iter()
+        .flat_map(|reference| [reference.oid.as_str(), reference.peeled.as_str()])
+        .filter(|oid| !oid.is_empty())
+        .collect();
+    let unadvertised: Vec<_> = wants
+        .iter()
+        .filter(|want| !advertised.contains(want.to_string().as_str()))
+        .copied()
+        .collect();
+    if unadvertised.is_empty() {
+        return Ok(true);
+    }
+    handle
+        .local()
+        .wants_reachable(&unadvertised)
+        .await
+        .map_err(git_err)
 }
 
 /// Parse the v2 `fetch` command body (want/have/done/...) into [`UploadPackRequest`].

@@ -399,6 +399,11 @@ decision in §4 — or the PR is; never "fix later".
   + chain) is for clones, **`bundles/catchup`** (no fulls) is what recipes record in `fetch.bundleURI`. Measured: a
   catch-up is exactly the slots missed; for a client fetching several times a day, upload-pack's thin pack is
   smaller than an hourly bundle — bundles pay off for fresh clones and far-behind clients.
+- **D42** **Protected ref namespaces have one management writer.** Host configuration
+  `git.protected_ref_prefixes` reserves namespaces from receive-pack, including policy bypasses. An admin may
+  idempotently create an existing commit there through `PUT /{o}/{r}/api/protected-ref`; an existing different
+  value conflicts. The ref transaction still publishes through the WAL, and upload-pack exposes only advertised
+  or reachable objects unless `git.allow_any_sha1_in_want` explicitly opts out.
 
 Decision identifiers are stable; gaps in the numbering are intentional.
 

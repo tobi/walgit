@@ -689,6 +689,9 @@ pub struct GitConfig {
     pub upload_pack_engine: UploadPackEngine,
     pub allow_filter: bool,
     pub allow_any_sha1_in_want: bool,
+    /// Ref namespaces reserved for the admin protected-ref API. Receive-pack
+    /// cannot mutate refs below these prefixes.
+    pub protected_ref_prefixes: Vec<String>,
     /// Default object format for new repos.
     pub object_format: ObjectFormat,
     /// Maintain a split commit-graph chain per local repo: tier-2 packs that
@@ -1239,6 +1242,7 @@ impl Default for GitConfig {
             commit_graph_changed_paths: false,
             history_pack: true,
             max_wants: 0,
+            protected_ref_prefixes: Vec::new(),
         }
     }
 }
@@ -1453,6 +1457,16 @@ impl Config {
                     "upstream.follow entries are full ref names (refs/heads/main), got {r:?}"
                 );
             }
+        }
+        for prefix in &self.git.protected_ref_prefixes {
+            anyhow::ensure!(
+                prefix.starts_with("refs/")
+                    && prefix.ends_with('/')
+                    && !prefix.contains("..")
+                    && !prefix.contains("//")
+                    && !prefix.contains('*'),
+                "git.protected_ref_prefixes entries must be ref namespace prefixes (refs/example/), got {prefix:?}"
+            );
         }
         for o in &self.server.cors_origins {
             let host = o

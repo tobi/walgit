@@ -493,6 +493,7 @@ pub fn evaluate(
     policy: &RepoPolicy,
     principal: &str,
     txn: &RefTransaction,
+    protected_ref_prefixes: &[String],
     is_force: impl Fn(&RefUpdate) -> bool,
 ) -> Eval {
     let groups: HashMap<&str, &Group> =
@@ -500,7 +501,12 @@ pub fn evaluate(
     let mut per_ref = Vec::with_capacity(txn.updates.len());
     let mut allowed = Vec::new();
     for u in &txn.updates {
-        match deny_reason(policy, &groups, principal, u, &is_force) {
+        let denied = protected_ref_prefixes
+            .iter()
+            .any(|prefix| u.name.starts_with(prefix))
+            .then(|| "protected ref namespace; use the admin API".to_string())
+            .or_else(|| deny_reason(policy, &groups, principal, u, &is_force));
+        match denied {
             None => {
                 per_ref.push((u.name.clone(), Ok(())));
                 allowed.push(u.clone());
@@ -815,7 +821,7 @@ mod tests {
             ],
             false,
         );
-        let ev = evaluate(&p, "bob@example.com", &t, |_| true);
+        let ev = evaluate(&p, "bob@example.com", &t, &[], |_| true);
         assert!(ev.per_ref.iter().all(|(_, r)| r.is_ok()));
         assert_eq!(ev.publish.updates.len(), 2);
     }
@@ -830,7 +836,7 @@ mod tests {
             ],
             false,
         );
-        let ev = evaluate(&p, "bob@example.com", &t, |_| true);
+        let ev = evaluate(&p, "bob@example.com", &t, &[], |_| true);
         assert!(
             ev.per_ref[0]
                 .1
@@ -842,7 +848,7 @@ mod tests {
         assert_eq!(ev.publish.updates.len(), 1);
 
         let del = txn(vec![upd("refs/heads/main", "aaa", "")], false);
-        let ev = evaluate(&p, "bob@example.com", &del, |_| false);
+        let ev = evaluate(&p, "bob@example.com", &del, &[], |_| false);
         assert!(ev.per_ref[0].1.as_ref().unwrap_err().contains("lock-main"));
         assert!(!ev.any_allowed());
     }
@@ -851,7 +857,7 @@ mod tests {
     fn ff_update_allowed() {
         let p = lock_main();
         let t = txn(vec![upd("refs/heads/main", "aaa", "bbb")], false);
-        let ev = evaluate(&p, "bob@example.com", &t, |_| false);
+        let ev = evaluate(&p, "bob@example.com", &t, &[], |_| false);
         assert!(ev.per_ref[0].1.is_ok());
     }
 
@@ -859,7 +865,7 @@ mod tests {
     fn group_bypass() {
         let p = lock_main();
         let t = txn(vec![upd("refs/heads/main", "aaa", "bbb")], false);
-        let ev = evaluate(&p, "Alice@example.com", &t, |_| true);
+        let ev = evaluate(&p, "Alice@example.com", &t, &[], |_| true);
         assert!(ev.per_ref[0].1.is_ok());
     }
 
@@ -867,7 +873,7 @@ mod tests {
     fn create_allowed_when_not_restricted() {
         let p = lock_main();
         let t = txn(vec![upd("refs/heads/main", "", "aaa")], false);
-        let ev = evaluate(&p, "bob@example.com", &t, |_| true);
+        let ev = evaluate(&p, "bob@example.com", &t, &[], |_| true);
         assert!(ev.per_ref[0].1.is_ok());
     }
 
@@ -881,7 +887,7 @@ mod tests {
             ],
             true,
         );
-        let ev = evaluate(&p, "bob@example.com", &t, |_| true);
+        let ev = evaluate(&p, "bob@example.com", &t, &[], |_| true);
         assert!(ev.any_denied());
         assert!(!ev.any_allowed());
         assert_eq!(ev.per_ref.len(), 2);
@@ -900,7 +906,7 @@ mod tests {
         let p = parse_bytes(json.as_bytes()).unwrap();
         let t = txn(vec![upd("refs/tags/v1", "aaa", "bbb")], false);
         // even if merge-base would say ff
-        let ev = evaluate(&p, "bob@example.com", &t, |_| false);
+        let ev = evaluate(&p, "bob@example.com", &t, &[], |_| false);
         assert!(ev.per_ref[0].1.is_err());
     }
 

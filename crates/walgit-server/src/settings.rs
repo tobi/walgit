@@ -505,7 +505,13 @@ pub async fn http_policy_dry_run(
                 }
             }
         }
-        let ev = crate::policy::evaluate(&policy, &principal, &txn, |u| forces.contains(&u.name));
+        let ev = crate::policy::evaluate(
+            &policy,
+            &principal,
+            &txn,
+            &st.cfg.git.protected_ref_prefixes,
+            |u| forces.contains(&u.name),
+        );
         let refs: Vec<serde_json::Value> = ev
             .per_ref
             .iter()

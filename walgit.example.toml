@@ -263,6 +263,7 @@ binary = "git"                    # path to upstream git binary (>= 2.47 recomme
 upload_pack_engine = "auto"       # "auto" = stock git when packs are local/mount-linked, gix only for remote-served bases | "git" | "gix"
 allow_filter = true               # uploadpack.allowFilter
 allow_any_sha1_in_want = false    # uploadpack.allowAnySHA1InWant
+protected_ref_prefixes = []       # ref namespaces writable only through the admin protected-ref API, e.g. ["refs/deployments/"]
 object_format = "sha1"            # default for new repos: "sha1" | "sha256"
 commit_graph = true               # maintain a split commit-graph chain per repo (tier-2 layer from the WAL + incremental)
 history_pack = true               # base rebuild also publishes commits+trees as a local "history pack"

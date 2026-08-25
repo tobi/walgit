@@ -108,6 +108,7 @@ impl Registry {
                 LocalRepo::init(&self.cache_root, id, format)?
             }
         };
+        local.configure_upload_pack(self.cfg.git.allow_any_sha1_in_want)?;
 
         // Load state
         let state = load_state(local.path());
@@ -229,6 +230,7 @@ impl Registry {
             Ok(meta) => {
                 // Init local repo
                 let local = LocalRepo::init(&self.cache_root, id, format)?;
+                local.configure_upload_pack(self.cfg.git.allow_any_sha1_in_want)?;
 
                 let state = RepoState::default();
                 save_state(local.path(), &state)?;

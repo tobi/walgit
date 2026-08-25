@@ -379,6 +379,9 @@ pub(crate) async fn dispatch_route(
             }
             (&Method::PUT, "") => admin::create(st, route, &headers, &query).await,
             (&Method::DELETE, "") => admin::delete(st, route, &headers).await,
+            (&Method::PUT, "protected-ref") => {
+                admin::create_protected_ref(st, route, &headers, body.take().unwrap()).await
+            }
             // Admin routes reach here only through `/{o}/{r}/api[-browser]/…` (web::v1).
             (&Method::GET, "policy") => policy::http_get(st, route, &headers).await,
             (&Method::PUT, "policy") => {

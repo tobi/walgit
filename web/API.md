@@ -263,6 +263,12 @@ index, URLs. `404` for an unknown repo. Cache: SWR + `ETag: "<head sha>"`.
 `PUT` creates the repository (write permission; `201`/`200`), `DELETE`
 removes it — the same handlers as `PUT|DELETE /{owner}/{repo}`.
 `GET|PUT|DELETE …/policy` is the push policy document (`docs/POLICY.md`).
+`PUT …/protected-ref` creates an existing commit at a ref below one of the
+host's `git.protected_ref_prefixes`. Body: `{"name":"refs/deployments/42",
+"oid":"<full object id>"}`. It needs admin permission and returns `204` for a
+new ref or an idempotent replay, `409` when the ref already names another
+commit, and `404` when the commit is absent. Receive-pack cannot mutate these
+namespaces, including for an admin principal.
 
 `GET|PUT|DELETE /{o}/{r}/api/settings` (D24, 2026-08-21) is the repository's **settings in the WAL**: a TOML document
 restricted to `[bundles]`, `[maintenance]`, `[compaction]`, `[upstream]`, and `[integrations]`, merged over the
@@ -506,8 +512,9 @@ redelivers). Never cached, never served to the SPA.
 - Reads must be as fresh as a `git fetch` from the same host would be:
   after a push is acknowledged, the next API call (any node) reflects it.
 - Writes on the JSON surface are admin only: `PUT|DELETE /{o}/{r}/api`,
-  `PUT|DELETE …/policy`, `POST …/ops/{op}`. Content moves over git
-  (`git-receive-pack`) and LFS, never through JSON.
+  `PUT|DELETE …/policy`, `PUT …/protected-ref`, `POST …/ops/{op}`. Git object
+  content still moves through receive-pack; protected-ref only roots an
+  existing commit.
 
 ## 6. Minimal conformance checklist
 

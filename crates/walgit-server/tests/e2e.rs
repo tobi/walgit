@@ -3032,3 +3032,153 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
     assert!(stale.is_empty(), "stale reads:\n{}", stale.join("\n"));
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn protected_refs_are_admin_rooted_and_do_not_open_arbitrary_wants() -> TestResult {
+    let server = Server::start_with_tweak(|cfg| {
+        cfg.git.allow_any_sha1_in_want = false;
+        cfg.git.protected_ref_prefixes = vec!["refs/deployments/".into()];
+        cfg.server.auth.mode = walgit_config::AuthMode::Token;
+        cfg.server.auth.anonymous_read = false;
+        cfg.server.auth.tokens = vec![
+            walgit_config::StaticToken {
+                principal: "manager@example.com".into(),
+                token: "manager".into(),
+                token_env: None,
+                write: true,
+                admin: true,
+            },
+            walgit_config::StaticToken {
+                principal: "writer@example.com".into(),
+                token: "writer".into(),
+                token_env: None,
+                write: true,
+                admin: false,
+            },
+        ];
+    })
+    .await?;
+    let client = reqwest::Client::new();
+    let response = client
+        .put(format!("{}/t/protected", server.base_url))
+        .header("Authorization", "Bearer manager")
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+
+    let source = TestRepo::synthetic(1, 1)?;
+    let url = server.repo_url("t", "protected");
+    let push = |args: &[&str]| {
+        let mut command = vec![
+            "-c",
+            "http.extraHeader=Authorization: Bearer writer",
+            "push",
+            "-q",
+            &url,
+        ];
+        command.extend_from_slice(args);
+        git_in(&source, &command)
+    };
+    push(&["main"])?;
+    let main = git_in(&source, &["rev-parse", "main"])?.trim().to_string();
+
+    git_in(&source, &["checkout", "-q", "--orphan", "hidden"])?;
+    git_in(&source, &["rm", "-q", "-rf", "."])?;
+    std::fs::write(source.join("hidden.txt"), "hidden\n")?;
+    git_in(&source, &["add", "hidden.txt"])?;
+    git_in(&source, &["commit", "-q", "-m", "hidden"])?;
+    let hidden = git_in(&source, &["rev-parse", "HEAD"])?.trim().to_string();
+    push(&["HEAD:refs/heads/hidden"])?;
+    push(&["--delete", "hidden"])?;
+
+    git_in(&source, &["checkout", "-q", "--orphan", "unrooted"])?;
+    git_in(&source, &["rm", "-q", "-rf", "."])?;
+    std::fs::write(source.join("unrooted.txt"), "unrooted\n")?;
+    git_in(&source, &["add", "unrooted.txt"])?;
+    git_in(&source, &["commit", "-q", "-m", "unrooted"])?;
+    let unrooted = git_in(&source, &["rev-parse", "HEAD"])?.trim().to_string();
+    push(&["HEAD:refs/heads/unrooted"])?;
+    push(&["--delete", "unrooted"])?;
+
+    let body = |name: &str, oid: &str| serde_json::json!({ "name": name, "oid": oid });
+    let endpoint = format!("{}/t/protected/api/protected-ref", server.base_url);
+    let denied = client
+        .put(&endpoint)
+        .header("Authorization", "Bearer writer")
+        .json(&body("refs/deployments/d1", &hidden))
+        .send()
+        .await?;
+    assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let missing = client
+        .put(&endpoint)
+        .header("Authorization", "Bearer manager")
+        .json(&body("refs/deployments/missing", &"f".repeat(40)))
+        .send()
+        .await?;
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+
+    for expected in [
+        reqwest::StatusCode::NO_CONTENT,
+        reqwest::StatusCode::NO_CONTENT,
+    ] {
+        let response = client
+            .put(&endpoint)
+            .header("Authorization", "Bearer manager")
+            .json(&body("refs/deployments/d1", &hidden))
+            .send()
+            .await?;
+        assert_eq!(response.status(), expected);
+    }
+    let mismatch = client
+        .put(&endpoint)
+        .header("Authorization", "Bearer manager")
+        .json(&body("refs/deployments/d1", &main))
+        .send()
+        .await?;
+    assert_eq!(mismatch.status(), reqwest::StatusCode::CONFLICT);
+
+    let public = push(&["HEAD:refs/deployments/public"]);
+    assert!(public.is_err(), "public writer created a protected ref");
+
+    for protocol in ["0", "2"] {
+        let raw = tempfile::tempdir()?;
+        git(&["init", "-q", "--bare"], raw.path())?;
+        let denied_raw = Command::new("git")
+            .current_dir(raw.path())
+            .args([
+                "-c",
+                &format!("protocol.version={protocol}"),
+                "-c",
+                "http.extraHeader=Authorization: Bearer writer",
+                "fetch",
+                "--no-tags",
+                &url,
+                &unrooted,
+            ])
+            .output()?;
+        assert!(
+            !denied_raw.status.success(),
+            "protocol v{protocol} unadvertised raw object fetch succeeded"
+        );
+    }
+
+    let checkout = tempfile::tempdir()?;
+    git(&["init", "-q", "--bare"], checkout.path())?;
+    git(
+        &[
+            "-c",
+            "http.extraHeader=Authorization: Bearer writer",
+            "fetch",
+            "--no-tags",
+            &url,
+            "refs/deployments/d1",
+        ],
+        checkout.path(),
+    )?;
+    assert_eq!(
+        git_in(checkout.path(), &["rev-parse", "FETCH_HEAD"])?.trim(),
+        hidden
+    );
+    Ok(())
+}

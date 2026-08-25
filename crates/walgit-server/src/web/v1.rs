@@ -20,7 +20,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::Next,
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use serde::Serialize;
 
@@ -52,6 +52,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     for base in crate::web::api::REPO_API_BASES {
         r = r
             .route(base, get(repo_summary).put(repo_admin).delete(repo_admin))
+            .route(&format!("{base}/protected-ref"), put(repo_admin))
             .route(
                 &format!("{base}/policy"),
                 get(repo_admin).put(repo_admin).delete(repo_admin),

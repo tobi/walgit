@@ -20,7 +20,7 @@ pub use gix_hash::{self, ObjectId};
 use gix_object::{FindExt, FindHeader, Kind as ObjKind};
 use gix_traverse::tree::Visit as TreeVisit;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tracing::Instrument;
 
@@ -612,7 +612,8 @@ impl LocalRepo {
         // Deterministic HEAD -> refs/heads/main regardless of the host's
         // init.defaultBranch (git init writes master/main depending on config).
         std::fs::write(path.join("HEAD"), "ref: refs/heads/main\n").map_err(GitError::Io)?;
-        // Permissive upload-pack config so filter / any-sha1 fetches work.
+        // Partial-clone wants may name reachable blobs, but arbitrary
+        // unadvertised object wants stay disabled by default.
         // `pack.writeReverseIndex`: every pack this repo writes (index-pack on
         // ingest, repack in compaction) gets a `.rev` — git < 2.41 defaults it
         // off, and without one `pack-objects` builds the reverse index of the
@@ -620,7 +621,9 @@ impl LocalRepo {
         // the SSD host (2026-08-21, a large repository's serving copy had no .rev at all).
         for (k, v) in [
             ("uploadpack.allowFilter", "true"),
-            ("uploadpack.allowAnySHA1InWant", "true"),
+            ("uploadpack.allowAnySHA1InWant", "false"),
+            ("uploadpack.allowTipSHA1InWant", "true"),
+            ("uploadpack.allowReachableSHA1InWant", "true"),
             ("uploadpack.allowSidebandAll", "true"),
             ("pack.writeReverseIndex", "true"),
         ] {
@@ -672,6 +675,14 @@ impl LocalRepo {
 
     pub fn id(&self) -> &RepoId {
         &self.inner.id
+    }
+    pub fn configure_upload_pack(&self, allow_any_sha1_in_want: bool) -> Result<(), GitError> {
+        self.git_cmd_sync(&[
+            "config",
+            "uploadpack.allowAnySHA1InWant",
+            if allow_any_sha1_in_want { "true" } else { "false" },
+        ])?;
+        Ok(())
     }
     pub fn path(&self) -> &Path {
         &self.inner.path
@@ -1460,6 +1471,53 @@ impl LocalRepo {
     pub fn has_object(&self, oid: &gix_hash::oid) -> bool {
         let repo = self.gix();
         repo.has_object(oid)
+    }
+    pub fn is_commit(&self, oid: &gix_hash::oid) -> Result<bool, GitError> {
+        let repo = self.gix();
+        Ok(matches!(
+            repo.objects.try_header(oid).map_err(GitError::Gix)?,
+            Some(header) if header.kind == ObjKind::Commit
+        ))
+    }
+
+    /// Whether every requested object is reachable from the current ref set.
+    pub async fn wants_reachable(&self, wants: &[gix_hash::ObjectId]) -> Result<bool, GitError> {
+        let mut remaining: HashSet<String> = wants.iter().map(ToString::to_string).collect();
+        if remaining.is_empty() {
+            return Ok(true);
+        }
+        let mut child = Command::new("git")
+            .current_dir(&self.inner.path)
+            .env("GIT_DIR", &self.inner.path)
+            .args(["rev-list", "--objects", "--all"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(GitError::Io)?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            GitError::Io(std::io::Error::other("git rev-list stdout unavailable"))
+        })?;
+        let mut lines = BufReader::new(stdout).lines();
+        while let Some(line) = lines.next_line().await.map_err(GitError::Io)? {
+            let oid = line
+                .split_once(' ')
+                .map_or(line.as_str(), |(oid, _)| oid);
+            remaining.remove(oid);
+            if remaining.is_empty() {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Ok(true);
+            }
+        }
+        let output = child.wait_with_output().await.map_err(GitError::Io)?;
+        if !output.status.success() {
+            return Err(GitError::Subprocess {
+                cmd: "git rev-list --objects --all".into(),
+                status: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+        Ok(false)
     }
 
     /// Write one object into the loose store (`objects/xx/yyyy…`) with a known

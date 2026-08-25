@@ -32,6 +32,11 @@ file just lies.
 Missing file / empty `rules` = allow-all (anyone with write may move any
 ref). That is the only implicit default.
 
+Host-configured `git.protected_ref_prefixes` are stricter than this document:
+receive-pack rejects every mutation below those namespaces before evaluating
+per-repository rules or bypasses. An admin can create an existing commit there
+only through `PUT /{owner}/{repo}/api/protected-ref`.
+
 ## Envelope
 
 ```json
