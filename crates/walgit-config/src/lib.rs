@@ -228,6 +228,7 @@ pub struct StoreConfig {
     pub prefix: String,
     pub gcs: GcsConfig,
     pub s3: S3Config,
+    pub azure: AzureConfig,
     pub max_retries: u32,
     /// Objects larger than this use resumable/multipart upload.
     pub multipart_threshold: ByteSize,
@@ -240,6 +241,8 @@ pub enum StoreBackend {
     #[default]
     Gcs,
     S3,
+    /// Azure Blob Storage.
+    Azure,
     /// Tests only.
     Memory,
 }
@@ -278,6 +281,28 @@ pub struct S3Config {
     pub access_key_env: String,
     pub secret_key_env: String,
     pub force_path_style: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AzureCredential {
+    /// Microsoft Entra Workload Identity on Kubernetes.
+    #[default]
+    WorkloadIdentity,
+    /// Storage account key read from `account_key_env`.
+    AccountKey,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AzureConfig {
+    /// Blob endpoint. Empty uses `https://{account}.blob.core.windows.net`.
+    pub endpoint: String,
+    /// Storage account name.
+    pub account: String,
+    pub credential: AzureCredential,
+    /// Environment variable holding the account key.
+    pub account_key_env: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1078,6 +1103,7 @@ impl Default for StoreConfig {
             prefix: String::new(),
             gcs: GcsConfig::default(),
             s3: S3Config::default(),
+            azure: AzureConfig::default(),
             max_retries: 8,
             multipart_threshold: ByteSize::mib(64),
             multipart_part_size: ByteSize::mib(32),
@@ -1103,6 +1129,16 @@ impl Default for S3Config {
             access_key_env: "AWS_ACCESS_KEY_ID".into(),
             secret_key_env: "AWS_SECRET_ACCESS_KEY".into(),
             force_path_style: true,
+        }
+    }
+}
+impl Default for AzureConfig {
+    fn default() -> Self {
+        AzureConfig {
+            endpoint: String::new(),
+            account: String::new(),
+            credential: AzureCredential::WorkloadIdentity,
+            account_key_env: "AZURE_STORAGE_ACCOUNT_KEY".into(),
         }
     }
 }
@@ -1381,6 +1417,37 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.store.backend == StoreBackend::Azure {
+            let azure = &self.store.azure;
+            anyhow::ensure!(
+                !azure.account.is_empty(),
+                "store.azure.account must be set for the azure backend"
+            );
+            anyhow::ensure!(
+                azure.endpoint.is_empty()
+                    || azure.endpoint.starts_with("https://")
+                    || azure.endpoint.starts_with("http://"),
+                "store.azure.endpoint must be an http(s) origin"
+            );
+            match azure.credential {
+                AzureCredential::WorkloadIdentity => anyhow::ensure!(
+                    azure.endpoint.is_empty() || azure.endpoint.starts_with("https://"),
+                    "store.azure.endpoint must use https for workload_identity credentials"
+                ),
+                AzureCredential::AccountKey => {
+                    anyhow::ensure!(
+                        !azure.account_key_env.is_empty(),
+                        "store.azure.account_key_env must be set for account_key credentials"
+                    );
+                    if azure.endpoint.starts_with("http://") {
+                        anyhow::ensure!(
+                            origin_is_loopback(&azure.endpoint),
+                            "store.azure.endpoint may use http only for a loopback account_key endpoint"
+                        );
+                    }
+                }
+            }
+        }
         anyhow::ensure!(!self.store.bucket.is_empty(), "store.bucket must be set");
         let t = &self.server.tls;
         match t.mode {
@@ -1971,6 +2038,85 @@ webhook_secret = "s"
         assert_eq!(c.events.webhook_secret.as_deref(), Some("s"));
         let err = Config::parse("[events]\nwebhook_url = \"ftp://x\"\n").unwrap_err();
         assert!(err.to_string().contains("webhook_url"), "{err}");
+    }
+
+    #[test]
+    fn azure_backend_parses_explicit_credentials() {
+        let c = Config::parse(
+            r#"
+[store]
+backend = "azure"
+bucket = "walgit-test"
+
+[store.azure]
+endpoint = "http://127.0.0.1:10000"
+account = "devstoreaccount1"
+credential = "account_key"
+account_key_env = "AZURE_STORAGE_ACCOUNT_KEY"
+"#,
+        )
+        .unwrap();
+        assert_eq!(c.store.backend, StoreBackend::Azure);
+        assert_eq!(c.store.azure.credential, AzureCredential::AccountKey);
+        assert_eq!(c.store.azure.account, "devstoreaccount1");
+    }
+
+    #[test]
+    fn azure_backend_defaults_to_workload_identity() {
+        let c = Config::parse(
+            "[store]\nbackend = \"azure\"\nbucket = \"b\"\n[store.azure]\naccount = \"account\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.store.azure.credential, AzureCredential::WorkloadIdentity);
+    }
+
+    #[test]
+    fn azure_workload_identity_requires_https() {
+        let err = Config::parse(
+            "[store]\nbackend = \"azure\"\nbucket = \"b\"\n[store.azure]\naccount = \"a\"\nendpoint = \"http://127.0.0.1:10000\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("https") && err.contains("workload_identity"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn azure_account_key_http_requires_loopback() {
+        let err = Config::parse(
+            "[store]\nbackend = \"azure\"\nbucket = \"b\"\n[store.azure]\naccount = \"a\"\ncredential = \"account_key\"\nendpoint = \"http://blob.example.com\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("loopback") && err.contains("account_key"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn azure_backend_requires_an_account() {
+        let err = Config::parse("[store]\nbackend = \"azure\"\nbucket = \"b\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("store.azure.account"), "{err}");
+    }
+
+    #[test]
+    fn azure_section_denies_unknown_fields() {
+        let err = format!(
+            "{:#}",
+            Config::parse(
+                "[store]\nbackend = \"azure\"\nbucket = \"b\"\n[store.azure]\naccount = \"a\"\nuse_aad = true\n",
+            )
+            .unwrap_err()
+        );
+        assert!(
+            err.contains("unknown field") && err.contains("use_aad"),
+            "{err}"
+        );
     }
 
     #[test]

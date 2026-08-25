@@ -7,7 +7,7 @@
 //! * conditional writes (`Create` = if-absent, `Update(v)` = CAS on version),
 //! * conditional deletes, range reads, streaming bodies, prefix listing.
 //!
-//! [`Version`] is opaque to callers: GCS generation, S3/rustfs ETag, or a
+//! [`Version`] is opaque to callers: GCS generation, S3/Azure ETag, or a
 //! counter in [`memory::MemoryStore`]. Callers must never parse it.
 
 use std::{fmt, ops::Range, pin::Pin, sync::Arc};
@@ -18,6 +18,8 @@ use tracing::Instrument;
 
 pub mod coord;
 pub use coord::CoordError;
+#[cfg(feature = "azure")]
+pub mod azure;
 pub mod fault;
 #[cfg(feature = "gcs")]
 pub mod gcs;
@@ -200,7 +202,7 @@ pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 
 #[async_trait::async_trait]
 pub trait ObjectStore: Send + Sync + 'static {
-    /// Human-readable backend id for logs/metrics ("gcs", "s3", "memory").
+    /// Human-readable backend id for logs/metrics ("gcs", "s3", "azure", "memory").
     fn backend(&self) -> &'static str;
     /// Whether this store is a prefixing wrapper. Used to avoid duplicate
     /// operation spans when prefixes are nested.
@@ -244,23 +246,22 @@ pub trait ObjectStore: Send + Sync + 'static {
 
     /// How a trusted edge (nginx `X-Accel-Redirect`) fetches `key` on the client's behalf:
     /// a URL it can `proxy_pass`, and the `Authorization` value to send with it, if any.
-    /// GCS: the path-style URL + this process's bearer token (no token on the edge, nothing to
-    /// refresh). S3: a presigned GET URL (`Range` is not a signed header, so the edge may slice).
+    /// GCS: the path-style URL + this process's bearer token. S3 and Azure:
+    /// a signed GET URL (`Range` is not a signed header, so the edge may slice).
     /// Backends without one return `None` and the bytes stream through walgit.
     async fn accel_target(&self, _key: &str) -> Option<AccelTarget> {
         None
     }
 
-    /// Whether [`ObjectStore::compose`] is available. GCS: native (<= 32 sources
-    /// per call, no data movement). S3: multipart `UploadPartCopy` (server-side copy,
-    /// no bytes through this process beyond one small part).
+    /// Whether [`ObjectStore::compose`] is available. GCS: native (<= 32 sources).
+    /// S3: multipart `UploadPartCopy`. Azure: `Put Block From URL` + block list.
     fn supports_compose(&self) -> bool {
         false
     }
 
-    /// Whether compose is a metadata operation (GCS). When false (S3) a compose still
-    /// moves bytes inside the bucket, so callers that only want a parallel upload of one
-    /// file use the backend's multipart PUT instead of part objects + compose.
+    /// Whether compose is a metadata operation (GCS). When false (S3/Azure),
+    /// bytes move inside the store, so callers that only want a parallel upload
+    /// use the backend's multipart PUT instead of part objects + compose.
     fn compose_is_native(&self) -> bool {
         false
     }
@@ -656,6 +657,16 @@ pub async fn open_store(cfg: &walgit_config::Config) -> anyhow::Result<DynStore>
             #[cfg(not(feature = "gcs"))]
             {
                 anyhow::bail!("gcs backend requires the `gcs` feature")
+            }
+        }
+        walgit_config::StoreBackend::Azure => {
+            #[cfg(feature = "azure")]
+            {
+                Arc::new(azure::AzureStore::new(&cfg.store).await?)
+            }
+            #[cfg(not(feature = "azure"))]
+            {
+                anyhow::bail!("azure backend requires the `azure` feature")
             }
         }
     };
