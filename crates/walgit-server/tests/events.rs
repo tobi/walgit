@@ -7,23 +7,37 @@ const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 
 type TestResult = anyhow::Result<()>;
 use harness::{Server, TestRepo, git_in};
+use parking_lot::Mutex;
+use std::process::Command;
 use std::time::Duration;
 
-type Captured = std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+type Captured = std::sync::Arc<Mutex<Vec<Vec<serde_json::Value>>>>;
 
 /// The webhook sink's target: records every event it receives (the bus as
 /// the test sees it).
 async fn webhook() -> (String, Captured) {
+    webhook_failing_on(None).await
+}
+
+async fn webhook_failing_on(fail_on: Option<usize>) -> (String, Captured) {
     let captured: Captured = Default::default();
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let app = axum::Router::new().route(
         "/events",
         axum::routing::post({
             let captured = captured.clone();
+            let calls = calls.clone();
             move |axum::Json(batch): axum::Json<Vec<serde_json::Value>>| {
                 let captured = captured.clone();
+                let calls = calls.clone();
                 async move {
-                    captured.lock().unwrap().extend(batch);
-                    axum::http::StatusCode::OK
+                    let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    captured.lock().push(batch);
+                    if fail_on == Some(call) {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        axum::http::StatusCode::OK
+                    }
                 }
             }
         }),
@@ -43,6 +57,19 @@ fn bridge_cfg(url: &str, sweep: Duration) -> impl FnOnce(&mut walgit_config::Con
     }
 }
 
+fn bounded_bridge_cfg(
+    url: &str,
+    max_entries: usize,
+    max_events: usize,
+) -> impl FnOnce(&mut walgit_config::Config) + '_ {
+    move |c| {
+        c.events.webhook_url = Some(url.to_string());
+        c.events.sweep_interval = Duration::ZERO;
+        c.events.max_batch_entries = max_entries;
+        c.events.max_batch_events = max_events;
+    }
+}
+
 async fn cursor_seq(server: &Server, owner: &str, name: &str) -> Option<u64> {
     use walgit_store::ObjectStoreExt;
     let id = walgit_git::RepoId::new(owner, name).unwrap();
@@ -55,7 +82,7 @@ async fn cursor_seq(server: &Server, owner: &str, name: &str) -> Option<u64> {
 async fn wait_for(captured: &Captured, n: usize) -> Vec<serde_json::Value> {
     let t0 = std::time::Instant::now();
     loop {
-        let got = captured.lock().unwrap().clone();
+        let got: Vec<_> = captured.lock().iter().flatten().cloned().collect();
         if got.len() >= n {
             return got;
         }
@@ -65,6 +92,10 @@ async fn wait_for(captured: &Captured, n: usize) -> Vec<serde_json::Value> {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+fn captured_event_count(captured: &Captured) -> usize {
+    captured.lock().iter().map(Vec::len).sum()
 }
 
 fn gcs_notification(object: &str, event_type: &str) -> serde_json::Value {
@@ -97,7 +128,7 @@ async fn bridge_publishes_from_cursor_exactly_once() -> TestResult {
     git_in(&src, &["commit", "--allow-empty", "-m", "b"])?;
     git_in(&src, &["push"])?;
     assert!(
-        captured.lock().unwrap().is_empty(),
+        captured.lock().is_empty(),
         "nothing reaches the bus until the bridge runs"
     );
 
@@ -127,7 +158,7 @@ async fn bridge_publishes_from_cursor_exactly_once() -> TestResult {
     let r = bridge.catch_up(&id).await?;
     assert_eq!((r.from_seq, r.head_seq, r.emitted), (2, 2, 0));
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(captured.lock().unwrap().len(), 2);
+    assert_eq!(captured_event_count(&captured), 2);
 
     // The GCS notification of the manifest CAS is the wake-up.
     git_in(&src, &["push", "origin", ":refs/heads/main"])?;
@@ -198,7 +229,7 @@ async fn bridge_publishes_from_cursor_exactly_once() -> TestResult {
         .await?;
     assert_eq!(resp.status(), 200);
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(captured.lock().unwrap().len(), 3);
+    assert_eq!(captured_event_count(&captured), 3);
     Ok(())
 }
 
@@ -222,38 +253,129 @@ async fn bridge_sweep_timer_publishes_without_notifications() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bridge_sink_failure_keeps_the_cursor() -> TestResult {
-    // Nothing listens here: every delivery fails.
-    let server =
-        Server::start_with_tweak(bridge_cfg("http://127.0.0.1:1/events", Duration::ZERO)).await?;
+async fn bridge_drains_backlog_as_bounded_whole_entry_deliveries() -> TestResult {
+    let (url, captured) = webhook().await;
+    let server = Server::start_with_tweak(bounded_bridge_cfg(&url, 1, 100)).await?;
     let bridge = server.state.bridge.clone().expect("bridge enabled");
-    server.put_repo("t", "r").await?;
-    let id = walgit_git::RepoId::new("t", "r")?;
+    server.put_repo("t", "bounded").await?;
+    let id = walgit_git::RepoId::new("t", "bounded")?;
     let src = TestRepo::synthetic(1, 1)?;
     git_in(&src, &["commit", "--allow-empty", "-m", "a"])?;
     git_in(&src, &["branch", "-M", "main"])?;
     git_in(
         &src,
-        &["remote", "add", "origin", &server.repo_url("t", "r")],
+        &[
+            "remote",
+            "add",
+            "origin",
+            &server.repo_url("t", "bounded"),
+        ],
     )?;
     git_in(&src, &["push", "-u", "origin", "main"])?;
+    for message in ["b", "c"] {
+        git_in(&src, &["commit", "--allow-empty", "-m", message])?;
+        git_in(&src, &["push"])?;
+    }
 
-    let err = bridge.catch_up(&id).await.expect_err("sink down");
+    let report = bridge.catch_up(&id).await?;
+    assert_eq!((report.from_seq, report.head_seq, report.emitted), (0, 3, 3));
+    assert_eq!(cursor_seq(&server, "t", "bounded").await, Some(3));
+    let batches = captured.lock().clone();
+    assert_eq!(batches.len(), 3);
+    assert!(batches.iter().all(|batch| batch.len() == 1));
+    let seqs: Vec<_> = batches
+        .iter()
+        .map(|batch| batch[0]["_walgit"]["seq"].as_str().unwrap())
+        .collect();
+    assert_eq!(seqs, ["1", "2", "3"]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bridge_failure_resumes_after_last_accepted_batch() -> TestResult {
+    let (url, captured) = webhook_failing_on(Some(2)).await;
+    let server = Server::start_with_tweak(bounded_bridge_cfg(&url, 1, 100)).await?;
+    let bridge = server.state.bridge.clone().expect("bridge enabled");
+    server.put_repo("t", "resume").await?;
+    let id = walgit_git::RepoId::new("t", "resume")?;
+    let src = TestRepo::synthetic(1, 1)?;
+    git_in(&src, &["commit", "--allow-empty", "-m", "a"])?;
+    git_in(&src, &["branch", "-M", "main"])?;
+    git_in(
+        &src,
+        &["remote", "add", "origin", &server.repo_url("t", "resume")],
+    )?;
+    git_in(&src, &["push", "-u", "origin", "main"])?;
+    for message in ["b", "c"] {
+        git_in(&src, &["commit", "--allow-empty", "-m", message])?;
+        git_in(&src, &["push"])?;
+    }
+
+    let err = bridge.catch_up(&id).await.expect_err("second delivery fails");
     assert!(err.to_string().contains("webhook sink"), "{err:#}");
     assert_eq!(
-        cursor_seq(&server, "t", "r").await,
-        None,
-        "cursor must not advance"
+        cursor_seq(&server, "t", "resume").await,
+        Some(1),
+        "the accepted first batch advances durably"
     );
 
-    let resp = reqwest::Client::new()
-        .post(format!("{}/_events/notify", server.base_url))
-        .json(&gcs_notification(
-            "repos/t/r/manifest.pb",
-            "OBJECT_FINALIZE",
-        ))
-        .send()
-        .await?;
-    assert_eq!(resp.status(), 503, "non-2xx so Pub/Sub redelivers");
+    let report = bridge.catch_up(&id).await?;
+    assert_eq!((report.from_seq, report.head_seq, report.emitted), (1, 3, 2));
+    assert_eq!(cursor_seq(&server, "t", "resume").await, Some(3));
+    let batches = captured.lock().clone();
+    let seqs: Vec<_> = batches
+        .iter()
+        .map(|batch| batch[0]["_walgit"]["seq"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        seqs,
+        ["1", "2", "2", "3"],
+        "only the failed batch is retried; the accepted first batch is not replayed"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn receive_pack_rejects_one_entry_larger_than_the_delivery_limit() -> TestResult {
+    let (url, captured) = webhook().await;
+    let server = Server::start_with_tweak(bounded_bridge_cfg(&url, 128, 1)).await?;
+    server.put_repo("t", "oversized").await?;
+    let src = TestRepo::synthetic(1, 1)?;
+    git_in(&src, &["commit", "--allow-empty", "-m", "a"])?;
+    git_in(&src, &["branch", "-M", "main"])?;
+    git_in(
+        &src,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &server.repo_url("t", "oversized"),
+        ],
+    )?;
+
+    let output = Command::new("git")
+        .current_dir(&*src)
+        .args([
+            "push",
+            "origin",
+            "main:refs/heads/main",
+            "main:refs/heads/other",
+        ])
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("events.max_batch_events is 1"), "{stderr}");
+
+    let id = walgit_git::RepoId::new("t", "oversized")?;
+    let handle = server.state.registry.open(&id).await?;
+    let guard = handle.sync_refs().await?;
+    assert_eq!(
+        handle.manifest().head_seq,
+        0,
+        "the oversized transaction is rejected before WAL publication"
+    );
+    drop(guard);
+    assert_eq!(captured_event_count(&captured), 0);
+    assert_eq!(cursor_seq(&server, "t", "oversized").await, None);
     Ok(())
 }

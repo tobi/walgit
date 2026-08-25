@@ -1250,14 +1250,32 @@ async fn receive_pack_process(
     let mut txn = ev.publish;
     let mut per_ref_policy = ev.per_ref;
 
+    // Writer-side peel: replicas advertise annotated tags without objects.
+    local.fill_peeled(&mut txn);
+    let meta = push_meta(&caps, principal, &txn, &request_id);
+    if let Err(e) = crate::events::ensure_entry_fits(
+        &route_id,
+        &txn,
+        &meta,
+        st.cfg.events.max_batch_events,
+        st.cfg.events.max_batch_bytes.as_u64(),
+    ) {
+        tracing::warn!(repo = %route_id, error = %e, "receive-pack: event delivery limit exceeded");
+        metrics::counter!("walgit_push_refused_total", "reason" => "event_delivery_limit")
+            .increment(1);
+        let message = e.to_string();
+        for (_, result) in &mut per_ref_policy {
+            if result.is_ok() {
+                *result = Err(message.clone());
+            }
+        }
+        return Ok(build_report(&caps, unpack_result, &per_ref_policy).await);
+    }
+
     // Release the sync read guard before publishing. `publish_push_synced`
     // reuses this request's freshness check while still syncing after CAS
     // conflicts.
     drop(_guard);
-
-    // Writer-side peel: replicas advertise annotated tags without objects.
-    local.fill_peeled(&mut txn);
-    let meta = push_meta(&caps, principal, &txn, &request_id);
     let pack_ref = match ingest {
         Ok(Some(p)) => Some(p),
         _ => None,

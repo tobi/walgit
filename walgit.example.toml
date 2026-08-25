@@ -278,7 +278,10 @@ metrics = true                    # Prometheus on /metrics
 lock_wait_warn = "1s"             # WARN "lock wait" (lock, repo, wait_ms, request_id) when a request waits longer than this on
                                   # rw/sync_mutex/pack_mutex/bulk permits; histogram walgit_lock_wait_seconds{lock}
 
-[events]                          # docs/EVENTS.md — read only by the bridge (roles ∋ "events"); never gates a push
-# webhook_url = "https://hooks.example.com/walgit"   # each batch of ref events is POSTed as a JSON array
+[events]                          # docs/EVENTS.md — the bridge reads the WAL; delivery admission never calls the sink
+# webhook_url = "https://hooks.example.com/walgit"   # bounded JSON arrays of whole WAL entries
 # webhook_secret = ""             # X-Walgit-Signature: sha256=<HMAC-SHA256 of the body>; unset = unsigned
 # sweep_interval = "5m"           # backstop + health check (warns when a sweep finds unpublished entries); 0 = off
+# max_batch_entries = 128         # max WAL sequence span read and considered for one delivery
+# max_batch_events = 1000         # max ref events in one delivery; one larger ref transaction is rejected before publish
+# max_batch_bytes = "1 MiB"       # max serialized JSON body; one larger ref transaction is rejected before publish

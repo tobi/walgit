@@ -2,12 +2,12 @@
 //! The only producer of events.
 //!
 //! `catch_up(repo)`: read the durable cursor `events/cursor.json` (last seq
-//! published), the fresh manifest, and the log entries `(cursor, head_seq]`;
-//! convert to `ref` events; deliver to every sink; CAS the cursor to
-//! `head_seq`. A sink failure leaves the cursor where it was, so the next
-//! wake-up retries the same range — at-least-once, never a gap, and
-//! `head_seq - cursor` is the lag. An event is published iff its entry is
-//! durable; nothing on the push path knows events exist.
+//! published), the fresh manifest, and bounded groups of whole WAL entries
+//! after the cursor. Each group is delivered and cursor-CASed before the next
+//! group is read. A sink failure therefore retries only the undelivered range.
+//! Delivery remains at-least-once because a crash can happen after the sink
+//! accepts a group but before its cursor CAS. An event is published iff its
+//! entry is durable; nothing on the push path knows events exist.
 //!
 //! Wake-ups, both idempotent (they only ever call `catch_up`):
 //! * `POST /_events/notify` with a bucket notification that names a finalized
@@ -58,6 +58,9 @@ pub struct Bridge {
     /// carry it, the registry's store strips it.
     store_prefix: String,
     sinks: Vec<Box<dyn Sink>>,
+    max_batch_entries: usize,
+    max_batch_events: usize,
+    max_batch_bytes: u64,
     serial: tokio::sync::Mutex<()>,
 }
 
@@ -89,11 +92,15 @@ impl Bridge {
             registry,
             store_prefix: cfg.store_prefix(),
             sinks,
+            max_batch_entries: cfg.events.max_batch_entries,
+            max_batch_events: cfg.events.max_batch_events,
+            max_batch_bytes: cfg.events.max_batch_bytes.as_u64(),
             serial: tokio::sync::Mutex::new(()),
         }))
     }
 
-    /// Publish everything committed after the cursor, then advance it.
+    /// Publish committed entries in bounded whole-entry groups, durably
+    /// advancing after each accepted group.
     pub async fn catch_up(&self, id: &RepoId) -> anyhow::Result<CatchUp> {
         let _serial = self.serial.lock().await;
         let handle = self.registry.open(id).await?;
@@ -110,7 +117,7 @@ impl Bridge {
         let readable_from = manifest.min_seq.saturating_sub(1);
         let store = handle.store();
 
-        let (cursor, version) = match store.get_bytes(CURSOR_KEY).await? {
+        let (cursor, mut version) = match store.get_bytes(CURSOR_KEY).await? {
             Some((meta, bytes)) => {
                 let c: Cursor = serde_json::from_slice(&bytes).context("events/cursor.json")?;
                 (Some(c.published_seq), Some(meta.version))
@@ -127,8 +134,9 @@ impl Bridge {
                 "events bridge: entries folded into a checkpoint before they were published; consumers backfill from the WAL");
             from = readable_from;
         }
+        let report_from = from;
         metrics::gauge!("events_bridge_lag_entries", "repo" => id.to_string())
-            .set((head - from) as f64);
+            .set(head.saturating_sub(from) as f64);
         let mut report = CatchUp {
             repo: id.to_string(),
             from_seq: from,
@@ -137,38 +145,93 @@ impl Bridge {
             gap,
         };
 
-        if head > from {
-            let entries = handle.read_log(from + 1, Some(head)).await?;
+        while from < head {
+            let read_to = head.min(from.saturating_add(self.max_batch_entries as u64));
+            let entries = handle.read_log(from + 1, Some(read_to)).await?;
             let mut batch = Vec::new();
-            events::refs_from_entries(id, &entries, &mut batch);
-            // A failing sink returns here: cursor untouched, retried on the
-            // next wake-up.
-            self.publish(&batch).await?;
-            report.emitted = batch.len();
-        }
+            let mut batch_bytes = 2_u64;
+            let mut batch_end = from;
+            let mut consumed_all = true;
 
-        if cursor != Some(head) {
+            for entry in entries {
+                let event_count = events::ref_event_count(&entry);
+                anyhow::ensure!(
+                    event_count <= self.max_batch_events,
+                    "WAL entry {} cannot fit one event delivery ({} events)",
+                    entry.seq,
+                    event_count
+                );
+                let mut entry_events = Vec::with_capacity(event_count);
+                events::refs_from_entries(id, std::slice::from_ref(&entry), &mut entry_events);
+                let entry_bytes = events::batch_json_len(&entry_events)?;
+                anyhow::ensure!(
+                    entry_bytes <= self.max_batch_bytes,
+                    "WAL entry {} cannot fit one event delivery ({} bytes)",
+                    entry.seq,
+                    entry_bytes
+                );
+                let separator = u64::from(!batch.is_empty() && !entry_events.is_empty());
+                let next_bytes = batch_bytes + entry_bytes.saturating_sub(2) + separator;
+                if batch.len() + entry_events.len() > self.max_batch_events
+                    || next_bytes > self.max_batch_bytes
+                {
+                    consumed_all = false;
+                    break;
+                }
+                batch.extend(entry_events);
+                batch_bytes = next_bytes;
+                batch_end = entry.seq;
+            }
+
+            if consumed_all {
+                // Burned log slots contain no entry. Advancing across them is
+                // safe after every committed entry in this bounded range was read.
+                batch_end = read_to;
+            }
+            anyhow::ensure!(batch_end > from, "events bridge made no cursor progress after seq {from}");
+
+            // A failing sink returns here. Earlier accepted groups already have
+            // durable cursors; this group is retried in full.
+            self.publish(&batch).await?;
             let body = serde_json::to_vec(&Cursor {
-                published_seq: head,
+                published_seq: batch_end,
                 updated_at: Utc::now().to_rfc3339(),
             })?;
-            let mode = match version {
+            let mode = match version.clone() {
                 Some(v) => PutMode::Update(v),
                 None => PutMode::Create,
             };
             match store.put_bytes(CURSOR_KEY, body, mode).await {
-                Ok(_) => {}
-                // Another bridge instance advanced it: our emission was a
-                // duplicate (dedup key), theirs stands.
+                Ok(meta) => version = Some(meta.version),
                 Err(StoreError::PreconditionFailed { .. }) => {
-                    tracing::warn!(repo = %id, "events bridge: cursor CAS lost (two bridges?)")
+                    anyhow::bail!(
+                        "events cursor changed while advancing {id} to {batch_end}; delivery may be duplicated"
+                    )
+                }
+                Err(e) => return Err(e.into()),
+            }
+            report.emitted += batch.len();
+            from = batch_end;
+            metrics::gauge!("events_bridge_lag_entries", "repo" => id.to_string())
+                .set(head.saturating_sub(from) as f64);
+        }
+
+        // Seed an absent cursor even when there is no readable work.
+        if cursor.is_none() && version.is_none() {
+            let body = serde_json::to_vec(&Cursor {
+                published_seq: from,
+                updated_at: Utc::now().to_rfc3339(),
+            })?;
+            match store.put_bytes(CURSOR_KEY, body, PutMode::Create).await {
+                Ok(_) => {}
+                Err(StoreError::PreconditionFailed { .. }) => {
+                    anyhow::bail!("events cursor changed while initializing {id}")
                 }
                 Err(e) => return Err(e.into()),
             }
         }
-        metrics::gauge!("events_bridge_lag_entries", "repo" => id.to_string()).set(0.0);
         if report.emitted > 0 {
-            tracing::info!(repo = %id, from = from, head = head, emitted = report.emitted,
+            tracing::info!(repo = %id, from = report_from, head = head, emitted = report.emitted,
                 "events bridge: published");
         }
         Ok(report)
@@ -384,6 +447,9 @@ mod tests {
             ),
             store_prefix: "prefix/".into(),
             sinks: Vec::new(),
+            max_batch_entries: 128,
+            max_batch_events: 1_000,
+            max_batch_bytes: 1024 * 1024,
             serial: tokio::sync::Mutex::new(()),
         };
         let id = b

@@ -741,8 +741,9 @@ pub enum ObjectFormat {
 }
 
 /// Events (`docs/EVENTS.md`): the bridge (`Role::Events`) tails every repo's
-/// WAL from a durable cursor and publishes `ref` events to the webhook. Only the
-/// bridge reads this section; nothing on the push path does.
+/// WAL from a durable cursor and publishes bounded batches of `ref` events.
+/// Receive-pack also uses the bounds to reject an indivisible transaction
+/// that no bridge delivery could accept.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct EventsConfig {
@@ -756,6 +757,12 @@ pub struct EventsConfig {
     /// warns when a sweep finds unpublished entries. `0` = off.
     #[serde(with = "humantime_serde")]
     pub sweep_interval: Duration,
+    /// Maximum WAL entries read and considered for one webhook delivery.
+    pub max_batch_entries: usize,
+    /// Maximum ref events in one webhook delivery.
+    pub max_batch_events: usize,
+    /// Maximum serialized JSON bytes in one webhook delivery.
+    pub max_batch_bytes: ByteSize,
 }
 
 impl Default for EventsConfig {
@@ -764,6 +771,9 @@ impl Default for EventsConfig {
             webhook_url: None,
             webhook_secret: None,
             sweep_interval: Duration::from_secs(300),
+            max_batch_entries: 128,
+            max_batch_events: 1_000,
+            max_batch_bytes: ByteSize::mib(1),
         }
     }
 }
@@ -1576,6 +1586,18 @@ impl Config {
                 "events.webhook_url must be an http(s) URL"
             );
         }
+        anyhow::ensure!(
+            self.events.max_batch_entries > 0,
+            "events.max_batch_entries must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.events.max_batch_events > 0,
+            "events.max_batch_events must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.events.max_batch_bytes.as_u64() >= 2,
+            "events.max_batch_bytes must fit a JSON array"
+        );
         Ok(())
     }
 
@@ -1964,11 +1986,25 @@ audiences = ["walgit-cli", "https://git.example.com"]
 sweep_interval = "1m"
 webhook_url = "https://hooks.example.com/walgit"
 webhook_secret = "s"
+max_batch_entries = 12
+max_batch_events = 34
+max_batch_bytes = "512 KiB"
 "#,
         )
         .unwrap();
         assert_eq!(c.events.sweep_interval, Duration::from_secs(60));
         assert_eq!(c.events.webhook_secret.as_deref(), Some("s"));
+        assert_eq!(c.events.max_batch_entries, 12);
+        assert_eq!(c.events.max_batch_events, 34);
+        assert_eq!(c.events.max_batch_bytes, ByteSize::kib(512));
+        for bad in [
+            "max_batch_entries = 0",
+            "max_batch_events = 0",
+            "max_batch_bytes = \"1 B\"",
+        ] {
+            let err = Config::parse(&format!("[events]\n{bad}\n")).unwrap_err();
+            assert!(err.to_string().contains("events.max_batch"), "{err}");
+        }
         let err = Config::parse("[events]\nwebhook_url = \"ftp://x\"\n").unwrap_err();
         assert!(err.to_string().contains("webhook_url"), "{err}");
     }

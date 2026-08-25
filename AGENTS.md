@@ -373,11 +373,14 @@ decision in §4 — or the PR is; never "fix later".
   `server.drain_timeout`, exit. Test `tests/drain.rs`.
 - **D32** **Events are produced from the WAL by one small service, never by the push path** (`docs/EVENTS.md`).
   The **events bridge** (`roles=["events"]`) tails each repo's log from a durable per-repo cursor
-  (`events/cursor.json`), converts committed PUSH/REF_UPDATE entries to `ref` events, POSTs each batch to
-  `events.webhook_url` (JSON array; `X-Walgit-Delivery` = sha1 of the body; `X-Walgit-Signature: sha256=<HMAC>`
-  when `webhook_secret` is set), advances the cursor: published iff durable, a crash loses nothing, lag =
-  `head_seq − cursor`. Writers and the WAL crate contain no event code. Wake-ups: `POST /_events/notify` from a
-  bucket notification (at-least-once) + a periodic sweep as backstop. Dedup key `(repo, seq, ref_name)`.
+  (`events/cursor.json`), converts committed PUSH/REF_UPDATE entries to `ref` events, and POSTs bounded groups of
+  whole WAL entries to `events.webhook_url` (JSON array; `X-Walgit-Delivery` = sha1 of the body;
+  `X-Walgit-Signature: sha256=<HMAC>` when `webhook_secret` is set). Limits are `max_batch_entries`,
+  `max_batch_events`, and `max_batch_bytes`; receive-pack rejects an indivisible transaction that exceeds an
+  event or byte limit before publication. The bridge CAS-advances the cursor after each accepted group:
+  published iff durable, a crash loses nothing, lag = `head_seq − cursor`, and a later sink failure retries only
+  the undelivered range. Writers contain no event delivery. Wake-ups: `POST /_events/notify` from a bucket
+  notification (at-least-once) + a periodic sweep as backstop. Dedup key `(repo, seq, ref_name)`.
 - **D33** **A repository's refs can follow an upstream git host, through the WAL, by its maintainer.**
   `[upstream] follow = ["refs/heads/main"]` (needs `upstream.git`; `upstream.token_env` names the env var with the
   token) makes the maintaining host fetch the delta every `maintenance.follow_interval` and publish it as an

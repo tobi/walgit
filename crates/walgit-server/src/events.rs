@@ -111,6 +111,24 @@ impl RefEvent {
     }
 }
 
+pub(crate) fn ref_event_count(entry: &LogEntry) -> usize {
+    if !matches!(
+        EntryKind::try_from(entry.kind),
+        Ok(EntryKind::Push | EntryKind::RefUpdate)
+    ) {
+        return 0;
+    }
+    entry.txn.as_ref().map_or(0, |txn| {
+        txn.updates
+            .iter()
+            .filter(|update| {
+                update.new_symbolic_target.is_empty()
+                    && classify(&update.old_oid, &update.new_oid).is_some()
+            })
+            .count()
+    })
+}
+
 /// `ref` events for the PUSH / REF_UPDATE entries in `entries`, in seq order.
 pub(crate) fn refs_from_entries(repo: &RepoId, entries: &[LogEntry], out: &mut Vec<RefEvent>) {
     let repo = repo.to_string();
@@ -154,6 +172,41 @@ pub(crate) fn refs_from_entries(repo: &RepoId, entries: &[LogEntry], out: &mut V
             });
         }
     }
+}
+
+pub(crate) fn batch_json_len(events: &[RefEvent]) -> anyhow::Result<u64> {
+    Ok(u64::try_from(serde_json::to_vec(events)?.len())?)
+}
+
+/// Ref transactions are the indivisible delivery unit. Reject one before WAL
+/// publication when its eventual webhook body cannot fit the configured bound.
+pub(crate) fn ensure_entry_fits(
+    repo: &RepoId,
+    txn: &walgit_proto::v1::RefTransaction,
+    meta: &std::collections::HashMap<String, String>,
+    max_events: usize,
+    max_bytes: u64,
+) -> anyhow::Result<()> {
+    let entry = LogEntry {
+        seq: u64::MAX,
+        kind: EntryKind::Push as i32,
+        txn: Some(txn.clone()),
+        meta: meta.clone(),
+        ..Default::default()
+    };
+    let event_count = ref_event_count(&entry);
+    anyhow::ensure!(
+        event_count <= max_events,
+        "ref transaction produces {event_count} events; events.max_batch_events is {max_events}"
+    );
+    let mut events = Vec::with_capacity(event_count);
+    refs_from_entries(repo, &[entry], &mut events);
+    let bytes = batch_json_len(&events)?;
+    anyhow::ensure!(
+        bytes <= max_bytes,
+        "ref transaction produces a {bytes}-byte event payload; events.max_batch_bytes is {max_bytes} bytes"
+    );
+    Ok(())
 }
 
 /// Where the bridge publishes: a webhook receives each batch as a JSON array,
