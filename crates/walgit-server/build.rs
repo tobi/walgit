@@ -1,8 +1,7 @@
 //! Make `cargo build`/`cargo test` work in a fresh checkout without running the
-//! web build. `rust-embed` requires `../../web/dist` to exist at compile time;
-//! when the SPA has not been built (`just web-build`) we drop in a placeholder
-//! `index.html` so the server compiles and the HTML routes still answer 200.
-//! A real `pnpm run build` overwrites the placeholder.
+//! web build. `rust-embed` requires `../../web/dist` to exist at compile time.
+//! Development builds may use a placeholder when the SPA has not been built;
+//! release builds fail instead so a deployable artifact cannot silently omit UI.
 
 use std::fs;
 use std::path::Path;
@@ -15,12 +14,17 @@ fn main() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let dist = manifest.join("../../web/dist");
     println!("cargo:rerun-if-changed={}", dist.display());
+    println!("cargo:rerun-if-env-changed=PROFILE");
     let index = dist.join("index.html");
     if !index.exists() {
+        let release = std::env::var("PROFILE").as_deref() == Ok("release");
+        if release {
+            panic!("web/dist/index.html is missing in a release build; run `just web-build` first");
+        }
         fs::create_dir_all(&dist).expect("create web/dist");
         fs::write(&index, PLACEHOLDER).expect("write placeholder web/dist/index.html");
         println!(
-            "cargo:warning=web/dist was missing; wrote a placeholder index.html (run `just web-build` for the real UI)"
+            "cargo:warning=web/dist was missing; wrote a development placeholder index.html (run `just web-build` for the real UI)"
         );
     }
 }

@@ -2,8 +2,8 @@
 //! to this instance (packs when they fit, the remote pack indexes otherwise)
 //! and touch the default branch's root tree, so the first user request on a
 //! fresh instance finds everything in place. Each repo is a `prewarm` task
-//! (discoverable at `…/tasks`); `/readyz` can be gated on completion
-//! (`cache.prewarm_ready_timeout`).
+//! (discoverable at `…/tasks`); `/readyz` is ready only after every required
+//! prewarm succeeds.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -13,9 +13,11 @@ use tracing::Instrument;
 use crate::AppState;
 
 pub struct Readiness {
-    /// All prewarms finished (ok or not).
+    /// All configured prewarms finished successfully.
     pub done: AtomicBool,
     pub pending: AtomicUsize,
+    /// Number of prewarm tasks that finished with an error in the current run.
+    pub failed: AtomicUsize,
     pub started_at: Instant,
 }
 
@@ -24,14 +26,14 @@ impl Readiness {
         Arc::new(Readiness {
             done: AtomicBool::new(true),
             pending: AtomicUsize::new(0),
+            failed: AtomicUsize::new(0),
             started_at: Instant::now(),
         })
     }
-    /// True when traffic may be routed here.
-    pub fn ready(&self, timeout: std::time::Duration) -> bool {
-        self.done.load(Ordering::Acquire)
-            || timeout.is_zero()
-            || self.started_at.elapsed() >= timeout
+    /// True only when every configured prewarm completed successfully.
+    ///
+    pub fn ready(&self) -> bool {
+        self.done.load(Ordering::Acquire) && self.failed.load(Ordering::Acquire) == 0
     }
 }
 
@@ -40,6 +42,7 @@ impl Default for Readiness {
         Readiness {
             done: AtomicBool::new(true),
             pending: AtomicUsize::new(0),
+            failed: AtomicUsize::new(0),
             started_at: Instant::now(),
         }
     }
@@ -52,6 +55,7 @@ pub fn spawn(state: Arc<AppState>) {
         return;
     }
     state.readiness.done.store(false, Ordering::Release);
+    state.readiness.failed.store(0, Ordering::Release);
     state
         .readiness
         .pending
@@ -68,7 +72,10 @@ pub fn spawn(state: Arc<AppState>) {
                 let t = Instant::now();
                 match warm(&st, &r).await {
                     Ok(summary) => tracing::info!(repo = %r, elapsed_ms = t.elapsed().as_millis() as u64, "prewarm: {summary}"),
-                    Err(e) => tracing::warn!(repo = %r, elapsed_ms = t.elapsed().as_millis() as u64, "prewarm failed: {e}"),
+                    Err(e) => {
+                        st.readiness.failed.fetch_add(1, Ordering::AcqRel);
+                        tracing::warn!(repo = %r, elapsed_ms = t.elapsed().as_millis() as u64, "prewarm failed: {e}");
+                    }
                 }
                 st.readiness.pending.fetch_sub(1, Ordering::AcqRel);
             }));
@@ -77,7 +84,15 @@ pub fn spawn(state: Arc<AppState>) {
             let _ = h.await;
         }
         state.readiness.done.store(true, Ordering::Release);
-        tracing::info!("prewarm complete; instance ready");
+        let failures = state.readiness.failed.load(Ordering::Acquire);
+        if failures == 0 {
+            tracing::info!("prewarm complete; instance ready");
+        } else {
+            tracing::error!(
+                failures,
+                "prewarm complete with failures; instance remains unready"
+            );
+        }
     });
 }
 

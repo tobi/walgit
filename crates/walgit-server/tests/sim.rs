@@ -1510,12 +1510,20 @@ async fn liveness_frozen_task_owner_does_not_wedge_readiness() -> Result<()> {
 
     let ready = walgit_server::prewarm::Readiness::new();
     ready.done.store(false, Ordering::Release);
-    ensure!(!ready.ready(Duration::from_millis(50)));
+    ensure!(!ready.ready());
     tokio::time::sleep(Duration::from_millis(60)).await;
     ensure!(
-        ready.ready(Duration::from_millis(50)),
-        "readiness joined a frozen prewarm forever"
+        !ready.ready(),
+        "readiness must remain false while prewarm is incomplete"
     );
+    ready.done.store(true, Ordering::Release);
+    ready.failed.store(1, Ordering::Release);
+    ensure!(
+        !ready.ready(),
+        "readiness must remain false after a failed prewarm"
+    );
+    ready.failed.store(0, Ordering::Release);
+    ensure!(ready.ready());
     Ok(())
 }
 

@@ -353,7 +353,7 @@ export class ReposClient {
 
   private async openAuthPopup(): Promise<boolean> {
     if (typeof window === "undefined") return false;
-    const url = `${this.base}/api-browser/v1/authenticate`;
+    const url = `${this.base}/api-browser/v1/authenticate?origin=${encodeURIComponent(window.location.origin)}`;
     const w = 520;
     const h = 640;
     const left = Math.max(0, (window.screen?.width ?? w) / 2 - w / 2);

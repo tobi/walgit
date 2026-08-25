@@ -40,7 +40,9 @@ pre-D15 `/services/api/{owner}/{repo}/…` are gone (prototyping phase — no al
 Every request authenticates (§1.3 of AGENTS.md); a missing/expired browser
 session answers `401` and the SDK opens **`/api-browser/v1/authenticate`** in a popup —
 walgit's own sign-in (`/_auth/login`) runs before the application page `postMessage`s
-`{type: "repos:authenticated"}` to its opener and closes — then retries once.
+`{type: "repos:authenticated"}` to the validated opener origin and closes — then retries once. The SDK passes
+its page origin as a query parameter; the server accepts it only when it is in `server.cors_origins`, otherwise
+it falls back to the walgit host origin.
 `GET /api/v1/me` → `{principal, write, anonymous}` (`no-store`).
 
 CORS: origins listed in `server.cors_origins` (exact, or one leading `*.`,

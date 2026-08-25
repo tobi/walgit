@@ -9,7 +9,7 @@ pub use bytesize::ByteSize;
 use serde::{Deserialize, Serialize};
 pub use std::str::FromStr;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     pub server: ServerConfig,
@@ -469,7 +469,7 @@ impl Default for MaintenanceConfig {
 ///   everywhere, so the edge's read-only fallback (D29) works.
 /// * **maintain**: the maintainer loop's units (checkpoints, bundles, compaction,
 ///   fsck/repair) — only on hosts with the `maintain` role.
-/// Placement is by rule, not by capacity: a repo is either this host's or not.
+///   Placement is by rule, not by capacity: a repo is either this host's or not.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct PlacementConfig {
@@ -857,7 +857,7 @@ impl Config {
     /// never `upstream.token_env` (that name is host-only).
     pub fn public_settings_toml(&self) -> Result<String> {
         let mut doc: toml::Table = toml::Table::try_from(self).context("serializing config")?;
-        doc.retain(|k, _| SETTINGS_SECTIONS.iter().any(|s| *s == k));
+        doc.retain(|k, _| SETTINGS_SECTIONS.contains(&k));
         if let Some(toml::Value::Table(u)) = doc.get_mut("upstream") {
             u.remove("token_env");
         }
@@ -1009,25 +1009,6 @@ pub fn repo_listed(list: &[String], owner: &str, name: &str) -> bool {
     })
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            server: ServerConfig::default(),
-            store: StoreConfig::default(),
-            cache: CacheConfig::default(),
-            wal: WalConfig::default(),
-            compaction: CompactionConfig::default(),
-            maintenance: MaintenanceConfig::default(),
-            bundles: BundlesConfig::default(),
-            placement: PlacementConfig::default(),
-            lfs: LfsConfig::default(),
-            upstream: UpstreamConfig::default(),
-            git: GitConfig::default(),
-            telemetry: TelemetryConfig::default(),
-            events: EventsConfig::default(),
-        }
-    }
-}
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
@@ -1371,10 +1352,10 @@ impl Config {
             self.server.listen.set_port(port);
             // Standalone / `dev server`: public_url is the origin the browser hits. Keep its
             // port in lockstep with PORT. A real public_url is left alone.
-            if let Some(u) = self.server.public_url.as_mut() {
-                if origin_is_loopback(u) {
-                    *u = rewrite_origin_port(u, port);
-                }
+            if let Some(u) = self.server.public_url.as_mut()
+                && origin_is_loopback(u)
+            {
+                *u = rewrite_origin_port(u, port);
             }
         }
         Ok(ignored)

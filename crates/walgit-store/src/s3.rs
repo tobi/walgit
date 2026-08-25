@@ -21,21 +21,18 @@
 //!
 //! ## Conditional DELETE
 //!
-//! S3 has no native conditional delete. We emulate via HEAD (read ETag) +
-//! compare + DELETE, documenting the inherent check-then-act race: a
-//! concurrent writer could replace the object between HEAD and DELETE.
-//! Acceptable for walgit's lease-guarded semantics.
+//! Conditional deletes use S3's native `If-Match` ETag precondition. The
+//! precondition is evaluated by S3 at the delete linearization point; callers
+//! must not emulate it with `HEAD` followed by an unconditional delete.
 //!
 //! ## Multipart upload
 //!
 //! Objects above `cfg.multipart_threshold` use CreateMultipartUpload +
-//! UploadPart + CompleteMultipartUpload. CreateMultipartUpload does NOT
-//! support `If-None-Match`/`If-Match` in the S3 API, so multipart is only
-//! used for `PutMode::Overwrite`. For walgit's immutable pack objects
-//! (`PutMode::Create`) we use single-shot PUT when the object is large,
-//! accepting the (tiny) risk of concurrent create races. CAS-rewritten
-//! objects (manifests, leases, bundle lists) are always small → single-shot
-//! PUT with conditional headers.
+//! UploadPart + CompleteMultipartUpload. S3 applies `If-None-Match`/`If-Match`
+//! at multipart completion, so immutable creates and CAS updates remain
+//! conditional even when the object is larger than the single-PUT limit.
+//! Completion conflicts are surfaced as precondition failures and incomplete
+//! uploads are aborted on every failure path.
 //!
 //! ## rustfs compatibility (tested with rustfs/rustfs:latest)
 //!
@@ -185,7 +182,7 @@ impl S3Store {
             404 => Err(StoreError::NotFound { key: key.into() }),
             412 => Err(StoreError::PreconditionFailed {
                 key: key.into(),
-                current: etag.map(|e| Version::new(e)),
+                current: etag.map(Version::new),
             }),
             s if s >= 500 || s == 429 => {
                 Err(StoreError::Retryable(anyhow::anyhow!("s3 get status {s}")))
@@ -233,7 +230,7 @@ fn err_code<E>(err: &aws_sdk_s3::error::SdkError<E>) -> Option<&str>
 where
     E: aws_sdk_s3::error::ProvideErrorMetadata,
 {
-    err.as_service_error().map(|e| e.meta().code()).flatten()
+    err.as_service_error().and_then(|e| e.meta().code())
 }
 
 fn classify_put_error(
@@ -300,11 +297,9 @@ impl ObjectStore for S3Store {
     async fn put(&self, key: &str, body: PutBody, opts: PutOptions) -> Result<ObjectMeta> {
         let (s3_body, len) = body_to_s3(body).await?;
 
-        // Multipart only for Overwrite (CreateMultipartUpload has no
-        // conditional header support in the S3 API). Create/Update always
-        // use single-shot PUT.
-        let use_multipart =
-            len > self.multipart_threshold && matches!(opts.mode, PutMode::Overwrite);
+        // Apply conditional create/update at multipart completion. This keeps
+        // the storage abstraction atomic for large immutable packs too.
+        let use_multipart = len > self.multipart_threshold;
 
         if use_multipart {
             return self.multipart_put(key, s3_body, len, &opts).await;
@@ -345,10 +340,10 @@ impl ObjectStore for S3Store {
             Err(e) => {
                 let mut err = classify_put_error(key, e);
                 // Fill `current` via HEAD if we got a PreconditionFailed.
-                if let StoreError::PreconditionFailed { current: c, .. } = &mut err {
-                    if c.is_none() {
-                        *c = self.head(key).await.ok().flatten().map(|m| m.version);
-                    }
+                if let StoreError::PreconditionFailed { current: c, .. } = &mut err
+                    && c.is_none()
+                {
+                    *c = self.head(key).await.ok().flatten().map(|m| m.version);
                 }
                 Err(err)
             }
@@ -356,34 +351,24 @@ impl ObjectStore for S3Store {
     }
 
     async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
+        let mut request = self.client.delete_object().bucket(&self.bucket).key(key);
         if let Some(want) = &if_version {
-            // S3 has no conditional delete: emulate via HEAD + compare + DELETE.
-            // RACE: a concurrent writer could replace the object between HEAD
-            // and DELETE. Acceptable for walgit's lease-guarded semantics.
-            let head = self.head(key).await?;
-            match head {
-                None => return Err(StoreError::NotFound { key: key.into() }),
-                Some(meta) if &meta.version != want => {
-                    return Err(StoreError::PreconditionFailed {
-                        key: key.into(),
-                        current: Some(meta.version),
-                    });
-                }
-                _ => {}
-            }
+            request = request.if_match(want.as_str());
         }
-
-        let resp = self
-            .client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await;
+        let resp = request.send().await;
 
         match resp {
             Ok(_) => Ok(()),
             Err(err) => {
+                let code = err_code(&err).unwrap_or("");
+                if if_version.is_some()
+                    && matches!(code, "PreconditionFailed" | "ConditionalRequestConflict")
+                {
+                    return Err(StoreError::PreconditionFailed {
+                        key: key.into(),
+                        current: self.head(key).await.ok().flatten().map(|m| m.version),
+                    });
+                }
                 // S3 DeleteObject is idempotent: deleting a non-existent key
                 // returns Ok, not an error. If we get here, it's a real error.
                 // For unconditional deletes we treat any error as transient.
@@ -547,14 +532,6 @@ impl ObjectStore for S3Store {
                 "compose needs at least one source".into(),
             ));
         }
-        if let PutMode::Create = opts.mode
-            && self.head(dest).await?.is_some()
-        {
-            return Err(StoreError::PreconditionFailed {
-                key: dest.to_owned(),
-                current: None,
-            });
-        }
         // Sizes first: the layout of parts depends on them.
         let mut sizes = Vec::with_capacity(sources.len());
         for src in sources {
@@ -697,19 +674,30 @@ impl ObjectStore for S3Store {
         let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
             .set_parts(Some(parts))
             .build();
-        let resp = match self
+        let mut complete = self
             .client
             .complete_multipart_upload()
             .bucket(&self.bucket)
             .key(dest)
             .upload_id(&upload_id)
-            .multipart_upload(completed)
-            .send()
-            .await
-        {
+            .multipart_upload(completed);
+        if let PutMode::Create = &opts.mode {
+            complete = complete.if_none_match("*");
+        }
+        if let PutMode::Update(v) = &opts.mode {
+            complete = complete.if_match(v.as_str());
+        }
+        let resp = match complete.send().await {
             Ok(r) => r,
             Err(e) => {
                 let _ = self.abort_multipart(dest, &upload_id).await;
+                let code = err_code(&e).unwrap_or("");
+                if matches!(code, "PreconditionFailed" | "ConditionalRequestConflict") {
+                    return Err(StoreError::PreconditionFailed {
+                        key: dest.to_owned(),
+                        current: self.head(dest).await.ok().flatten().map(|m| m.version),
+                    });
+                }
                 return Err(StoreError::Other(anyhow::anyhow!(
                     "s3 complete multipart: {e}"
                 )));
@@ -749,7 +737,7 @@ struct ListState {
     buffer: std::vec::IntoIter<Result<ObjectMeta>>,
 }
 
-// ---- multipart upload (Overwrite only) ---------------------------------
+// ---- multipart upload ----------------------------------------------------
 
 impl S3Store {
     async fn multipart_put(
@@ -900,7 +888,8 @@ impl S3Store {
 // 5. ListObjectsV2: StartAfter, ContinuationToken, IsTruncated/NextToken OK.
 // 6. DeleteObject: idempotent for absent keys (204).
 // 7. Multipart: CreateMultipartUpload + UploadPart + CompleteMultipartUpload
-//    supported. No conditional headers on Create/Complete (same as real S3).
+//    supported. Conditional Create/Update preconditions are applied at
+//    CompleteMultipartUpload; providers that reject them must fail closed.
 // 8. ETags: quoted, MD5 for single-PUT, compound for multipart. Quotes
 //    stripped consistently in our Version.
 // 9. force_path_style: required for rustfs local dev.
