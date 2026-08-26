@@ -37,6 +37,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `web/sdk/README.md` | Users of `repos.js`. |
 | `web/README.md` | Frontend engineers changing the React SPA, Vite build, SDK adapter, static assets, loading states. |
 | `walgit.example.toml` | Every config key with its default and a comment. Change it with the code. |
+| `docs/DEV_SETUP.md` | Local dev setup: prerequisites per platform, build, `just dev-local`, tests, platform caveats (macOS port 9000). |
 | `walgit.standalone.toml` | The one-machine shape: `walgit-server --config walgit.standalone.toml` → `https://walgit.localhost:8080/`. |
 | `deploy/nginx.conf.example` | An optional nginx in front; documents the `X-Accel-Redirect` byte-offload contract. |
 | `Containerfile`, `flake.nix` | An OCI image; a Nix package, image and devshell. |
