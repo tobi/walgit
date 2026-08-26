@@ -23,7 +23,7 @@ SDK picks the lane, handles the sign-in popup, and unwraps long answers.
 
 | You are… | Lane | What the SDK does |
 |---|---|---|
-| a page on another origin listed in `server.cors_origins` | browser `/{owner}/{repo}/api-browser/*` | `fetch` with `credentials: "include"`. On `401` it opens `<host>/api-browser/v1/authenticate`; walgit's sign-in (`/_auth/login`, your OIDC issuer) runs, the landing page posts `repos:authenticated`, and the SDK retries once. |
+| a page on another origin listed in `server.cors_origins` | browser `/{owner}/{repo}/api-browser/*` | `fetch` with `credentials: "include"`. On `401` it opens `<host>/api-browser/v1/authenticate?origin=<page-origin>`; walgit's sign-in (`/_auth/login`, your OIDC issuer) runs, the landing page posts `repos:authenticated` only to the validated opener origin, and the SDK retries once. |
 | the bundled UI on git.example.com | same-origin `/{owner}/{repo}/api/*` | the session cookie; a lapsed session is sent to `/_auth/login` |
 | a script, agent, CI job, Node | bearer `/{owner}/{repo}/api/*` | `createClient({ token })` with a walgit access token (`/_auth/tokens`), a static token, or an ID token → `Authorization: Bearer` |
 

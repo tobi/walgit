@@ -2873,7 +2873,7 @@ fn capabilities_for(service: Service, format: ObjectFormat) -> String {
     let agent = format!("agent=walgit/{WALGIT_VERSION}");
     match service {
         Service::UploadPack => format!(
-            "multi_ack_detailed side-band-64k thin-pack ofs-delta shallow deepen-since deepen-not \
+            "multi_ack_detailed side-band-64k thin-pack ofs-delta shallow \
              no-progress include-tag allow-tip-sha1-in-want allow-reachable-sha1-in-want filter \
              object-format={of} {agent}"
         ),
@@ -3607,6 +3607,16 @@ mod index_pack_trace_tests {
             phases,
             "feed=3,git=2251,index-pack:resolve_deltas=1500,index-pack:fsck=250"
         );
+    }
+
+    #[test]
+    fn upload_pack_does_not_advertise_unimplemented_deepen_modes() {
+        let caps = capabilities_for(Service::UploadPack, ObjectFormat::Sha1);
+        assert!(!caps.split_whitespace().any(|c| c == "deepen-since"));
+        assert!(!caps.split_whitespace().any(|c| c == "deepen-not"));
+        assert!(!caps.split_whitespace().any(|c| c == "packfile-uris"));
+        assert!(caps.split_whitespace().any(|c| c == "shallow"));
+        assert!(caps.split_whitespace().any(|c| c == "filter"));
     }
 
     #[test]

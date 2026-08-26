@@ -16,13 +16,13 @@ use std::sync::Arc;
 use axum::{
     Router,
     body::Body,
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::Next,
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::repo::RepoRoute;
 use crate::web::api::{Need, RefInfo, etag_for, json_swr, run};
@@ -274,14 +274,31 @@ async fn me(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     }
 }
 
+#[derive(Deserialize, Default)]
+struct AuthenticateQuery {
+    /// Origin of the SDK page that opened this popup. It is accepted only when
+    /// it is already allowed by the server's credentialed CORS policy.
+    origin: Option<String>,
+}
+
 /// `GET /api/v1/authenticate`: the popup landing page of the browser lane.
 /// `require_auth` sends an unauthenticated browser through sign-in first; this
 /// authenticated page then tells its opener and closes. The SDK opens it when a
 /// browser-lane call answers 401.
-async fn authenticate(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+async fn authenticate(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AuthenticateQuery>,
+) -> Response {
     match st.auth.require_read(&headers).await {
         Ok(p) => {
-            let page = AUTHENTICATE_HTML.replace("{{principal}}", &html_escape(&p.name));
+            let target_origin = query
+                .origin
+                .filter(|origin| origin_allowed(&st.cfg, origin))
+                .unwrap_or_else(|| crate::smart::request_base_url(&st, &headers));
+            let page = AUTHENTICATE_HTML
+                .replace("{{principal}}", &html_escape(&p.name))
+                .replace("{{target_origin}}", &html_escape(&target_origin));
             let mut r = Html(page).into_response();
             r.headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -300,8 +317,8 @@ const AUTHENTICATE_HTML: &str = r#"<!doctype html>
 <script>
 (function () {
   var msg = { type: "repos:authenticated", principal: "{{principal}}" };
-  try { if (window.opener) { window.opener.postMessage(msg, "*"); } } catch (e) {}
-  try { if (window.parent && window.parent !== window) { window.parent.postMessage(msg, "*"); } } catch (e) {}
+  try { if (window.opener) { window.opener.postMessage(msg, "{{target_origin}}"); } } catch (e) {}
+  try { if (window.parent && window.parent !== window) { window.parent.postMessage(msg, "{{target_origin}}"); } } catch (e) {}
   // Only a window we opened ourselves (same site or cross-site via the SDK) is closed.
   if (window.opener) { setTimeout(function () { window.close(); }, 150); }
 })();
@@ -415,6 +432,19 @@ async fn repo_admin(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popup_origin_must_match_configured_cors_origin() {
+        let mut cfg = walgit_config::Config::default();
+        cfg.server.cors_origins = vec![
+            "https://docs.example.com".into(),
+            "https://*.trusted.example.com".into(),
+        ];
+        assert!(origin_allowed(&cfg, "https://docs.example.com"));
+        assert!(origin_allowed(&cfg, "https://a.trusted.example.com"));
+        assert!(!origin_allowed(&cfg, "https://evil.example.com"));
+        assert!(!origin_allowed(&cfg, "https://trusted.example.com/path"));
+    }
 
     #[test]
     fn cors_covers_prefix_form_and_v1() {
