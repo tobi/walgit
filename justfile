@@ -41,22 +41,31 @@ dev-local config="walgit.standalone.toml":
 
 # Start rustfs (S3-compatible) for local dev via podman compose (rootless, no daemon group needed;
 # `podman compose` drives compose.yaml through the docker-compose binary dev.yml installs).
-# `podman compose` talks to the podman API socket; rootless nix podman has no systemd unit for it, so
-# `podman system service` is started (detached, idle-timeout 0) when the socket is missing.
+# `podman compose` talks to the podman API socket; on Linux rootless nix podman has no systemd unit
+# for it, so `podman system service` is started (detached, idle-timeout 0) when the socket is missing.
+# Elsewhere (macOS, the BSDs) the socket belongs to the podman machine VM: the recipe only checks that
+# podman answers and tells you to start it if it does not.
 dev-store:
     #!/usr/bin/env bash
     set -euo pipefail
-    # nix podman ships no /etc/containers: give the user a signature policy + registry search list once.
-    cdir="${XDG_CONFIG_HOME:-$HOME/.config}/containers"; mkdir -p "$cdir"
-    [ -f "$cdir/policy.json" ] || printf '{"default":[{"type":"insecureAcceptAnything"}]}\n' > "$cdir/policy.json"
-    [ -f "$cdir/registries.conf" ] || printf 'unqualified-search-registries = ["docker.io"]\n' > "$cdir/registries.conf"
-    sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
-    if [ ! -S "$sock" ]; then
-        echo "starting rootless podman API socket at $sock"
-        mkdir -p "$(dirname "$sock")"
-        setsid nohup podman system service --time=0 "unix://$sock" >/tmp/walgit-podman-service.log 2>&1 < /dev/null &
-        for _ in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.2; done
-        [ -S "$sock" ] || { echo "podman API socket did not appear; see /tmp/walgit-podman-service.log"; exit 1; }
+    # The rootless socket bootstrap is Linux-only: XDG_RUNTIME_DIR and /run/user do not exist on
+    # macOS or the BSDs, and setsid is util-linux. There the socket lives in the podman machine VM.
+    if [ "$(uname -s)" = Linux ]; then
+        # nix podman ships no /etc/containers: give the user a signature policy + registry search list once.
+        cdir="${XDG_CONFIG_HOME:-$HOME/.config}/containers"; mkdir -p "$cdir"
+        [ -f "$cdir/policy.json" ] || printf '{"default":[{"type":"insecureAcceptAnything"}]}\n' > "$cdir/policy.json"
+        [ -f "$cdir/registries.conf" ] || printf 'unqualified-search-registries = ["docker.io"]\n' > "$cdir/registries.conf"
+        sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
+        if [ ! -S "$sock" ]; then
+            echo "starting rootless podman API socket at $sock"
+            mkdir -p "$(dirname "$sock")"
+            nohup podman system service --time=0 "unix://$sock" >/tmp/walgit-podman-service.log 2>&1 < /dev/null &
+            for _ in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.2; done
+            [ -S "$sock" ] || { echo "podman API socket did not appear; see /tmp/walgit-podman-service.log"; exit 1; }
+        fi
+    elif ! podman info >/dev/null 2>&1; then
+        echo "podman is not answering: start the container runtime first (macOS: podman machine start)"
+        exit 1
     fi
     podman compose up -d rustfs
     echo "Waiting for rustfs to be healthy..."
