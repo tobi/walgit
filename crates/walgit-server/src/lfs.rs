@@ -4,6 +4,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use walgit_proto::keys;
 
@@ -13,6 +14,9 @@ use crate::repo::RepoRoute;
 use crate::smart::open_repo;
 use crate::stream::body_to_async_read;
 use walgit_store::{ObjectStore, ObjectStoreExt, PutBody, PutMode};
+
+// Collapse git-lfs's default 100-object batch without unbounded store fan-out.
+const LOCAL_PRESENCE_CONCURRENCY: usize = 16;
 
 #[derive(Debug, Deserialize)]
 pub struct BatchRequest {
@@ -94,15 +98,25 @@ pub async fn batch(
         require_lfs_oid(&o.oid)?;
     }
     // Local presence first; then one bounded upstream batch for the misses.
-    let mut local = Vec::with_capacity(body.objects.len());
-    let mut missing = Vec::new();
-    for o in &body.objects {
-        let exists = store.exists(&keys::lfs_key(&o.oid)).await.unwrap_or(false);
-        local.push(exists);
-        if !exists {
-            missing.push((o.oid.clone(), o.size));
-        }
-    }
+    let local_keys = body
+        .objects
+        .iter()
+        .map(|o| keys::lfs_key(&o.oid))
+        .collect::<Vec<_>>();
+    let local = futures::stream::iter(local_keys.into_iter().map(|key| {
+        let store = store.clone();
+        async move { store.exists(&key).await.unwrap_or(false) }
+    }))
+    .buffered(LOCAL_PRESENCE_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    let missing = body
+        .objects
+        .iter()
+        .zip(&local)
+        .filter(|(_, exists)| !**exists)
+        .map(|(o, _)| (o.oid.clone(), o.size))
+        .collect::<Vec<_>>();
     let upstream_has = match (&cfg.upstream.lfs, missing.is_empty()) {
         (Some(upstream), false) => {
             st.lfs_upstream
