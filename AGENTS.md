@@ -144,8 +144,8 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `fsck.pb` | Last connectivity audit (`FsckReport`), written by the maintainer's `fsck` unit, consumed by `repair` (`docs/INTEGRITY.md`). |
 | `events/cursor.json` | Durable acknowledged WAL sequence of the events bridge; advanced only after the webhook acknowledged (D32). |
 | `lfs/objects/<aa>/<bb>/<oid>` | LFS objects (sha256-addressed, immutable). Missing ones can be read through from `upstream.lfs` and persisted (`docs/LFS.md`). |
-Schema `crates/walgit-proto/proto/walgit/v1/wal.proto`; GCS over gRPC, S3 (AWS SDK) and in-memory stores share
-one contract suite (`crates/walgit-store/tests/contract.rs`, incl. compose).
+Schema `crates/walgit-proto/proto/walgit/v1/wal.proto`; GCS over gRPC, S3 (AWS SDK), Azure Blob REST and
+in-memory stores share one contract suite (`crates/walgit-store/tests/contract.rs`, incl. compose).
 
 ### 2.2 Write path
 receive-pack (ours, `walgit-git/src/receive.rs`) → index the pack locally (`git index-pack --stdin --fix-thin
@@ -222,7 +222,7 @@ changes take effect by re-planning; there are no one-off backfill scripts.
 
 ### 2.6 Bundles (bundle-uri): move clone bytes to static files — **the north star** (`docs/BUNDLE_URI_DESIGN.md`)
 - Strategies (config, D21/D22): **weekly full** (for a big repo = base pack ∘ header via store-side compose — GCS
-  natively, S3 by multipart `UploadPartCopy`; no disk, no index-pack), **daily incremental** chained on the previous
+  natively, S3 by multipart `UploadPartCopy`, Azure by `Put Block From URL`; no disk, no index-pack), **daily incremental** chained on the previous
   daily, **hourly incremental** on the newest daily, each on a calendar slot (6-field UTC cron `schedule`; the fire
   time is the as-of instant), `creationToken = slot epoch`, main-only refs for `bundles.main_only` repos;
   `bundles/list.pb` CAS'd.
@@ -275,9 +275,9 @@ decision in §4 — or the PR is; never "fix later".
   table per chunk per thread (60 M entries × 44 threads ⇒ 178 GB RSS) and is the only place gix writes an object id
   into a pack (a mid-pack refresh once paired offsets with another pack's table ⇒ a wrong id). The gix pack source
   is a frozen snapshot (`frozen_pack_source`). Reproducer: `walgit-git/tests/upload_gix_scale.rs`.
-- **D3** `ObjectStore` trait with CAS version tokens, conditional GET, range, compose; gcs/s3/memory backends.
-  `compose` is native on GCS and a multipart `UploadPartCopy` on S3 (`compose_is_native` tells callers which);
-  `accel_target` gives an edge a URL (+ bearer on GCS, presigned on S3) to fetch an object itself.
+- **D3** `ObjectStore` trait with CAS version tokens, conditional GET, range, compose; gcs/s3/azure/memory backends.
+  `compose` is native on GCS, multipart `UploadPartCopy` on S3, and `Put Block From URL` on Azure
+  (`compose_is_native` tells callers which); `accel_target` returns the backend's authenticated object URL.
 - **D4** protobuf on the wire and in the bucket; schema versioned, append-only.
 - **D5** Repo identity `<owner>/<repo>[.git]`, prefix `repos/<o>/<r>/`, creation = CAS create of the manifest.
 - **D6** Manifest CAS is the only commit point. **D7** No node identity, no elections; leases for exclusivity.
@@ -399,6 +399,9 @@ decision in §4 — or the PR is; never "fix later".
   + chain) is for clones, **`bundles/catchup`** (no fulls) is what recipes record in `fetch.bundleURI`. Measured: a
   catch-up is exactly the slots missed; for a client fetching several times a day, upload-pack's thin pack is
   smaller than an hourly bundle — bundles pay off for fresh clones and far-behind clients.
+- **D42** **Azure Blob Storage is a first-class ObjectStore backend** (2026-08-25). Authentication is explicit:
+  `store.azure.credential = "workload_identity"` uses AKS Workload Identity; `"account_key"` reads
+  `store.azure.account_key_env` for Azurite and service SAS signing. Azurite compose uses bounded process I/O.
 
 Decision identifiers are stable; gaps in the numbering are intentional.
 
@@ -423,8 +426,8 @@ Decision identifiers are stable; gaps in the numbering are intentional.
 - **Standalone first (D39):** a feature must work with walgit hit directly (no edge, in-process TLS, bytes
   streamed by walgit). Anything an edge takes over is announced per request in `X-Walgit-Capabilities`; never
   infer an edge from config, never hardcode a hostname in `crates/` or `web/`.
-- **S3 and GCS are both first class.** Every store feature has both implementations and runs in the contract
-  suite (`just test-s3` against rustfs, `just test-gcs <bucket>`); "GCS only" is a bug.
+- **S3, GCS and Azure Blob are first class.** Every store feature has all three implementations and runs in the
+  contract suite (`just test-s3`, `just test-gcs <bucket>`, `just test-azure`); a single-backend path is a bug.
 - **Use the rig before prod** (`just dev-store` → `walgit-server --config walgit.standalone.toml`). Per-repo
   settings (D24) with minute-scale slots compress a week of bundle behaviour into 30 minutes.
 - No new auth paths (§1.3). No LIST on hot paths. No unbounded buffering of packs in memory. No full

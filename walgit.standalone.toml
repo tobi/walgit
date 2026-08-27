@@ -66,6 +66,12 @@ force_path_style = true
 # backend = "gcs"
 # bucket = "my-walgit-bucket"
 # prefix = ""
+# Azure Blob on AKS (the pod supplies workload identity environment variables):
+# backend = "azure"
+# bucket = "my-walgit-container"
+# [store.azure]
+# account = "mywalgitaccount"
+# credential = "workload_identity"
 
 # Bundles (docs/BUNDLE_URI_DESIGN.md): one weekly full, then **chained** incrementals — each daily on the
 # previous daily (the first on the weekly), each hourly on the previous hourly (restarting from every new

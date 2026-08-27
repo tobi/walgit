@@ -6,9 +6,10 @@
 //! isolation, large streamed put/get roundtrip with checksum, and the
 //! multipart upload path.
 //!
-//! The suite is executed against `MemoryStore` always, and against `S3Store`
-//! when `WALGIT_TEST_S3_ENDPOINT` is set. `GcsStore` is tested when
-//! `WALGIT_TEST_GCS_BUCKET` is set (StoreGcs adds that wrapper).
+//! The suite is executed against `MemoryStore` always, against `S3Store`
+//! when `WALGIT_TEST_S3_ENDPOINT` is set, against `GcsStore` when
+//! `WALGIT_TEST_GCS_BUCKET` is set, and against `AzureStore` when
+//! `WALGIT_TEST_AZURE_ENDPOINT` is set.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -42,6 +43,7 @@ pub async fn run_contract(store: DynStore, prefix: &str) {
     test_list(&store, &p("list")).await;
     test_large_streamed_roundtrip(&store, &p("large")).await;
     test_multipart_path(&store, &p("multi")).await;
+    test_concurrent_multipart_create(&store, &p("multipart-concurrent")).await;
     test_compose(&store, &p("compose")).await;
 }
 
@@ -656,6 +658,49 @@ async fn test_multipart_path(store: &DynStore, key: &str) {
     let _ = store.delete(key, None).await;
 }
 
+/// Concurrent multipart Create attempts must commit blocks from exactly one upload.
+async fn test_concurrent_multipart_create(store: &DynStore, key: &str) {
+    let _ = store.delete(key, None).await;
+    let size = 6 * 1024 * 1024;
+    let attempts = (1u8..=8).map(|value| {
+        let store = store.clone();
+        let key = key.to_owned();
+        async move {
+            store
+                .put(
+                    &key,
+                    PutBody::Bytes(Bytes::from(vec![value; size])),
+                    PutOptions::from(PutMode::Create),
+                )
+                .await
+        }
+    });
+    let results = futures::future::join_all(attempts).await;
+    assert_eq!(
+        results.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "exactly one multipart Create must win"
+    );
+    for result in results.iter().filter(|result| result.is_err()) {
+        assert!(
+            matches!(result, Err(StoreError::PreconditionFailed { .. })),
+            "loser must be a precondition failure: {result:?}"
+        );
+    }
+    let response = store
+        .get(key, GetOptions::default())
+        .await
+        .expect("get concurrent multipart winner");
+    let (_, body) = collect_body(response).await;
+    assert_eq!(body.len(), size);
+    let winner = body[0];
+    assert!(
+        body.iter().all(|byte| *byte == winner),
+        "committed object mixed blocks from concurrent uploads"
+    );
+    let _ = store.delete(key, None).await;
+}
+
 // ---- test wrappers -----------------------------------------------------
 
 #[tokio::test]
@@ -766,6 +811,79 @@ async fn gcs_contract() {
         let _ = store.delete(&m.key, None).await;
     }
     eprintln!("[gcs_contract] cleanup done ({count} objects deleted)");
+}
+
+#[cfg(feature = "azure")]
+#[tokio::test]
+async fn azure_contract() {
+    let endpoint = match std::env::var("WALGIT_TEST_AZURE_ENDPOINT") {
+        Ok(value) => value,
+        Err(_) => {
+            eprintln!("skipping azure_contract: WALGIT_TEST_AZURE_ENDPOINT not set");
+            return;
+        }
+    };
+    let account =
+        std::env::var("WALGIT_TEST_AZURE_ACCOUNT").unwrap_or_else(|_| "devstoreaccount1".into());
+    let bucket = std::env::var("WALGIT_TEST_BUCKET").unwrap_or_else(|_| "walgit-test".into());
+    std::env::var("AZURE_STORAGE_ACCOUNT_KEY")
+        .expect("AZURE_STORAGE_ACCOUNT_KEY required for Azure tests");
+    let prefix = format!("contract-test-{}", uuid::Uuid::new_v4().simple());
+
+    let cfg = walgit_config::StoreConfig {
+        backend: walgit_config::StoreBackend::Azure,
+        bucket,
+        prefix: prefix.clone(),
+        azure: walgit_config::AzureConfig {
+            endpoint,
+            account,
+            credential: walgit_config::AzureCredential::AccountKey,
+            account_key_env: "AZURE_STORAGE_ACCOUNT_KEY".into(),
+        },
+        multipart_threshold: bytesize::ByteSize::mib(5),
+        multipart_part_size: bytesize::ByteSize::mib(4),
+        ..Default::default()
+    };
+    let store = walgit_store::azure::AzureStore::new(&cfg)
+        .await
+        .expect("AzureStore::new");
+    store
+        .ensure_container()
+        .await
+        .expect("ensure Azure container");
+    let store: DynStore = Arc::new(store);
+
+    run_contract(store.clone(), &prefix).await;
+
+    let sas_key = format!("{prefix}/sas-probe");
+    store
+        .put(
+            &sas_key,
+            PutBody::Bytes(Bytes::from_static(b"sas-body")),
+            PutOptions::from(PutMode::Overwrite),
+        )
+        .await
+        .expect("put SAS probe");
+    let url = store
+        .signed_get_url(&sas_key, std::time::Duration::from_secs(3600))
+        .await
+        .expect("signed_get_url")
+        .expect("Azure signed_get_url must return a URL");
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .expect("SAS GET");
+    assert!(response.status().is_success(), "SAS GET failed");
+    assert_eq!(
+        response.bytes().await.expect("SAS body"),
+        Bytes::from_static(b"sas-body")
+    );
+
+    let objects = store.list(&prefix, None).collect::<Vec<_>>().await;
+    for meta in objects.into_iter().flatten() {
+        let _ = store.delete(&meta.key, None).await;
+    }
 }
 
 /// Control plane must stay fast under bulk load (prod 2026-08-20: a 184-byte
