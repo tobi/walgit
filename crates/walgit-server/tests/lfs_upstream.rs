@@ -11,6 +11,7 @@ mod harness;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use axum::{
@@ -23,7 +24,8 @@ use harness::Server;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use walgit_proto::keys;
-use walgit_store::ObjectStoreExt;
+use walgit_store::memory::MemoryStore;
+use walgit_store::{ObjectStoreExt, PutMode};
 
 struct Mock {
     oid: String,
@@ -95,6 +97,60 @@ async fn start_mock(body: Vec<u8>) -> Result<(Arc<Mock>, String)> {
 
 fn batch_req(op: &str, objects: &[(&str, usize)]) -> Value {
     json!({"operation": op, "transfers": ["basic"], "objects": objects.iter().map(|(o, s)| json!({"oid": o, "size": s})).collect::<Vec<_>>()})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_presence_checks_are_parallel_and_preserve_batch_order() -> Result<()> {
+    let mut raw_store = MemoryStore::new();
+    let objects: Vec<String> = (0..100).map(|i| format!("{i:064x}")).collect();
+    for oid in objects.iter().step_by(2) {
+        raw_store
+            .put_bytes(
+                &format!("repos/o/r/{}", keys::lfs_key(oid)),
+                "present",
+                PutMode::Create,
+            )
+            .await?;
+    }
+    raw_store.latency = Some(Duration::from_millis(20));
+
+    let server = Server::start_with_store_and_tweak(Arc::new(raw_store), |_| {}).await?;
+    server.put_repo("o", "r").await?;
+    let batch_url = format!("{}/o/r.git/info/lfs/objects/batch", server.base_url);
+    let request = json!({
+        "operation": "download",
+        "transfers": ["basic"],
+        "objects": objects
+            .iter()
+            .map(|oid| json!({"oid": oid, "size": 7}))
+            .collect::<Vec<_>>(),
+    });
+
+    let started = Instant::now();
+    let response: Value = reqwest::Client::new()
+        .post(batch_url)
+        .json(&request)
+        .send()
+        .await?
+        .json()
+        .await?;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "100 independent presence checks took {elapsed:?}"
+    );
+    let response_objects = response["objects"].as_array().unwrap();
+    assert_eq!(response_objects.len(), objects.len());
+    for (i, (actual, oid)) in response_objects.iter().zip(&objects).enumerate() {
+        assert_eq!(actual["oid"], oid.as_str(), "response order changed at {i}");
+        if i % 2 == 0 {
+            assert!(actual["actions"]["download"].is_object());
+        } else {
+            assert_eq!(actual["error"]["code"], 404);
+        }
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
