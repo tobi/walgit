@@ -45,15 +45,17 @@ if [[ -n "${WALGIT_E2E_BASE_URL:-}" ]]; then
     walgit_auth_setup "$WALGIT_E2E_BASE_URL" || exit 1
 fi
 
+# ${ARR[@]+"${ARR[@]}"}: bash 3.2 (macOS /bin/bash) calls an empty array expansion an unbound
+# variable under set -u. "${ARR[@]:-}" would pass a blank argument, which curl and git reject.
 # Wrapper for curl that adds auth headers.
-curl_auth() { curl "${AUTH_CURL_ARGS[@]}" "$@"; }
+curl_auth() { curl ${AUTH_CURL_ARGS[@]+"${AUTH_CURL_ARGS[@]}"} "$@"; }
 # Wrapper for git that adds auth headers.
-git_auth() { git "${GIT_AUTH_ARGS[@]}" "$@"; }
+git_auth() { git ${GIT_AUTH_ARGS[@]+"${GIT_AUTH_ARGS[@]}"} "$@"; }
 
 wait_http() {
     local url="$1" max="${2:-30}"
     for ((i=0; i<max; i++)); do
-        if curl -sf "${AUTH_CURL_ARGS[@]}" "$url" >/dev/null 2>&1; then return 0; fi
+        if curl -sf ${AUTH_CURL_ARGS[@]+"${AUTH_CURL_ARGS[@]}"} "$url" >/dev/null 2>&1; then return 0; fi
         sleep 1
     done
     return 1
@@ -70,7 +72,9 @@ fi
 
 TMP="$(mktemp -d)"
 PIDS=()
-cleanup() { for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done; wait 2>/dev/null || true; rm -rf "$TMP"; }
+# "${PIDS[@]:-}": bash 3.2 (macOS /bin/bash) calls an empty array expansion an unbound variable
+# under set -u, which aborts the EXIT trap before rm -rf. Same guard as tests/git-bundle-filter.sh:24.
+cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done; wait 2>/dev/null || true; rm -rf "$TMP"; }
 trap cleanup EXIT
 
 PORT="$(rand_port)"
