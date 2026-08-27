@@ -50,7 +50,7 @@ anonymous_read = true             # must be false in oidc mode
 # ]
 # admin_emails = []                # oidc: emails that may delete repos or PUT/DELETE settings and policy.json
 # admin_domains = []               # oidc: email domains that may delete repos or PUT/DELETE settings and policy.json
-# issuer = "https://id.example.com"        # oidc: discovery at <issuer>/.well-known/openid-configuration
+# issuer = "https://id.example.com"        # oidc: required, no default. Discovery at <issuer>/.well-known/openid-configuration
 # allowed_domains = ["example.com"]        # oidc: email domains admitted (email_verified required)
 # allowed_emails = []                      # oidc: individual identities admitted
 # write_domains = ["example.com"]          # oidc: omit to let every admitted identity write
