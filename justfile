@@ -46,6 +46,22 @@ dev-local config="walgit.standalone.toml":
 dev-store:
     #!/usr/bin/env bash
     set -euo pipefail
+    # Preflight: verify port 9000 is free before starting the store.
+    if command -v ss >/dev/null 2>&1; then
+        if ss -tlnH 'sport = :9000' | grep -q .; then
+            echo "Port 9000 is already in use (by another process or container)."
+            echo "Free it with: lsof -i :9000"
+            echo "Or set a different port: WALGIT__STORE__S3__ENDPOINT=http://127.0.0.1:<port>"
+            exit 1
+        fi
+    elif command -v lsof >/dev/null 2>&1; then
+        if lsof -i :9000 -sTCP:LISTEN -t >/dev/null 2>&1; then
+            echo "Port 9000 is already in use (by another process or container)."
+            echo "Free it with: lsof -i :9000"
+            echo "Or set a different port: WALGIT__STORE__S3__ENDPOINT=http://127.0.0.1:<port>"
+            exit 1
+        fi
+    fi
     # nix podman ships no /etc/containers: give the user a signature policy + registry search list once.
     cdir="${XDG_CONFIG_HOME:-$HOME/.config}/containers"; mkdir -p "$cdir"
     [ -f "$cdir/policy.json" ] || printf '{"default":[{"type":"insecureAcceptAnything"}]}\n' > "$cdir/policy.json"
