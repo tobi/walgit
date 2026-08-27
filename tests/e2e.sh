@@ -127,7 +127,9 @@ fi
 
 step "synth: generate synthetic repo (size s, seed 12345)"
 SYNTH_DIR="$TMP/synth"
-"$WALGIT" --config "$TMP/walgit.toml" synth --out "$SYNTH_DIR" --size s --seed 12345
+# synth reads nothing from the config (walgit-cli/src/lib.rs:493 passes only out/size/seed) and
+# $TMP/walgit.toml exists in local mode only, so ask for defaults the way the CLI documents.
+"$WALGIT" --config /dev/null synth --out "$SYNTH_DIR" --size s --seed 12345
 pass "synth completed"
 
 # Verify with git fsck.
