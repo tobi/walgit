@@ -3,6 +3,9 @@
 //! Schema lives in `proto/walgit/v1/wal.proto`; it is the contract between
 //! every walgit instance and must only evolve backward-compatibly.
 
+// prost writes these doc comments from the `.proto` file's own comments, so
+// `doc_markdown` is judging the schema's prose, not ours.
+#[allow(clippy::doc_markdown)]
 pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/walgit.v1.rs"));
 }
@@ -95,7 +98,7 @@ pub mod keys {
 /// Appendable objects grow by appending frames; readers stop at the first
 /// incomplete trailing frame.
 pub mod frame {
-    use bytes::{Buf, Bytes, BytesMut};
+    use bytes::{Bytes, BytesMut};
     use prost::Message;
 
     use crate::v1::LogEntry;
@@ -104,6 +107,9 @@ pub mod frame {
         let len = e.encoded_len();
         prost::encoding::encode_varint(len as u64, out);
         out.reserve(len);
+        // `encode` fails only when the buffer lacks capacity, and `reserve`
+        // above supplied exactly what `encoded_len` asked for.
+        #[allow(clippy::expect_used)]
         e.encode(out).expect("BytesMut has capacity");
     }
 
@@ -120,16 +126,20 @@ pub mod frame {
     pub fn decode_entries(buf: &[u8]) -> Result<(Vec<LogEntry>, usize), prost::DecodeError> {
         let mut out = Vec::new();
         let mut pos = 0usize;
-        loop {
-            let mut probe = &buf[pos..];
+        while let Some(mut probe) = buf.get(pos..) {
             let Ok(len) = prost::encoding::decode_varint(&mut probe) else {
                 break;
             };
-            let len = len as usize;
-            if probe.remaining() < len {
+            // A frame longer than this platform's `usize` cannot be present in
+            // the buffer either, so it reads as an incomplete trailing frame
+            // rather than an error — same as any other short read.
+            let Ok(len) = usize::try_from(len) else {
                 break;
-            }
-            out.push(LogEntry::decode(&probe[..len])?);
+            };
+            let Some(frame) = probe.get(..len) else {
+                break;
+            };
+            out.push(LogEntry::decode(frame)?);
             pos = buf.len() - probe.len() + len;
         }
         Ok((out, pos))
@@ -146,12 +156,18 @@ pub mod time {
     pub fn from_system(t: SystemTime) -> prost_types::Timestamp {
         let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
         prost_types::Timestamp {
-            seconds: d.as_secs() as i64,
-            nanos: d.subsec_nanos() as i32,
+            seconds: d.as_secs().cast_signed(),
+            nanos: d.subsec_nanos().cast_signed(),
         }
     }
     pub fn to_system(t: &prost_types::Timestamp) -> SystemTime {
-        UNIX_EPOCH + Duration::new(t.seconds.max(0) as u64, t.nanos.max(0) as u32)
+        // Both are clamped non-negative first, so neither cast can change the
+        // value it carries.
+        UNIX_EPOCH
+            + Duration::new(
+                t.seconds.max(0).cast_unsigned(),
+                t.nanos.max(0).cast_unsigned(),
+            )
     }
 }
 
@@ -185,6 +201,19 @@ mod tests {
         assert!(keys::lfs_oid_ok(&"a".repeat(64)));
         assert_eq!(keys::lfs_key("ab"), "lfs/objects///ab");
     }
+    #[test]
+    fn a_frame_length_the_buffer_cannot_satisfy_reads_as_incomplete() {
+        // A log object is bytes from the bucket; a truncated or corrupt frame
+        // header can declare any length at all. `u64::MAX` exceeds both the
+        // buffer and a 32-bit `usize`, and must read as an incomplete trailing
+        // frame — the same as any other short read — rather than panicking.
+        let mut buf = bytes::BytesMut::new();
+        prost::encoding::encode_varint(u64::MAX, &mut buf);
+        let (got, used) = frame::decode_entries(&buf).unwrap();
+        assert!(got.is_empty());
+        assert_eq!(used, 0);
+    }
+
     #[test]
     fn frames_roundtrip_and_partial() {
         let e1 = v1::LogEntry {
