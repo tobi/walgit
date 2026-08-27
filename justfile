@@ -18,7 +18,7 @@ web-build:
 
 # Local dev = standalone: the server with every role (serve, maintain, events) at
 # https://walgit.localhost:$PORT (default 8080) against local rustfs. Self-contained: starts rustfs (+ bucket) if
-# it is not answering on :9000 and builds the SPA if web/dist is missing, then runs the server.
+# it is not answering on :9000 and builds the SPA if web/dist holds no Vite output, then runs the server.
 # `config` defaults to walgit.standalone.toml; point it at a real bucket by editing [store] there. The rustfs
 # keys come from the environment (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY; compose.yaml fixes them).
 # Optional: export WALGIT__SERVER__AUTH__* (OIDC client, session secret) to try browser sign-in locally.
@@ -30,8 +30,10 @@ dev-local config="walgit.standalone.toml":
         echo "rustfs not running on :9000 — starting it (just dev-store)"
         just dev-store
     fi
-    if [ ! -f web/dist/index.html ]; then
-        echo "web/dist missing — building the SPA (just web-build)"
+    # crates/walgit-server/build.rs:19 writes a placeholder index.html on any cargo build, so only
+    # repos.js proves a real Vite build (the same file Containerfile:23 checks).
+    if [ ! -f web/dist/repos.js ]; then
+        echo "web/dist SPA is unbuilt; building it (just web-build)"
         just web-build
     fi
     cargo build --release --bin walgit-server
