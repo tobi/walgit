@@ -146,7 +146,8 @@ pub struct AuthConfig {
     pub tokens: Vec<StaticToken>,
     /// OIDC issuer (`oidc` mode). Discovery at `<issuer>/.well-known/openid-configuration`
     /// supplies the JWKS, authorization and token endpoints. Any compliant provider works
-    /// (Google, Microsoft Entra, Okta, Auth0, Keycloak, Dex, GitLab, ...).
+    /// (Google, Microsoft Entra, Okta, Auth0, Keycloak, Dex, GitLab, ...). No default:
+    /// `Config::validate` refuses `oidc` mode until it is set.
     pub issuer: String,
     /// Email domains accepted by `oidc` (the `email` claim, `email_verified` required).
     pub allowed_domains: Vec<String>,
@@ -1050,7 +1051,7 @@ impl Default for AuthConfig {
             mode: AuthMode::None,
             anonymous_read: true,
             tokens: vec![],
-            issuer: "https://accounts.google.com".into(),
+            issuer: String::new(),
             allowed_domains: vec![],
             allowed_emails: vec![],
             audiences: vec![],
@@ -1954,10 +1955,12 @@ audiences = ["walgit-cli", "https://git.example.com"]
             err.to_string().contains("needs `token` or `token_env`"),
             "{err}"
         );
-        // oidc: anonymous_read off, an allowlist, and a way in.
-        let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\n").unwrap_err();
+        // oidc: an issuer, anonymous_read off, an allowlist, and a way in.
+        let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\noauth_client_id = \"x\"\noauth_client_secret = \"y\"\nsession_secret = \"0123456789abcdef0123456789abcdef\"\n").unwrap_err();
+        assert!(err.to_string().contains("issuer"), "{err}");
+        let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nissuer = \"https://login.example.com\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\n").unwrap_err();
         assert!(err.to_string().contains("way in"), "{err}");
-        let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\noauth_client_id = \"x\"\noauth_client_secret = \"y\"\n").unwrap_err();
+        let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nissuer = \"https://login.example.com\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\noauth_client_id = \"x\"\noauth_client_secret = \"y\"\n").unwrap_err();
         assert!(err.to_string().contains("session_secret"), "{err}");
         let ok = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nissuer = \"https://login.example.com\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\noauth_client_id = \"x\"\noauth_client_secret = \"y\"\nsession_secret = \"0123456789abcdef0123456789abcdef\"\n").unwrap();
         assert_eq!(ok.server.auth.issuer, "https://login.example.com");
@@ -1967,6 +1970,11 @@ audiences = ["walgit-cli", "https://git.example.com"]
         )
         .unwrap_err();
         assert!(err.to_string().contains("loopback-only"), "{err}");
+        // The issuer is an oidc-only requirement: none and token mode validate without one.
+        let none = Config::parse("[store]\nbucket = \"b\"\n").unwrap();
+        assert_eq!(none.server.auth.issuer, "");
+        let tok = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ principal = \"ci\", token = \"s\" }]\n").unwrap();
+        assert_eq!(tok.server.auth.issuer, "");
     }
 
     #[test]

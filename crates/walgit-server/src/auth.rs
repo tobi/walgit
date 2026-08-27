@@ -1103,6 +1103,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
     fn config() -> walgit_config::Config {
         let mut cfg = walgit_config::Config::default();
         cfg.server.auth.mode = AuthMode::Oidc;
+        cfg.server.auth.issuer = ISSUER.into();
         cfg.server.auth.allowed_domains = vec!["Example.com".into()];
         cfg.server.auth.audiences = vec![AUD.into()];
         cfg.server.auth.anonymous_read = false;
