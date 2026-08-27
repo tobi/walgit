@@ -894,24 +894,24 @@ fn edge_owns_authorization(headers: &HeaderMap) -> bool {
         })
 }
 
-/// The client's `Authorization` header value (edge-forwarded copy first).
+/// The client's `Authorization` header value: the header itself when walgit is hit
+/// directly, the edge-forwarded copy when an edge announced `client-authorization`.
 fn client_authorization(headers: &HeaderMap) -> Option<String> {
-    if let Some(v) = headers
+    // Nothing announced the capability, so `Authorization` is the client's own and a
+    // forwarded copy nobody vouched for is not read at all (D39 (2), §1.3).
+    if !edge_owns_authorization(headers) {
+        return headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+    }
+    // Behind the edge, a missing copy means the client sent no credential; the
+    // Authorization that is there is the hop's own.
+    headers
         .get(FORWARDED_AUTHORIZATION_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|v| !v.is_empty())
-    {
-        return Some(v.to_string());
-    }
-    // Behind the edge, a missing copy means the client sent no credential; the
-    // Authorization that is there is the hop's own.
-    if edge_owns_authorization(headers) {
-        return None;
-    }
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
         .map(str::to_string)
 }
 
@@ -1002,7 +1002,8 @@ mod tests {
 
     /// Behind the edge (`client-authorization` capability) `Authorization` is the hop's own
     /// credential: with no `X-Walgit-Authorization` there is no client bearer (so the session
-    /// cookie gets its turn). Without the capability, `Authorization` is the client's.
+    /// cookie gets its turn). Without the capability, `Authorization` is the client's and the
+    /// forwarded header is not read at all.
     #[test]
     fn edge_owned_authorization_is_not_the_client() {
         let mut h = HeaderMap::new();
@@ -1018,6 +1019,24 @@ mod tests {
             "Bearer client".parse().unwrap(),
         );
         assert_eq!(bearer_token(&h).as_deref(), Some("client"));
+
+        let mut direct = HeaderMap::new();
+        direct.insert(AUTHORIZATION, "Bearer a".parse().unwrap());
+        direct.insert(FORWARDED_AUTHORIZATION_HEADER, "Bearer b".parse().unwrap());
+        assert_eq!(
+            bearer_token(&direct).as_deref(),
+            Some("a"),
+            "hit directly, a forwarded copy no edge announced is ignored"
+        );
+        direct.insert(
+            crate::static_object::CAPABILITIES_HEADER,
+            "client-authorization".parse().unwrap(),
+        );
+        assert_eq!(
+            bearer_token(&direct).as_deref(),
+            Some("b"),
+            "the announced capability makes the forwarded copy the client's"
+        );
     }
 
     #[test]
