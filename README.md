@@ -140,7 +140,7 @@ each repository one maintainer (placement globs) and you are done.
 
 | mode | who gets in | how git authenticates |
 |---|---|---|
-| `none` | everyone is `anon` with write — loopback experiments | nothing |
+| `none` | everyone is `anon` with write and admin — loopback experiments | nothing |
 | `token` | static `tokens` in the config (`token_env` reads the secret from the environment) | `Authorization: Bearer <token>`, or the token as an HTTP Basic password |
 | `oidc` | any OpenID Connect issuer (`issuer`, `oauth_client_id/secret`, `allowed_domains`/`allowed_emails`): Google, Entra, Okta, Auth0, Keycloak, Dex, GitLab… | a **walgit access token**: sign in once in the browser, create one at `/_auth/tokens`, paste it into the installer. Stateless (HMAC with `session_secret`, `access_token_ttl`); rotating the secret revokes all. ID tokens from the issuer (`audiences`) and static `tokens` work too. |
 
