@@ -209,6 +209,7 @@ pub enum AuthMode {
 pub struct StaticToken {
     pub principal: String,
     /// Read from env var if set, else literal.
+    #[serde(default)]
     pub token: String,
     #[serde(default)]
     pub token_env: Option<String>,
@@ -1938,6 +1939,25 @@ audiences = ["walgit-cli", "https://git.example.com"]
         let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\n")
             .unwrap_err();
         assert!(err.to_string().contains("tokens"), "{err}");
+        // `token_env` alone is a whole entry: the README quick start writes exactly this.
+        let readme = Config::parse(
+            "[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ principal = \"me\", token_env = \"WALGIT_TOKEN_ME\", write = true }]\n",
+        )
+        .unwrap();
+        let t = &readme.server.auth.tokens[0];
+        assert_eq!(t.principal, "me");
+        assert!(t.token.is_empty(), "{:?}", t.token);
+        assert_eq!(t.token_env.as_deref(), Some("WALGIT_TOKEN_ME"));
+        assert!(t.write && !t.admin);
+        // Neither key names a secret, so the entry could never let anyone in.
+        let err = Config::parse(
+            "[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ principal = \"me\", write = true }]\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("needs `token` or `token_env`"),
+            "{err}"
+        );
         // oidc: anonymous_read off, an allowlist, and a way in.
         let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\n").unwrap_err();
         assert!(err.to_string().contains("way in"), "{err}");
