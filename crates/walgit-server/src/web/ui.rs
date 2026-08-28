@@ -82,7 +82,8 @@ pub fn router(state: Arc<AppState>) -> Router {
                 axum::routing::post(ops_start),
             )
             .route(&format!("{base}/tasks"), get(tasks_list))
-            .route(&format!("{base}/tasks/{{id}}"), get(task_stream));
+            .route(&format!("{base}/tasks/{{id}}"), get(task_stream))
+            .route(&format!("{base}/snapshot/{{seq}}"), get(snapshot));
     }
     r.with_state(state)
 }
@@ -1152,6 +1153,43 @@ async fn task_stream(
             .into_response());
     }
     Ok(crate::sse::task_stream(task))
+}
+
+/// `GET …/snapshot/{seq}` — the WAL rewind of `seq` this instance has
+/// materialized (`POST …/ops/snapshot?at_seq={seq}`): its refs, its pack set
+/// and where the rebuilt copy lives. Same auth as the overview (read).
+///
+/// Snapshots are per instance and a cache like every other byte on disk, so
+/// this is `no-store` and the 404 names the op that builds one. It never
+/// touches live refs: `head_seq` in the answer is where the serving copy is.
+async fn snapshot(
+    State(state): State<Arc<AppState>>,
+    AxumPath((owner, repo, seq)): AxumPath<(String, String, u64)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    state.auth.require_read(&headers).await.map_err(auth_err)?;
+    let id =
+        walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
+    // Answer nothing about a repository that does not exist.
+    state.registry.open(&id).await.map_err(wal_err)?;
+    let dir = walgit_wal::snapshot::snapshot_dir(&state.cfg.cache.dir, &id, seq);
+    let body = tokio::task::spawn_blocking(move || walgit_wal::snapshot::read_snapshot(&dir))
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "no snapshot of {id} at seq {seq} on {}; build one with POST /{id}/api/ops/snapshot?at_seq={seq}",
+                walgit_store::coord::instance_id()
+            ))
+        })?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        serde_json::to_vec(&body).map_err(|e| ApiError::Internal(e.to_string()))?,
+    )
+        .into_response())
 }
 
 async fn checkpoint_info(

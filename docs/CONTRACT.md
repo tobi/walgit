@@ -215,8 +215,29 @@ impl RepoHandle {
   pub async fn read_log(&self, from_seq: u64, to_seq: Option<u64>) -> Result<Vec<LogEntry>, WalError>;
   pub fn last_access(&self) -> Instant;  pub fn touch(&self);
 }
+// snapshot.rs — time travel, shared by `walgit wal materialize --at-seq` and the server's `snapshot` op.
+// Non-mutating: nothing is published and the serving copy stays at the WAL head. Runs on the bulk runtime.
+pub mod snapshot {
+  pub type Narrator = Arc<dyn Fn(String) + Send + Sync>;   // narration sink: CLI prints, server notices
+  pub const REFS_MAX: usize = 1000;                        // refs carried inline in a Snapshot
+  pub struct Snapshot { pub repo: String, pub at_seq: u64, pub head_seq: u64, pub from_seq: u64,
+                       pub entries: u64, pub git_dir: String, pub ref_count: usize,
+                       pub refs: Vec<SnapshotRef>, pub head_target: String,
+                       pub packs: Vec<SnapshotPack>, pub hostname: String, pub built_at: String }
+  /// Rebuild `id` as it was at `at_seq` into `out` (which must not exist).
+  pub async fn materialize_at(registry: Arc<Registry>, id: RepoId, at_seq: u64, out: PathBuf,
+                              narrate: Narrator) -> Result<Snapshot, WalError>;
+  /// Same replay into `<cache.dir>/snapshots/<owner>/<name>/<at_seq>/`, idempotently; the bool is
+  /// "built now". Err(Invalid) for seq 0 or past the head, Err(TooLarge) beyond the cache budget.
+  pub async fn snapshot_at(registry: Arc<Registry>, id: RepoId, at_seq: u64, narrate: Narrator)
+      -> Result<(Snapshot, bool), WalError>;
+  pub fn snapshot_dir(cache_dir: &Path, id: &RepoId, at_seq: u64) -> PathBuf;
+  /// The completed snapshot in `dir` (its marker is written last), else None.
+  pub fn read_snapshot(dir: &Path) -> Option<Snapshot>;
+}
 pub enum WalError { NotFound, AlreadyExists, RefConflict{name, expected, actual}, Store(StoreError),
-                    Coord(CoordError), Git(GitError), Corrupt(String), Retry{attempts}, Io(std::io::Error) }
+                    Coord(CoordError), Git(GitError), Corrupt(String), Invalid(String),
+                    Retry{attempts}, Io(std::io::Error), TooLarge{bytes, max} }
 pub enum RefError { NonFastForward, Conflict{expected,actual}, Rejected(String), Missing }
 ```
 
@@ -234,6 +255,7 @@ pub async fn serve(state: Arc<AppState>, shutdown: impl Future<Output=()> + Send
 //   GET  /HEAD  GET /objects/info/packs (404 unless dumb enabled)
 //   POST /info/lfs/objects/batch  PUT/GET /info/lfs/objects/{oid}  POST /info/lfs/verify
 //   GET  /bundles/list  GET /bundles/{strategy}/{name}    (bundle-uri targets; ETag/Range/immutable caching)
+//   POST /api/ops/snapshot?at_seq=N  GET /api/snapshot/{seq}   (WAL time travel; non-mutating, per instance)
 //   PUT  /  (create repo, write permission)   DELETE / (write permission)
 // Non-repo: GET /healthz /readyz /metrics ; GET / (list repos, text/plain)
 // Auth: verified Google identity; writes require write permission. Sync level depends on the endpoint

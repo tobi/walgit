@@ -8,7 +8,7 @@ The programmatic surface of walgit (D20, the *Bring Your Own Tool*
 shape): everything the bundled UI, another site, an agent or a script needs.
 A Git host that implements this surface (JSON over HTTP plus the hosting rule
 of §1) can serve the built UI unchanged; nothing in `web/src` depends on
-walgit internals except the optional `overview`/`ops`/`tasks` endpoints.
+walgit internals except the optional `overview`/`ops`/`tasks`/`snapshot` endpoints.
 
 ```
 https://git.example.com/{owner}/{repo}/api/…           bearer lane   a bearer token or the same-origin session cookie
@@ -193,7 +193,7 @@ Anything long-running is a **task** with a unique id, discoverable per repo:
 ok?: bool, summary, progress?: {label,done,total?,unit,percent?},
 log_tail: [string], params?: {…}}`; `ok` absent = running. Kinds today:
 `materialize`, `remote-index`, `fsck`, `compact`, `bundle`, `checkpoint`,
-`sync`, `rematerialize`.
+`sync`, `rematerialize`, `snapshot`.
 
 ## 3. Ref + path resolution (`{rest...}` routes)
 
@@ -477,6 +477,39 @@ kind, slot, status: built|missing|pending|blocked|unavailable|too-small|skipped|
 upcoming[], maintainers[{host, disk, max_pack_bytes, last_pass_age_secs, alive, passes, last_unit}], orphaned}`,
 `compactions[]`, `node{…counters}`. Arrays `[]` when empty.
 
+### `GET /{owner}/{repo}/api/snapshot/{seq}` — optional, walgit-specific
+
+A **WAL time-travel snapshot**: the repository as it was at WAL sequence `seq`,
+rebuilt by the instance that answers. Read-only and non-mutating — live refs and
+the serving copy stay at the WAL head, and `head_seq` in the answer says where
+that is.
+
+```json
+{ "repo": "acme/monorepo", "at_seq": 1417, "head_seq": 1502,
+  "from_seq": 1400, "entries": 17,
+  "git_dir": "/tmp/walgit/snapshots/acme/monorepo/1417/acme/monorepo.git",
+  "ref_count": 3, "refs": [ { "name": "refs/heads/main", "sha": "807d45a6…", "peeled": "" } ],
+  "head_target": "refs/heads/main",
+  "packs": [ { "checksum": "9f2c…", "tier": 2, "pack_size": 41231, "object_count": 12, "source": "store" } ],
+  "hostname": "walgit-7c9f", "built_at": "2026-08-28T16:24:03Z" }
+```
+
+- The tree is built by **`POST …/ops/snapshot?at_seq={seq}`** (write permission,
+  `mutating: false`) into `<cache.dir>/snapshots/<owner>/<name>/<seq>/` on that
+  instance; the op is idempotent and answers `{built: bool, snapshot: {…}}`.
+  A missing, unparsable, zero or past-the-head `at_seq` is refused with the
+  reason and nothing is written.
+- `404` (plain text, naming the op) until that instance has built it. Snapshots
+  are per instance and a **cache** like every other byte on disk: deleting the
+  tree loses warmth only, and the next run rebuilds the identical copy from the
+  WAL. `Cache-Control: no-store`. A host without a WAL returns `404`.
+- `refs` is capped at 1000 entries, name-sorted; `ref_count` is the real number
+  and the copy at `git_dir` has all of them (cost must not scale with ref count).
+- `source` per pack is `local` (copied from the instance's serving copy) or
+  `store` (range-downloaded), so the answer says what the rewind cost.
+- Same auth as `overview` (read). SDK: `repo.snapshot(seq)` and
+  `repo.ops.run("snapshot", { at_seq: String(seq) }, …)`.
+
 ### Service routes (not for the browser)
 
 `POST /_events/notify` is the events bridge's wake-up (`docs/EVENTS.md`): the
@@ -536,6 +569,9 @@ GET /o/r/api/commits?ref=<sha>&path=&skip=0     → 200 {ref,sha,commits,more}; 
 GET /o/r/api/commit/<sha>                       → 200 {commit,stats,patch}; immutable
 GET /o/r/api/commit/<sha[:8]>                   → 200; SWR + ETag "<full sha>"
 GET /o/r/api/commit/deadbeef                    → 404 text/plain
+POST /o/r/api/ops/snapshot?at_seq=1             → SSE, result {built, snapshot:{at_seq:1, head_seq, refs, packs}}
+GET /o/r/api/snapshot/1                         → 200 {at_seq,head_seq,refs,packs,git_dir}; no-store
+GET /o/r/api/snapshot/99999                     → 404 text/plain (not materialized here)
 GET /o/r/tree/main/anything                              → 200 index.html
 GET /o/r/settings                                        → 200 index.html  (JSON is /o/r/api/settings)
 ```

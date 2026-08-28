@@ -17,7 +17,9 @@ use walgit_wal::RepoHandle;
 
 use crate::AppState;
 
-/// Callback that receives human-readable progress lines.
+/// Callback that receives human-readable progress lines. Borrowed form of
+/// [`walgit_wal::snapshot::Narrator`], so an op can hand the same sink to work
+/// in the WAL crate that outlives the call.
 pub type Log<'a> = &'a (dyn Fn(String) + Send + Sync);
 
 pub fn noop_log(_: String) {}
@@ -121,6 +123,17 @@ pub const OPS: &[OpSpec] = &[
         params: &[],
         mutating: false,
     },
+    OpSpec {
+        id: "snapshot",
+        label: "Snapshot",
+        description: "Time travel: rebuild the repository as it was at WAL sequence at_seq=<n> into \
+                      <cache.dir>/snapshots/<owner>/<name>/<n>/ on this instance and report its refs. \
+                      Nothing is published and no live ref moves — the serving copy stays at the head. \
+                      Idempotent: a sequence already materialized here is returned as it is. Read it \
+                      back at GET …/api/snapshot/{n}.",
+        params: &["at_seq"],
+        mutating: false,
+    },
 ];
 
 pub fn spec(id: &str) -> Option<&'static OpSpec> {
@@ -164,11 +177,13 @@ pub async fn start(
         async move {
             let reporter = task.reporter();
             let repo = id.to_string();
-            let log = move |line: String| {
+            // An `Arc` sink, not a borrowed closure: work that runs on another
+            // runtime (the WAL crate's bulk runtime) needs an owned one.
+            let narrate: walgit_wal::snapshot::Narrator = Arc::new(move |line: String| {
                 tracing::info!(repo = %repo, op = op_id, "{line}");
                 reporter.notice(line);
-            };
-            let res = run(&state, &id, op_id, &params, &log).await;
+            });
+            let res = run(&state, &id, op_id, &params, narrate).await;
             match res {
                 Ok((summary, value)) => {
                     task.finish_ok(summary, Some(value));
@@ -210,8 +225,9 @@ async fn run(
     id: &RepoId,
     op: &str,
     params: &HashMap<String, String>,
-    log: Log<'_>,
+    narrate: walgit_wal::snapshot::Narrator,
 ) -> Result<(String, serde_json::Value), String> {
+    let log: Log<'_> = narrate.as_ref();
     let handle = state.registry.open(id).await.map_err(|e| e.to_string())?;
     match op {
         "fsck" => {
@@ -598,6 +614,44 @@ async fn run(
             Ok((
                 format!("re-materialized at seq {}", handle.applied_seq()),
                 serde_json::json!({ "seq": handle.applied_seq() }),
+            ))
+        }
+        "snapshot" => {
+            // Time travel, not a write: the WAL is replayed into a directory of
+            // its own under `cache.dir` and the serving copy stays at the head
+            // (AGENTS §2.4 — every state the repository was ever in is in the log).
+            let raw = params.get("at_seq").map_or("", |v| v.trim());
+            if raw.is_empty() {
+                return Err("snapshot: missing `at_seq` (the WAL sequence to rewind to)".into());
+            }
+            let at_seq: u64 = raw.parse().map_err(|_| {
+                format!("snapshot: `at_seq` must be a WAL sequence number, got {raw:?}")
+            })?;
+            let (snap, built) = walgit_wal::snapshot_at(
+                state.registry.clone(),
+                id.clone(),
+                at_seq,
+                narrate.clone(),
+            )
+            .await
+            .map_err(|e| format!("snapshot: {e}"))?;
+            tracing::info!(repo = %id, at_seq, built, refs = snap.ref_count, packs = snap.packs.len(), git_dir = %snap.git_dir, "snapshot materialized");
+            let summary = format!(
+                "{} at seq {} ({} ref(s), {} pack(s)) in {}; the WAL head is {} and the serving copy did not move",
+                if built {
+                    "materialized"
+                } else {
+                    "already materialized"
+                },
+                snap.at_seq,
+                snap.ref_count,
+                snap.packs.len(),
+                snap.git_dir,
+                snap.head_seq,
+            );
+            Ok((
+                summary,
+                serde_json::json!({ "built": built, "snapshot": snap }),
             ))
         }
         _ => Err("unknown op".into()),

@@ -10,6 +10,7 @@ pub mod progress;
 mod publish;
 mod registry;
 pub mod remote;
+pub mod snapshot;
 mod state;
 mod store_proto;
 mod sync;
@@ -22,6 +23,7 @@ pub use progress::{Progress, Reporter};
 pub use publish::PublishResult;
 pub use registry::{EvictReport, Registry};
 pub use remote::{BlockCache, RemotePacks};
+pub use snapshot::{Snapshot, materialize_at, snapshot_at};
 pub use sync::{PackPlan, ReadGuard, SyncLevel};
 pub use tasks::{Begin, TaskHandle, TaskRecord, Tasks};
 

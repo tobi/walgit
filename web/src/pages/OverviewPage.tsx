@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { api, runOp, type OpEvent, type OpRecord, type Overview } from "../api";
+import { api, repoApi, runOp, type OpEvent, type OpRecord, type Overview } from "../api";
 import { invalidate, useData } from "../data";
 import { Box } from "../components/Layout";
 import { BundlePlan } from "../components/BundlePlan";
@@ -222,13 +222,20 @@ const PARAM_HELP: Record<string, string> = {
   base: "rebuild bitmap'd base",
 };
 
+/** Params that take a value, not a flag: rendered as a field, not a checkbox. */
+const VALUE_PARAMS = new Set(["strategy", "at_seq"]);
+
 function OpsBox({ repo, overview, onChanged }: { repo: string; overview: Overview; onChanged: () => void }) {
   const specs = overview.ops.available;
+  const head = Math.max(0, overview.manifest.next_seq - 1);
   const [running, setRunning] = useState<string | null>(null);
   const [log, setLog] = useState<string[]>([]);
   const [status, setStatus] = useState<{ ok?: boolean; text: string } | null>(null);
   const [flags, setFlags] = useState<Record<string, boolean>>({});
   const [strategy, setStrategy] = useState<string>("");
+  // `snapshot`'s at_seq: which WAL sequence to rewind to. Defaults to the head,
+  // where the rewind is the current state.
+  const [atSeq, setAtSeq] = useState<string>(String(head));
   const abort = useRef<AbortController | null>(null);
   const logRef = useRef<HTMLPreElement>(null);
 
@@ -285,8 +292,9 @@ function OpsBox({ repo, overview, onChanged }: { repo: string; overview: Overvie
 
   const paramsFor = (op: string, spec: { params: string[] }) => {
     const p: Record<string, string> = {};
-    for (const k of spec.params) if (k !== "strategy" && flags[`${op}.${k}`]) p[k] = "1";
+    for (const k of spec.params) if (!VALUE_PARAMS.has(k) && flags[`${op}.${k}`]) p[k] = "1";
     if (op === "bundle" && strategy) p.strategy = strategy;
+    if (spec.params.includes("at_seq") && atSeq) p.at_seq = atSeq;
     return p;
   };
 
@@ -310,7 +318,7 @@ function OpsBox({ repo, overview, onChanged }: { repo: string; overview: Overvie
                   <div>{s.description}</div>
                   <div className="op-params">
                     {s.params.flatMap((k) =>
-                      k === "strategy" ? [] : (
+                      VALUE_PARAMS.has(k) ? [] : (
                         <label key={k} className="small muted">
                           <input
                             type="checkbox"
@@ -320,6 +328,20 @@ function OpsBox({ repo, overview, onChanged }: { repo: string; overview: Overvie
                           {PARAM_HELP[k] ?? k}
                         </label>
                       ),
+                    )}
+                    {s.params.includes("at_seq") && (
+                      <span className="small muted">
+                        <label>
+                          at_seq{" "}
+                          <input type="number" min={1} max={head} step={1} value={atSeq} onChange={(e) => setAtSeq(e.target.value)} />
+                        </label>{" "}
+                        of {head} — the state the WAL was in at that sequence; live refs stay at the head.{" "}
+                        {atSeq && (
+                          <a href={`${repoApi(repo)}/snapshot/${encodeURIComponent(atSeq)}`} target="_blank" rel="noreferrer">
+                            JSON
+                          </a>
+                        )}
+                      </span>
                     )}
                     {s.params.includes("strategy") && (
                       <label className="small muted">

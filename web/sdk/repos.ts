@@ -204,6 +204,45 @@ export type Overview = Record<string, unknown> & {
 /** One `/policy` document (docs/POLICY.md). */
 export type Policy = Record<string, unknown>;
 
+export interface SnapshotRef {
+  name: string;
+  sha: string;
+  /** Peeled commit of an annotated tag, `""` otherwise. */
+  peeled: string;
+}
+export interface SnapshotPack {
+  checksum: string;
+  tier: number;
+  pack_size: number;
+  object_count: number;
+  /** `local` (copied from the instance's serving copy) or `store` (range-downloaded). */
+  source: "local" | "store";
+}
+/**
+ * A WAL rewind one instance has materialized (`ops.run("snapshot", {at_seq})`,
+ * walgit-specific): the repository as it was at `at_seq`. Non-mutating — the
+ * serving copy stays at `head_seq`.
+ */
+export interface Snapshot {
+  repo: string;
+  at_seq: number;
+  /** The WAL head when it was built: where the live refs stayed. */
+  head_seq: number;
+  /** Where the replay started: the newest checkpoint at or before `at_seq`, or 0. */
+  from_seq: number;
+  /** Log entries applied in `(from_seq, at_seq]`. */
+  entries: number;
+  /** The bare git directory of the rebuilt copy on `hostname`. */
+  git_dir: string;
+  ref_count: number;
+  /** The first 1000 refs at `at_seq`, name-sorted (`ref_count` is the total). */
+  refs: SnapshotRef[];
+  head_target: string;
+  packs: SnapshotPack[];
+  hostname: string;
+  built_at: string;
+}
+
 /** An envelope packet (API.md §2b) or a task packet, surfaced via `onProgress`. */
 export type Progress =
   | { kind: "notice"; text: string; url: string }
@@ -664,6 +703,14 @@ export class RepoClient {
   /** WAL overview (walgit-specific). */
   overview(opts?: CallOptions) {
     return this.client.json<Overview>(`${this.p}/overview`, opts);
+  }
+  /**
+   * A WAL rewind of `seq` as materialized by the answering instance. `404`
+   * until that instance ran `ops.run("snapshot", {at_seq: String(seq)})`;
+   * snapshots are per instance and never cached (API.md §4).
+   */
+  snapshot(seq: number, opts?: CallOptions) {
+    return this.client.json<Snapshot>(`${this.p}/snapshot/${seq}`, opts, { cache: "no-store" });
   }
   /** What is happening to this repo on the instance that answers. Never cached. */
   tasks(opts?: CallOptions) {

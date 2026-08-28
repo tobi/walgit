@@ -728,6 +728,7 @@ h2 {
 .ops-table td { word-break: normal; }
 .op-params { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 4px; }
 .op-params select { font: inherit; font-size: 12px; }
+.op-params input[type="number"] { width: 6em; background: var(--bg2); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; font: inherit; font-size: 12px; }
 .op-output { margin-top: 12px; }
 .op-status { font-size: 13px; padding: 6px 10px; border-radius: 6px; margin-bottom: 6px; }
 .op-log { max-height: 320px; font-size: 12px; white-space: pre-wrap; min-height: 40px; }

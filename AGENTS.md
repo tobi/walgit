@@ -193,6 +193,10 @@ runtime** and never takes the refs phase's lock (D19). `check_fits` refuses to p
   `wal.checkpoint_tail_bytes` fires — the checkpoint is the unit of serving state. Writing one is refs-level work,
   so each `maintain` host checkpoints its own repositories.
 - **Provenance for free**: every push and repack is a log entry; `walgit wal ls|show|materialize --at-seq`.
+ The same rewind over HTTP is the **`snapshot` op** (non-mutating): `POST …/api/ops/snapshot?at_seq=<n>`
+ rebuilds the repository as it was at `<n>` into `<cache.dir>/snapshots/<o>/<r>/<n>/` on the answering
+ instance (idempotent, a cache, never a WAL write) and `GET …/api/snapshot/<n>` reads it back. Live refs and
+ the serving copy stay at the head; the replay lives in `walgit-wal/src/snapshot.rs` and is shared with the CLI.
 - **Never LIST on a hot path**; 404s are free; probe, don't list. Immutable objects get
   `Cache-Control: public, max-age=31536000, immutable` + strong ETag + Range everywhere (D10 static contract).
 
