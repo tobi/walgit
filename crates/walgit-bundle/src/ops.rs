@@ -801,7 +801,8 @@ pub async fn build_and_upload(
             build_span.record("bytes", s);
             build_span.record("outcome", "ok");
             metrics::histogram!("walgit_bundle_build_seconds", "strategy" => strategy_name.to_string(), "kind" => match kind { BundleKind::Full => "full", BundleKind::Incremental => "incremental" }).record(t_build.elapsed().as_secs_f64());
-            metrics::histogram!("walgit_bundle_build_bytes", "strategy" => strategy_name.to_string()).record(s);
+            metrics::histogram!("walgit_bundle_build_bytes", "strategy" => strategy_name.to_string())
+                .record(crate::histogram_sample(s));
             s
         }
         Err(BundleError::Git(GitError::Subprocess { stderr, .. }))
