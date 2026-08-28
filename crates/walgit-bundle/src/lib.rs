@@ -33,6 +33,16 @@ use walgit_store::Prefixed;
 
 pub use ops::LeaseGuard;
 pub use walgit_git::{RefSnapshotData, RepoId};
+
+/// Convert an integer sample for the metrics histogram API, whose storage type is f64.
+///
+/// Bundle sizes and commit counts may exceed f64's exact-integer range in theory, but
+/// histogram samples are approximate telemetry rather than repository state.
+#[allow(clippy::cast_precision_loss)]
+fn histogram_sample(value: u64) -> f64 {
+    value as f64
+}
+
 // ---------------------------------------------------------------------------
 // Error
 // ---------------------------------------------------------------------------
@@ -301,7 +311,8 @@ impl Bundler {
                     .map(|t| t.oid.clone())
                     .collect();
                 let commits = ops::count_commits(&handle.local, &tip_oids, &prerequisites).await?;
-                metrics::histogram!("walgit_bundle_commits", "strategy" => strategy_name.to_string()).record(commits as f64);
+                metrics::histogram!("walgit_bundle_commits", "strategy" => strategy_name.to_string())
+                    .record(histogram_sample(commits));
                 tracing::info!(
                     strategy = strategy_name,
                     slot = cut.slot,
