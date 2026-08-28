@@ -28,7 +28,7 @@ fn to_chrono(t: SystemTime) -> DateTime<Utc> {
 
 /// Convert a chrono UTC datetime back to [`SystemTime`].
 fn to_system(dt: DateTime<Utc>) -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(dt.timestamp().max(0) as u64)
+    UNIX_EPOCH + Duration::from_secs(dt.timestamp().max(0).cast_unsigned())
 }
 
 /// Next fire time of `schedule` strictly after `after`, or `None` if the

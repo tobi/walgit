@@ -301,7 +301,7 @@ impl Bundler {
                     .map(|t| t.oid.clone())
                     .collect();
                 let commits = ops::count_commits(&handle.local, &tip_oids, &prerequisites).await?;
-                metrics::histogram!("walgit_bundle_commits", "strategy" => strategy_name.to_string()).record(commits as f64);
+                metrics::histogram!("walgit_bundle_commits", "strategy" => strategy_name.to_string()).record(commits);
                 tracing::info!(
                     strategy = strategy_name,
                     slot = cut.slot,

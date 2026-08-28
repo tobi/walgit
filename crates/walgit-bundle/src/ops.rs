@@ -244,7 +244,9 @@ pub async fn create_bundle(
         .map_err(|e| BundleError::Io(e.to_string()))?;
     {
         use tokio::io::AsyncWriteExt;
-        let mut stdin = child.stdin.take().expect("stdin");
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            BundleError::Io("git pack-objects stdin was not piped".to_string())
+        })?;
         stdin
             .write_all(revs.as_bytes())
             .await
@@ -262,12 +264,15 @@ pub async fn create_bundle(
             .await
             .map_err(|e| BundleError::Io(e.to_string()))?;
     }
-    let mut stdout = child.stdout.take().expect("stdout");
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        BundleError::Io("git pack-objects stdout was not piped".to_string())
+    })?;
     let mut first = [0u8; 12];
     tokio::io::AsyncReadExt::read_exact(&mut stdout, &mut first)
         .await
         .map_err(|e| BundleError::Io(format!("pack header: {e}")))?;
-    let objects = u32::from_be_bytes([first[8], first[9], first[10], first[11]]);
+    let [_, _, _, _, _, _, _, _, b0, b1, b2, b3] = first;
+    let objects = u32::from_be_bytes([b0, b1, b2, b3]);
     {
         use tokio::io::AsyncWriteExt;
         file.write_all(&first)
@@ -796,7 +801,7 @@ pub async fn build_and_upload(
             build_span.record("bytes", s);
             build_span.record("outcome", "ok");
             metrics::histogram!("walgit_bundle_build_seconds", "strategy" => strategy_name.to_string(), "kind" => match kind { BundleKind::Full => "full", BundleKind::Incremental => "incremental" }).record(t_build.elapsed().as_secs_f64());
-            metrics::histogram!("walgit_bundle_build_bytes", "strategy" => strategy_name.to_string()).record(s as f64);
+            metrics::histogram!("walgit_bundle_build_bytes", "strategy" => strategy_name.to_string()).record(s);
             s
         }
         Err(BundleError::Git(GitError::Subprocess { stderr, .. }))

@@ -53,7 +53,10 @@ static SIGNING_WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::Ha
 
 fn warn_signing_once(owner: &str, repo: &str, e: &dyn std::fmt::Display) {
     let key = format!("{owner}/{repo}");
-    if SIGNING_WARNED.lock().unwrap().insert(key.clone()) {
+    let mut warned = SIGNING_WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if warned.insert(key.clone()) {
         tracing::warn!(repo = %key, error = %e, "signed bundle URL failed; serving proxy URIs instead (check the store signing permissions)");
     }
 }
@@ -131,12 +134,20 @@ pub async fn render_list_text(
             cfg.signed_url_ttl,
         )
         .await?;
-        out.push_str("\n");
-        out.push_str(&format!("[bundle \"{}\"]\n", entry.id));
-        out.push_str(&format!("    uri = {uri}\n"));
-        out.push_str(&format!("    creationToken = {}\n", entry.creation_token));
+        out.push('\n');
+        out.push_str("[bundle \"");
+        out.push_str(&entry.id);
+        out.push_str("\"]\n");
+        out.push_str("    uri = ");
+        out.push_str(&uri);
+        out.push('\n');
+        out.push_str("    creationToken = ");
+        out.push_str(&entry.creation_token.to_string());
+        out.push('\n');
         if !entry.filter.is_empty() {
-            out.push_str(&format!("    filter = {}\n", entry.filter));
+            out.push_str("    filter = ");
+            out.push_str(&entry.filter);
+            out.push('\n');
         }
     }
 
