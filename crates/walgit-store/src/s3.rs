@@ -546,7 +546,12 @@ impl ObjectStore for S3Store {
         opts: PutOptions,
     ) -> Result<ObjectMeta> {
         const MIN_PART: u64 = 5 * 1024 * 1024;
-        const COPY_PART: u64 = 1024 * 1024 * 1024; // <= 5 GiB per UploadPartCopy
+        // Copy in MIN_PART-sized slices (not the 5 GiB S3 maximum): R2 requires every
+        // non-trailing part of a multipart upload to have the SAME length, so the copy
+        // granularity must equal the upload granularity (MIN_PART) for mixed
+        // upload/copy layouts to complete. S3 accepts uniform parts just as well;
+        // a 5 GiB compose needs <= 1024 copy requests, a 30 GB one ~6k (limit 10k).
+        const COPY_PART: u64 = MIN_PART;
         if sources.is_empty() {
             return Err(StoreError::InvalidArgument(
                 "compose needs at least one source".into(),
