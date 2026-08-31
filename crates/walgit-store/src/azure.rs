@@ -70,19 +70,33 @@
 //! ([`API_VERSION`]) is kept equal to the SDK's own, and the URL is built with
 //! the SDK's `UrlExt::query_builder`, so both paths encode identically.
 //!
+//! ## Signed URLs
+//!
+//! [`ObjectStore::signed_get_url`] mints a **user-delegation SAS**: a read-only,
+//! time-boxed URL signed with a key the account issues to *this* identity
+//! (`Get User Delegation Key`), never with the account's shared key — walgit
+//! never holds one, and the config has nowhere to put one. The key is cached in
+//! [`AzureStore::delegation_key`] and refreshed by [`needs_new_delegation_key`].
+//!
+//! The result is a credential. Anyone holding it can read that one blob until
+//! `se`, so it is never logged, traced, or put into an error message, and no
+//! test writes a whole signed URL down.
+//!
 //! ## Status
 //!
-//! The whole `ObjectStore` data plane is implemented. The SAS/accel paths the
-//! currently-unread fields below are for land in a later task.
+//! The whole `ObjectStore` data plane is implemented, signed URLs included.
 
 use std::num::NonZero;
 use std::ops::Range;
 use std::sync::Arc;
 
-use azure_core::credentials::TokenCredential;
+use azure_core::base64;
+use azure_core::credentials::{Secret, TokenCredential};
 use azure_core::error::ErrorKind;
+use azure_core::hmac::hmac_sha256;
 use azure_core::http::headers::{ETAG, HeaderName, Headers};
 use azure_core::http::{Etag, RequestContent, Url, UrlExt};
+use azure_core::time::{Duration, OffsetDateTime};
 use azure_identity::{
     ClientSecretCredential, DeveloperToolsCredential, ManagedIdentityCredential,
     WorkloadIdentityCredential,
@@ -91,11 +105,12 @@ use azure_storage_blob::models::{
     BlobClientDeleteOptions, BlobClientDownloadOptions, BlobClientGetPropertiesResultHeaders,
     BlobContainerClientListBlobsOptions, BlobItem, BlockBlobClientCommitBlockListOptions,
     BlockBlobClientCommitBlockListResultHeaders, BlockBlobClientUploadOptions, BlockLookupList,
-    HttpRange,
+    HttpRange, KeyInfo,
 };
 use azure_storage_blob::{BlobContainerClient, BlobServiceClient};
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
+use parking_lot::Mutex;
 use serde::Deserialize;
 use walgit_config::AzureCredentialKind;
 
@@ -141,11 +156,43 @@ const STORAGE_SCOPE: &str = "https://storage.azure.com/.default";
 /// free of anything a caller sent — safe to put in an error message.
 const MS_ERROR_CODE: &str = "x-ms-error-code";
 
-/// Azure Blob Storage object store.
+/// `sp=r` — the permission a walgit signed URL grants: read one blob, nothing
+/// else. Never widened; a URL that could write would be a write credential
+/// handed to a git client.
+const SAS_PERMISSIONS: &str = "r";
+
+/// `sr=b` — the signature covers exactly one blob, not a container and not a
+/// "directory" of them.
+const SAS_RESOURCE: &str = "b";
+
+/// `spr=https` — the service refuses the SAS over plain HTTP, so a signature
+/// cannot be observed in transit even if the URL is used carelessly.
+const SAS_PROTOCOL: &str = "https";
+
+/// Backdate applied to every `st`/`skt`, and the margin the cache keeps between
+/// a URL's expiry and its key's.
 ///
-/// The `allow` covers `service` and `account`: populated here, first read by
-/// the SAS-signing task that follows.
-#[allow(dead_code)]
+/// Azure judges the window by *its* clock. A server running a few minutes fast
+/// would otherwise mint URLs that are not valid yet, which reads to a client as
+/// an unexplained 403.
+const CLOCK_SKEW: Duration = Duration::minutes(5);
+
+/// How long each user delegation key is requested for. The service's own
+/// ceiling is seven days; a day is long enough that signing is almost always
+/// zero round trips and short enough to bound a leaked key.
+const KEY_LIFETIME: Duration = Duration::hours(24);
+
+/// The longest `ttl` [`ObjectStore::signed_get_url`] will sign.
+///
+/// A URL cannot outlive the key that signed it, keys are asked for
+/// [`KEY_LIFETIME`], and [`needs_new_delegation_key`] keeps a [`CLOCK_SKEW`]
+/// margin below that. Anything longer is refused rather than silently
+/// shortened — refusing also stops the refresh test from asking for a key no
+/// fetch can satisfy, which would re-fetch on *every* call and still hand back
+/// a URL the service rejects.
+const MAX_SIGNED_TTL: Duration = Duration::hours(23);
+
+/// Azure Blob Storage object store.
 pub struct AzureStore {
     /// Client scoped to the container named by `store.bucket`.
     container: BlobContainerClient,
@@ -163,6 +210,46 @@ pub struct AzureStore {
     endpoint: String,
     multipart_threshold: u64,
     multipart_part_size: u64,
+    /// The user delegation key SAS URLs are signed with, cached until it can no
+    /// longer cover a URL being minted. `None` until the first signature.
+    ///
+    /// This is a *signing key* cache, not an access-token cache, and the
+    /// distinction is what makes 24 hours safe: Azure enforces revocation
+    /// server-side — revoking the account's user delegation keys invalidates
+    /// every SAS already built from them — so holding one here cannot extend
+    /// access past a revocation. Exposure per URL is bounded by the caller's
+    /// `ttl` either way.
+    delegation_key: Mutex<Option<Arc<CachedDelegationKey>>>,
+}
+
+/// A user delegation key, reduced to the strings one SAS needs.
+///
+/// The service returns every field as an `Option`; they are checked and
+/// converted once, here, so signing itself cannot fail on a missing field and
+/// the same bytes reach the string-to-sign and the query string.
+struct CachedDelegationKey {
+    /// The key value as base64 — what [`hmac_sha256`] takes (it decodes it
+    /// again itself). The SDK already base64-*decoded* the wire value into
+    /// bytes, so this is a re-encode, not a passthrough.
+    ///
+    /// `Secret`'s `Debug` prints `Secret`, so the key cannot reach a log line
+    /// through a derived `Debug` somewhere upstream.
+    value: Secret,
+    /// `skoid` — the Entra object id the key was issued to.
+    skoid: String,
+    /// `sktid` — its tenant.
+    sktid: String,
+    /// `skt` / `ske` — the key's own validity window, verbatim in the wire
+    /// form the service sent.
+    skt: String,
+    ske: String,
+    /// `sks` — the service the key is good for (`b` for blob).
+    sks: String,
+    /// `skv` — the service version that minted it. Also the SAS's own `sv`:
+    /// signing under one version and declaring another is `AuthenticationFailed`.
+    skv: String,
+    /// `ske` as an instant, for [`needs_new_delegation_key`].
+    expiry: OffsetDateTime,
 }
 
 impl AzureStore {
@@ -233,6 +320,7 @@ impl AzureStore {
             endpoint,
             multipart_threshold: cfg.multipart_threshold.as_u64(),
             multipart_part_size: cfg.multipart_part_size.as_u64(),
+            delegation_key: Mutex::new(None),
         })
     }
 
@@ -403,6 +491,89 @@ impl AzureStore {
             *current = self.head(key).await.ok().flatten().map(|m| m.version);
         }
         err
+    }
+
+    /// A delegation key able to cover a URL signed at `now` for `ttl`: the
+    /// cached one when it still reaches far enough, a fresh one otherwise.
+    ///
+    /// `ctx` only ever names the blob being signed, for the error message.
+    async fn delegation_key(
+        &self,
+        ctx: &str,
+        now: OffsetDateTime,
+        ttl: Duration,
+    ) -> Result<Arc<CachedDelegationKey>> {
+        // The guard dies with the statement: the fetch below must not hold a
+        // sync lock across an await, and the `Arc` is what makes that cheap.
+        let cached = self.delegation_key.lock().clone();
+        if let Some(key) = cached
+            && !needs_new_delegation_key(now, ttl, Some(key.expiry))
+        {
+            return Ok(key);
+        }
+
+        // Two callers racing here both fetch. That is deliberate: the service
+        // is happy to mint a key twice, both are valid, and the last writer
+        // wins — whereas holding the lock across the round trip would put every
+        // signature in the process behind one request.
+        let fresh = Arc::new(self.fetch_delegation_key(ctx, now).await?);
+        *self.delegation_key.lock() = Some(Arc::clone(&fresh));
+        Ok(fresh)
+    }
+
+    /// One `Get User Delegation Key` round trip, validated into a
+    /// [`CachedDelegationKey`].
+    ///
+    /// The key is requested backdated by [`CLOCK_SKEW`] and valid for
+    /// [`KEY_LIFETIME`]; the SAS window it later signs is always a sub-range of
+    /// that, which [`needs_new_delegation_key`] is what enforces.
+    async fn fetch_delegation_key(
+        &self,
+        ctx: &str,
+        now: OffsetDateTime,
+    ) -> Result<CachedDelegationKey> {
+        let info = KeyInfo {
+            start: Some(now.saturating_sub(CLOCK_SKEW)),
+            expiry: Some(now.saturating_add(KEY_LIFETIME)),
+            ..Default::default()
+        };
+        let body = RequestContent::try_from(info).map_err(|e| classify(ctx, e))?;
+        let key = self
+            .service
+            .get_user_delegation_key(body, None)
+            .await
+            .map_err(|e| classify(ctx, e))?
+            .into_model()
+            .map_err(|e| classify(ctx, e))?;
+
+        let expiry = key
+            .signed_expiry
+            .ok_or_else(|| missing_key_field("SignedExpiry"))?;
+        Ok(CachedDelegationKey {
+            // The SDK deserializes `<Value>` *through* base64 into bytes;
+            // `hmac_sha256` wants the base64 back, and decodes it itself.
+            value: Secret::new(base64::encode(
+                key.value.ok_or_else(|| missing_key_field("Value"))?,
+            )),
+            skoid: key
+                .signed_oid
+                .ok_or_else(|| missing_key_field("SignedOid"))?,
+            sktid: key
+                .signed_tid
+                .ok_or_else(|| missing_key_field("SignedTid"))?,
+            skt: sas_time(
+                key.signed_start
+                    .ok_or_else(|| missing_key_field("SignedStart"))?,
+            ),
+            ske: sas_time(expiry),
+            sks: key
+                .signed_service
+                .ok_or_else(|| missing_key_field("SignedService"))?,
+            skv: key
+                .signed_version
+                .ok_or_else(|| missing_key_field("SignedVersion"))?,
+            expiry,
+        })
     }
 }
 
@@ -862,6 +1033,204 @@ struct PrefixName {
     content: Option<String>,
 }
 
+// ---- user-delegation SAS -----------------------------------------------
+
+/// The signed fields of one user-delegation SAS.
+///
+/// One value carries both halves of the token — what gets hashed
+/// ([`SasFields::string_to_sign`]) and what goes on the URL ([`signed_url`]) —
+/// so a parameter can never be signed but not sent, or sent but not signed.
+/// Either mistake is an opaque `AuthenticationFailed` from the service.
+struct SasFields<'a> {
+    /// `sp` — the permissions granted.
+    permissions: &'a str,
+    /// `st` / `se` — the URL's own window, already in SAS wire form.
+    start: String,
+    expiry: String,
+    /// The canonicalized resource: `/blob/{account}/{container}/{key}`, the key
+    /// *undecoded*. See [`canonical_resource`].
+    resource: String,
+    /// The delegation key: `skoid`/`sktid`/`skt`/`ske`/`sks`/`skv` travel from
+    /// here verbatim, and `sv` is its `skv`.
+    key: &'a CachedDelegationKey,
+    /// `sr` — the kind of resource the signature covers.
+    signed_resource: &'a str,
+    /// `spr` — the protocols the SAS may be used over.
+    protocol: &'a str,
+}
+
+impl SasFields<'_> {
+    /// The 24 newline-separated fields Azure hashes for a user delegation SAS
+    /// at `sv >= 2020-12-06`, in the order the "Create a user delegation SAS"
+    /// REST reference prescribes.
+    ///
+    /// The 23-field layout that predates `signedEncryptionScope` belongs to
+    /// `sv` 2020-02-10 and earlier; `sv` here is the key's own `skv`, which the
+    /// live service always sets far past that.
+    ///
+    /// Every field walgit does not use is present and **empty**. The separators
+    /// are positional: dropping an unused field shifts every field after it and
+    /// the service computes a different hash. The empty ones, in order:
+    /// `saoid`, `suoid`, `scid`, `sip`, the snapshot time, `ses`, then the five
+    /// response-header overrides `rscc`/`rscd`/`rsce`/`rscl`/`rsct`.
+    fn string_to_sign(&self) -> String {
+        let fields: [&str; 24] = [
+            self.permissions,     // sp
+            &self.start,          // st
+            &self.expiry,         // se
+            &self.resource,       // canonicalizedResource
+            &self.key.skoid,      // skoid
+            &self.key.sktid,      // sktid
+            &self.key.skt,        // skt
+            &self.key.ske,        // ske
+            &self.key.sks,        // sks
+            &self.key.skv,        // skv
+            "",                   // saoid  — signedAuthorizedUserObjectId
+            "",                   // suoid  — signedUnauthorizedUserObjectId
+            "",                   // scid   — signedCorrelationId
+            "",                   // sip    — signedIP
+            self.protocol,        // spr
+            &self.key.skv,        // sv     — the key's own service version
+            self.signed_resource, // sr
+            "",                   // signedSnapshotTime
+            "",                   // ses    — signedEncryptionScope
+            "",                   // rscc   — Cache-Control override
+            "",                   // rscd   — Content-Disposition override
+            "",                   // rsce   — Content-Encoding override
+            "",                   // rscl   — Content-Language override
+            "",                   // rsct   — Content-Type override
+        ];
+        fields.join("\n")
+    }
+}
+
+/// HMAC-SHA256 of the string-to-sign under the delegation key, base64.
+///
+/// The key stays inside `Secret` up to this call. `hmac_sha256`'s own errors
+/// describe the *shape* of the failure ("failed to create hmac from key"), never
+/// its material, so the error is safe to surface.
+fn sign(fields: &SasFields<'_>) -> Result<String> {
+    hmac_sha256(&fields.string_to_sign(), &fields.key.value)
+        .map_err(|e| StoreError::other(anyhow::Error::new(e).context("azure: SAS signing")))
+}
+
+/// `url` plus every parameter the signature covers, and the signature.
+///
+/// **The result is a credential.** It ends in `sig=…`; anyone holding it can
+/// read that blob until `se`. It must never be logged, traced, or interpolated
+/// into an error — and nothing here does: the only failure path is [`sign`],
+/// which never sees the URL.
+///
+/// Values go through the SDK's own query builder, so `:` in a timestamp and the
+/// `+`, `/` and `=` a base64 signature can contain all travel percent-encoded
+/// and none of them can read as a separator.
+fn signed_url(fields: &SasFields<'_>, mut url: Url) -> Result<Url> {
+    let sig = sign(fields)?;
+    {
+        let mut query = url.query_builder();
+        query
+            .set_pair("sv", fields.key.skv.as_str())
+            .set_pair("sr", fields.signed_resource)
+            .set_pair("st", fields.start.as_str())
+            .set_pair("se", fields.expiry.as_str())
+            .set_pair("sp", fields.permissions)
+            .set_pair("spr", fields.protocol)
+            .set_pair("skoid", fields.key.skoid.as_str())
+            .set_pair("sktid", fields.key.sktid.as_str())
+            .set_pair("skt", fields.key.skt.as_str())
+            .set_pair("ske", fields.key.ske.as_str())
+            .set_pair("sks", fields.key.sks.as_str())
+            .set_pair("skv", fields.key.skv.as_str())
+            .set_pair("sig", sig);
+        query.build();
+    }
+    Ok(url)
+}
+
+/// The blob's own URL, with `key` spliced in as a **path**.
+///
+/// `UrlExt::append_path` goes through `Url::set_path`, which keeps `/` as a
+/// separator and percent-encodes everything else that is not path-safe — `?`
+/// and `#` included. That matters beyond tidiness: repository and object names
+/// reach this from the wire, and a key able to open a query string could
+/// otherwise smuggle an unsigned parameter onto a signed URL.
+fn blob_url(endpoint: &str, container: &str, key: &str) -> Result<Url> {
+    let mut url = parse_url(&format!("{endpoint}/{container}"))
+        .map_err(|e| StoreError::InvalidArgument(e.to_string()))?;
+    url.append_path(key);
+    Ok(url)
+}
+
+/// The canonicalized resource Azure signs: `/blob/{account}/{container}/{key}`.
+///
+/// The key appears **raw**. The service rebuilds this string from the request
+/// it received, after decoding the path, so signing the percent-encoded form
+/// would never match.
+fn canonical_resource(account: &str, container: &str, key: &str) -> String {
+    format!("/blob/{account}/{container}/{key}")
+}
+
+/// A SAS timestamp: RFC 3339 UTC at whole-second precision, `2026-08-31T13:00:00Z`.
+///
+/// `from_unix_timestamp` re-anchors at UTC *and* drops sub-second precision in
+/// one step — the service rejects fractional seconds, and an instant carrying
+/// an offset (RFC 3339 permits one, and the key's own timestamps are parsed as
+/// RFC 3339) would otherwise print a window shifted by that offset. It can only
+/// fail outside the representable range, which no value that was already an
+/// `OffsetDateTime` can reach.
+fn sas_time(t: OffsetDateTime) -> String {
+    let utc = OffsetDateTime::from_unix_timestamp(t.unix_timestamp()).unwrap_or(t);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        utc.year(),
+        u8::from(utc.month()),
+        utc.day(),
+        utc.hour(),
+        utc.minute(),
+        utc.second()
+    )
+}
+
+/// Whether a URL signed at `now` for `ttl` needs a delegation key the cache
+/// does not hold.
+///
+/// Pure, so the policy is testable without a service: refresh when nothing is
+/// cached, or when the cached key's `ske` does not clear the URL's own expiry
+/// by [`CLOCK_SKEW`]. A URL outliving its key is simply rejected, for its whole
+/// life, by a service whose clock is not ours.
+fn needs_new_delegation_key(
+    now: OffsetDateTime,
+    ttl: Duration,
+    cached_ske: Option<OffsetDateTime>,
+) -> bool {
+    let needed_until = now.saturating_add(ttl).saturating_add(CLOCK_SKEW);
+    cached_ske.is_none_or(|ske| needed_until > ske)
+}
+
+/// The signing window for a caller's `ttl`, or why it cannot be signed.
+///
+/// See [`MAX_SIGNED_TTL`] for why an over-long one is refused instead of
+/// clamped. A zero window is refused too: it is not a URL, it is a 403.
+fn signing_ttl(key: &str, ttl: std::time::Duration) -> Result<Duration> {
+    Duration::try_from(ttl)
+        .ok()
+        .filter(|t| *t > Duration::ZERO && *t <= MAX_SIGNED_TTL)
+        .ok_or_else(|| {
+            StoreError::InvalidArgument(format!(
+                "azure signed_get_url {key}: ttl must be above zero and at most {} hours",
+                MAX_SIGNED_TTL.whole_hours()
+            ))
+        })
+}
+
+/// A delegation key the service returned without a field the signature needs.
+/// Names the field, never the key material.
+fn missing_key_field(field: &str) -> StoreError {
+    StoreError::other(anyhow::anyhow!(
+        "azure: the user delegation key response carries no {field}"
+    ))
+}
+
 #[async_trait::async_trait]
 impl ObjectStore for AzureStore {
     fn backend(&self) -> &'static str {
@@ -1087,6 +1456,32 @@ impl ObjectStore for AzureStore {
         out.sort();
         out.dedup();
         Ok(out)
+    }
+
+    /// A user-delegation SAS URL for `key`: readable for `ttl` by anyone, with
+    /// no `Authorization` header.
+    ///
+    /// **The returned string is a credential.** It ends in `sig=…` and grants
+    /// read access to that one blob until it expires, so it must never be
+    /// logged, traced, or put into an error message. Hand it to the caller and
+    /// nowhere else.
+    async fn signed_get_url(&self, key: &str, ttl: std::time::Duration) -> Result<Option<String>> {
+        let ttl = signing_ttl(key, ttl)?;
+        // One `now` for the window, the cache decision and the key request, so
+        // the three cannot disagree about which instant this is.
+        let now = OffsetDateTime::now_utc();
+        let delegation = self.delegation_key(key, now, ttl).await?;
+        let fields = SasFields {
+            permissions: SAS_PERMISSIONS,
+            start: sas_time(now.saturating_sub(CLOCK_SKEW)),
+            expiry: sas_time(now.saturating_add(ttl)),
+            resource: canonical_resource(&self.account, &self.bucket, key),
+            key: &delegation,
+            signed_resource: SAS_RESOURCE,
+            protocol: SAS_PROTOCOL,
+        };
+        let url = signed_url(&fields, blob_url(&self.endpoint, &self.bucket, key)?)?;
+        Ok(Some(String::from(url)))
     }
 }
 
@@ -1704,5 +2099,321 @@ mod tests {
             );
         }
         assert_eq!(out, [&b"abcd"[..], &b"efgh"[..], &b"i"[..]]);
+    }
+
+    // ---- user-delegation SAS -------------------------------------------
+
+    /// A delegation key with recognisable, fixed field values. `value` is the
+    /// base64 of `0123456789abcdef` — real key material never appears in a
+    /// test, and this one is not a credential for anything.
+    fn test_key() -> CachedDelegationKey {
+        CachedDelegationKey {
+            value: Secret::new("MDEyMzQ1Njc4OWFiY2RlZg=="),
+            skoid: "oid-123".into(),
+            sktid: "tid-456".into(),
+            skt: "2026-08-31T12:00:00Z".into(),
+            ske: "2026-09-01T12:00:00Z".into(),
+            sks: "b".into(),
+            skv: "2025-07-05".into(),
+            expiry: at("2026-09-01T12:00:00Z"),
+        }
+    }
+
+    /// The fixture the layout and signature tests both sign.
+    fn test_fields(key: &CachedDelegationKey) -> SasFields<'_> {
+        SasFields {
+            permissions: SAS_PERMISSIONS,
+            start: "2026-08-31T13:00:00Z".into(),
+            expiry: "2026-08-31T14:00:00Z".into(),
+            resource: "/blob/myacct/walgit/repos/o/r/manifest.pb".into(),
+            key,
+            signed_resource: SAS_RESOURCE,
+            protocol: SAS_PROTOCOL,
+        }
+    }
+
+    fn at(s: &str) -> OffsetDateTime {
+        azure_core::time::parse_rfc3339(s).expect("timestamp")
+    }
+
+    /// The executable record of the string-to-sign layout.
+    ///
+    /// 24 fields for `sv >= 2020-12-06` (the 23-field layout is `sv` 2020-02-10
+    /// and earlier, which predates `signedEncryptionScope`). The separators are
+    /// positional: a dropped empty field shifts every field after it and the
+    /// service computes a different hash, so the count is asserted first.
+    #[test]
+    fn sas_string_to_sign_layout() {
+        let key = test_key();
+        let s = test_fields(&key).string_to_sign();
+        let lines: Vec<&str> = s.split('\n').collect();
+
+        assert_eq!(lines.len(), 24, "user delegation SAS signs 24 fields");
+        assert_eq!(lines[0], "r"); // sp
+        assert_eq!(lines[1], "2026-08-31T13:00:00Z"); // st
+        assert_eq!(lines[2], "2026-08-31T14:00:00Z"); // se
+        assert_eq!(lines[3], "/blob/myacct/walgit/repos/o/r/manifest.pb");
+        assert_eq!(lines[4], "oid-123"); // skoid
+        assert_eq!(lines[5], "tid-456"); // sktid
+        assert_eq!(lines[6], "2026-08-31T12:00:00Z"); // skt
+        assert_eq!(lines[7], "2026-09-01T12:00:00Z"); // ske
+        assert_eq!(lines[8], "b"); // sks
+        assert_eq!(lines[9], "2025-07-05"); // skv
+        assert!(lines[10].is_empty(), "saoid"); // signedAuthorizedUserObjectId
+        assert!(lines[11].is_empty(), "suoid"); // signedUnauthorizedUserObjectId
+        assert!(lines[12].is_empty(), "scid"); // signedCorrelationId
+        assert!(lines[13].is_empty(), "sip"); // signedIP
+        assert_eq!(lines[14], "https"); // spr
+        assert_eq!(lines[15], "2025-07-05"); // sv — the key's own skv
+        assert_eq!(lines[16], "b"); // sr
+        assert!(lines[17].is_empty(), "snapshot time");
+        assert!(lines[18].is_empty(), "ses"); // signedEncryptionScope
+        assert!(lines[19].is_empty(), "rscc");
+        assert!(lines[20].is_empty(), "rscd");
+        assert!(lines[21].is_empty(), "rsce");
+        assert!(lines[22].is_empty(), "rscl");
+        assert!(lines[23].is_empty(), "rsct");
+    }
+
+    /// `sv` is the delegation key's own `skv`: signing with one service version
+    /// and declaring another is the classic way to get `AuthenticationFailed`.
+    #[test]
+    fn sas_signs_with_the_keys_own_service_version() {
+        let key = test_key();
+        let fields = test_fields(&key);
+        let s = fields.string_to_sign();
+        let lines: Vec<&str> = s.split('\n').collect();
+        assert_eq!(lines[15], lines[9], "sv must equal skv");
+    }
+
+    /// A fixed vector. The expectation was computed independently of this code
+    /// — HMAC-SHA256 of the 24-field string above, keyed with the *decoded*
+    /// `MDEyMzQ1Njc4OWFiY2RlZg==` (`0123456789abcdef`) — so it pins the whole
+    /// chain: the layout, the base64 round trip the SDK's decoded `Value`
+    /// forces, and the signature encoding. The live check is the contract test
+    /// against Azure; this is the tripwire that catches a silent change first.
+    #[test]
+    fn sas_signature_is_deterministic() {
+        let key = test_key();
+        let sig = sign(&test_fields(&key)).expect("sign");
+        assert_eq!(sig, "burryZaKvxR9OOUIPHL0z2NWs5hrxtKBQ8y/gwxZovg=");
+    }
+
+    /// A signature is HMAC-SHA256: 32 bytes, base64.
+    #[test]
+    fn sas_signature_is_32_bytes_of_base64() {
+        let key = test_key();
+        let sig = sign(&test_fields(&key)).expect("sign");
+        let raw = azure_core::base64::decode(&sig).expect("base64");
+        assert_eq!(raw.len(), 32);
+    }
+
+    /// Every parameter the signature covers must reach the URL, and the URL
+    /// must carry nothing else: an unsigned extra would be ignored, a missing
+    /// one is `AuthenticationFailed`. Asserted on the parsed pairs — the signed
+    /// URL itself is a credential and is never written into a test file.
+    #[test]
+    fn sas_url_carries_exactly_the_signed_parameters() {
+        let key = test_key();
+        let url = signed_url(
+            &test_fields(&key),
+            blob_url(
+                "https://myacct.blob.core.windows.net",
+                "walgit",
+                "repos/o/r/manifest.pb",
+            )
+            .expect("url"),
+        )
+        .expect("sign");
+
+        let pairs: std::collections::BTreeMap<String, String> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        let mut names: Vec<&str> = pairs.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "se", "sig", "ske", "skoid", "sks", "skt", "sktid", "skv", "sp", "spr", "sr", "st",
+                "sv",
+            ]
+        );
+
+        assert_eq!(pairs["sp"], "r");
+        assert_eq!(pairs["sr"], "b");
+        assert_eq!(pairs["spr"], "https");
+        assert_eq!(pairs["sv"], "2025-07-05");
+        assert_eq!(pairs["skv"], "2025-07-05");
+        assert_eq!(pairs["skoid"], "oid-123");
+        assert_eq!(pairs["sktid"], "tid-456");
+        assert_eq!(pairs["sks"], "b");
+        assert_eq!(pairs["skt"], "2026-08-31T12:00:00Z");
+        assert_eq!(pairs["ske"], "2026-09-01T12:00:00Z");
+        assert_eq!(pairs["st"], "2026-08-31T13:00:00Z");
+        assert_eq!(pairs["se"], "2026-08-31T14:00:00Z");
+        // The signature itself: shape only, never its value.
+        assert_eq!(
+            azure_core::base64::decode(&pairs["sig"])
+                .expect("base64")
+                .len(),
+            32
+        );
+
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.path(), "/walgit/repos/o/r/manifest.pb");
+    }
+
+    /// The URL's query is percent-encoded, so the `+`, `/` and `=` a base64
+    /// signature can contain never read as separators or as another parameter.
+    #[test]
+    fn sas_url_percent_encodes_its_values() {
+        let key = test_key();
+        let url = signed_url(
+            &test_fields(&key),
+            blob_url("https://myacct.blob.core.windows.net", "walgit", "o/r").expect("url"),
+        )
+        .expect("sign");
+        let query = url.query().expect("query");
+        assert!(query.contains("st=2026-08-31T13%3A00%3A00Z"), "timestamps");
+        // Whatever this signature's bytes happen to be, none of base64's three
+        // non-alphanumeric characters may travel raw: `&`-splitting the query
+        // finds the parameter, so a raw `=` or `&` would have split it wrong.
+        let sig = query
+            .split('&')
+            .find_map(|p| p.strip_prefix("sig="))
+            .expect("sig");
+        assert!(!sig.contains('+') && !sig.contains('/') && !sig.contains('='));
+    }
+
+    /// A key is attacker-influenced (repository and object names travel in it).
+    /// It is spliced in as a *path*, so a `?` or `#` inside one can never open
+    /// a query string or a fragment and smuggle an unsigned parameter onto a
+    /// signed URL.
+    #[test]
+    fn blob_url_encodes_a_key_that_looks_like_a_query() {
+        let url = blob_url(
+            "https://myacct.blob.core.windows.net",
+            "walgit",
+            "repos/o/r?sp=racwd#x y",
+        )
+        .expect("url");
+        assert_eq!(url.query(), None);
+        assert_eq!(url.fragment(), None);
+        assert_eq!(url.path(), "/walgit/repos/o/r%3Fsp=racwd%23x%20y");
+    }
+
+    /// The canonicalized resource is the *decoded* path: the service rebuilds
+    /// it from the request it received, so signing the encoded form would never
+    /// match.
+    #[test]
+    fn canonical_resource_keeps_the_key_raw() {
+        assert_eq!(
+            canonical_resource("myacct", "walgit", "repos/o/r/manifest.pb"),
+            "/blob/myacct/walgit/repos/o/r/manifest.pb"
+        );
+    }
+
+    /// SAS timestamps are RFC 3339 UTC at whole-second precision — the service
+    /// rejects fractional seconds, and an offset other than `Z` would shift the
+    /// window.
+    #[test]
+    fn sas_time_is_utc_seconds() {
+        assert_eq!(sas_time(at("2026-08-31T13:00:00Z")), "2026-08-31T13:00:00Z");
+        // Sub-second precision is dropped, not rounded up.
+        assert_eq!(
+            sas_time(at("2026-08-31T13:00:00.987654321Z")),
+            "2026-08-31T13:00:00Z"
+        );
+        // An instant carrying an offset is re-anchored at UTC, not reprinted.
+        assert_eq!(
+            sas_time(at("2026-08-31T15:30:00+02:30")),
+            "2026-08-31T13:00:00Z"
+        );
+    }
+
+    // ---- delegation key cache ------------------------------------------
+
+    /// No key at all: fetch.
+    #[test]
+    fn refresh_when_no_key_is_cached() {
+        assert!(needs_new_delegation_key(
+            at("2026-08-31T13:00:00Z"),
+            Duration::hours(1),
+            None
+        ));
+    }
+
+    /// A key that outlives the URL by more than the skew margin is reused —
+    /// the whole point of the cache is that most calls make no round trip.
+    #[test]
+    fn reuse_a_key_that_covers_the_url() {
+        assert!(!needs_new_delegation_key(
+            at("2026-08-31T13:00:00Z"),
+            Duration::hours(1),
+            Some(at("2026-09-01T12:00:00Z"))
+        ));
+    }
+
+    /// A key that expires before the URL does would mint a URL the service
+    /// rejects for its whole life.
+    #[test]
+    fn refresh_when_the_key_expires_before_the_url() {
+        assert!(needs_new_delegation_key(
+            at("2026-08-31T13:00:00Z"),
+            Duration::hours(4),
+            Some(at("2026-08-31T15:00:00Z"))
+        ));
+    }
+
+    /// The margin: a key expiring exactly at the URL's expiry is refused —
+    /// the two clocks are not the same clock.
+    #[test]
+    fn refresh_inside_the_skew_margin() {
+        let now = at("2026-08-31T13:00:00Z");
+        let ttl = Duration::hours(1);
+        // Expiry exactly at the URL's own — inside the margin.
+        assert!(needs_new_delegation_key(
+            now,
+            ttl,
+            Some(at("2026-08-31T14:00:00Z"))
+        ));
+        // One second short of the full margin — still inside it.
+        assert!(needs_new_delegation_key(
+            now,
+            ttl,
+            Some(at("2026-08-31T14:04:59Z"))
+        ));
+        // Exactly the margin — the first instant that is good enough.
+        assert!(!needs_new_delegation_key(
+            now,
+            ttl,
+            Some(at("2026-08-31T14:05:00Z"))
+        ));
+    }
+
+    // ---- ttl bounds ------------------------------------------------------
+
+    /// A URL cannot outlive the key that signs it, and the key is asked for 24
+    /// hours. An over-long ttl is refused, not quietly shortened: shortening
+    /// would hand back a URL that dies before the caller expects it to, and
+    /// accepting it would re-fetch a key on every call and still sign a URL the
+    /// service rejects.
+    #[test]
+    fn signing_ttl_rejects_what_no_key_can_cover() {
+        assert!(signing_ttl("k", std::time::Duration::from_hours(1)).is_ok());
+        assert!(matches!(
+            signing_ttl("k", std::time::Duration::from_hours(24)),
+            Err(StoreError::InvalidArgument(_))
+        ));
+    }
+
+    /// A zero (or negative-after-skew) window is not a URL, it is a 403.
+    #[test]
+    fn signing_ttl_rejects_a_zero_window() {
+        assert!(matches!(
+            signing_ttl("k", std::time::Duration::ZERO),
+            Err(StoreError::InvalidArgument(_))
+        ));
     }
 }
