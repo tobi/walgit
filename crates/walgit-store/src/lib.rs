@@ -658,6 +658,11 @@ pub async fn open_store(cfg: &walgit_config::Config) -> anyhow::Result<DynStore>
                 anyhow::bail!("gcs backend requires the `gcs` feature")
             }
         }
+        // The config surface (`[store.azure]`) lands before the store: a deployment can be
+        // written against it, but opening one still fails until the backend exists.
+        walgit_config::StoreBackend::Azure => {
+            anyhow::bail!("azure backend is not implemented yet")
+        }
     };
     if prefix.is_empty() {
         Ok(inner)

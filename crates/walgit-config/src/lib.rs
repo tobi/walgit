@@ -228,6 +228,7 @@ pub struct StoreConfig {
     pub prefix: String,
     pub gcs: GcsConfig,
     pub s3: S3Config,
+    pub azure: AzureConfig,
     pub max_retries: u32,
     /// Objects larger than this use resumable/multipart upload.
     pub multipart_threshold: ByteSize,
@@ -240,6 +241,7 @@ pub enum StoreBackend {
     #[default]
     Gcs,
     S3,
+    Azure,
     /// Tests only.
     Memory,
 }
@@ -278,6 +280,28 @@ pub struct S3Config {
     pub access_key_env: String,
     pub secret_key_env: String,
     pub force_path_style: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AzureCredentialKind {
+    /// az CLI / azd login (dev machines).
+    #[default]
+    DeveloperTools,
+    /// `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` env vars.
+    ClientSecret,
+    ManagedIdentity,
+    WorkloadIdentity,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AzureConfig {
+    /// Storage account name (required; `bucket` is the container).
+    pub account: String,
+    /// "" = `https://<account>.blob.core.windows.net`; override for Azurite/sovereign clouds.
+    pub endpoint: String,
+    pub credential: AzureCredentialKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1078,6 +1102,7 @@ impl Default for StoreConfig {
             prefix: String::new(),
             gcs: GcsConfig::default(),
             s3: S3Config::default(),
+            azure: AzureConfig::default(),
             max_retries: 8,
             multipart_threshold: ByteSize::mib(64),
             multipart_part_size: ByteSize::mib(32),
@@ -1728,6 +1753,33 @@ mod tests {
         assert_eq!(c.store.s3.endpoint, "http://rustfs:9000");
         assert_eq!(c.wal.max_batch, 7);
         assert_eq!(c.server.listen.port(), 9090);
+    }
+
+    #[test]
+    fn azure_store_config_parses() {
+        let toml = r#"
+[store]
+backend = "azure"
+bucket = "walgit"
+[store.azure]
+account = "myacct"
+credential = "client_secret"
+"#;
+        let c: Config = toml::from_str(toml).expect("parse");
+        assert_eq!(c.store.backend, StoreBackend::Azure);
+        assert_eq!(c.store.azure.account, "myacct");
+        assert_eq!(c.store.azure.endpoint, "");
+        assert_eq!(c.store.azure.credential, AzureCredentialKind::ClientSecret);
+    }
+
+    #[test]
+    fn azure_config_defaults() {
+        let c = Config::default();
+        assert_eq!(c.store.azure.account, "");
+        assert_eq!(
+            c.store.azure.credential,
+            AzureCredentialKind::DeveloperTools
+        );
     }
 
     #[test]
