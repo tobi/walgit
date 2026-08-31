@@ -342,18 +342,7 @@ impl AzureStore {
             )));
         }
 
-        // One stream for every body shape. `file_stream` already cuts a file at
-        // the part size and a `Bytes` body arrives whole, so both take
-        // `next_chunk`'s slicing path; only a caller's stream is regrouped.
-        let mut stream = match body {
-            PutBody::Bytes(b) => util::once(b),
-            PutBody::Stream { stream, .. } => stream,
-            // Saturating only bites on a 32-bit target, where a part that large
-            // could not be buffered anyway.
-            PutBody::File(path) => {
-                util::file_stream(path, None, usize::try_from(part).unwrap_or(usize::MAX))
-            }
-        };
+        let mut stream = body_stream(body, len, part);
         let mut carry = Bytes::new();
 
         let client = self.container.blob_client(key).block_blob_client();
@@ -616,6 +605,32 @@ fn put_conditions(mode: &PutMode) -> (Option<Etag>, Option<Etag>) {
 /// double-encode.
 fn block_id(i: u64) -> Vec<u8> {
     format!("{i:016}").into_bytes()
+}
+
+/// The chunk stream for one body, cut at the part size the split expects.
+///
+/// `file_stream` already cuts a file at the size asked for and a `Bytes` body
+/// arrives whole, so both take [`next_chunk`]'s slicing path; only a caller's
+/// stream is regrouped.
+///
+/// The file reader is cut at [`effective_part`], never at the raw configured
+/// size: `file_stream` reads `min(chunk, remaining)` bytes per item, so a chunk
+/// of zero would end the stream at once while [`chunk_sizes`] still expected
+/// one whole-body chunk — and the mismatch would surface as a spurious
+/// [`short_body`]. The block-count guard, the split and the reader all
+/// normalize through the same function so they cannot disagree.
+fn body_stream(body: PutBody, len: u64, part_size: u64) -> ByteStream {
+    match body {
+        PutBody::Bytes(b) => util::once(b),
+        PutBody::Stream { stream, .. } => stream,
+        // Saturating only bites on a 32-bit target, where a part that large
+        // could not be buffered anyway.
+        PutBody::File(path) => util::file_stream(
+            path,
+            None,
+            usize::try_from(effective_part(len, part_size)).unwrap_or(usize::MAX),
+        ),
+    }
 }
 
 /// The part size actually used for a `len`-byte body.
@@ -1569,6 +1584,97 @@ mod tests {
                 // SAFETY-free pointer arithmetic: comparing addresses only.
                 base.wrapping_add(i * 4),
                 "chunk {i} was copied out of the original allocation"
+            );
+        }
+    }
+
+    /// Drives a body through exactly what `chunked_put` drives it through —
+    /// the block-count guard, `body_stream`, `chunk_sizes` and `next_chunk` —
+    /// and asserts the four agree: every requested chunk is delivered in full
+    /// and the pieces reassemble the original bytes.
+    ///
+    /// Returns the chunk sizes so a caller can pin the split as well.
+    async fn drive_chunking(body: PutBody, len: u64, part: u64, expect: &[u8]) -> Vec<usize> {
+        // The same normalization `chunked_put` applies before staging.
+        let blocks = len.div_ceil(effective_part(len, part));
+        assert!(blocks <= MAX_BLOCKS, "guard would reject {len}/{part}");
+
+        let mut stream = body_stream(body, len, part);
+        let mut carry = Bytes::new();
+        let mut sizes = Vec::new();
+        let mut seen = BytesMut::new();
+        for want in chunk_sizes(len, part) {
+            let want = usize::try_from(want).expect("fits");
+            let chunk = next_chunk("k", &mut stream, &mut carry, want)
+                .await
+                .unwrap_or_else(|e| panic!("chunk of {want} at part {part}: {e}"));
+            assert_eq!(chunk.len(), want, "short chunk at part {part}");
+            seen.extend_from_slice(&chunk);
+            sizes.push(want);
+        }
+        assert_eq!(&seen[..], expect, "body did not reassemble at part {part}");
+        assert_eq!(
+            sizes.len() as u64,
+            blocks,
+            "the guard counted {blocks} blocks, the split produced {}",
+            sizes.len()
+        );
+        sizes
+    }
+
+    /// A `File` body must reach the staging loop through the *same* part-size
+    /// normalization as the guard and the split. It did not: the file reader was
+    /// cut at the raw configured size, so `multipart_part_size == 0` — which
+    /// nothing validates — ended the stream immediately and failed a put the
+    /// design says should succeed as a single block.
+    #[tokio::test]
+    async fn file_bodies_chunk_consistently_at_every_part_size() {
+        let data: Vec<u8> = (0..250u32).map(|i| (i % 251) as u8).collect();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("body.bin");
+        std::fs::write(&path, &data).expect("write");
+        let len = data.len() as u64;
+
+        // The regression: a zero part size is one whole-body block, not a
+        // spurious short-body error.
+        assert_eq!(
+            drive_chunking(PutBody::File(path.clone()), len, 0, &data).await,
+            [250]
+        );
+
+        // And the ordinary sizes still split where the arithmetic says.
+        assert_eq!(
+            drive_chunking(PutBody::File(path.clone()), len, 100, &data).await,
+            [100, 100, 50]
+        );
+        assert_eq!(
+            drive_chunking(PutBody::File(path.clone()), len, 250, &data).await,
+            [250]
+        );
+        assert_eq!(
+            drive_chunking(PutBody::File(path), len, 4096, &data).await,
+            [250]
+        );
+    }
+
+    /// The other two body shapes go through the same seam, so they are held to
+    /// the same agreement — including at the part size that broke `File`.
+    #[tokio::test]
+    async fn bytes_and_stream_bodies_chunk_consistently_too() {
+        let data: Vec<u8> = (0..250u32).map(|i| (i % 251) as u8).collect();
+        let bytes = Bytes::from(data.clone());
+        let len = data.len() as u64;
+
+        for part in [0u64, 100, 250, 4096] {
+            let sizes = drive_chunking(PutBody::Bytes(bytes.clone()), len, part, &data).await;
+            let stream = PutBody::Stream {
+                len,
+                stream: util::once(bytes.clone()),
+            };
+            assert_eq!(
+                drive_chunking(stream, len, part, &data).await,
+                sizes,
+                "Bytes and Stream disagree at part {part}"
             );
         }
     }
