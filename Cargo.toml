@@ -122,6 +122,13 @@ google-cloud-auth = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
 aws-smithy-types = "1"
+# Azure Blob. `azure_storage_blob` is pinned exactly: it is a beta whose client and
+# option types still move between patch releases. `azure_core` is pulled in directly
+# so the transport is rustls (never openssl) and so `hmac_rust` is available for
+# user-delegation SAS signing; `xml` is what the blob list/commit payloads need.
+azure_storage_blob = { version = "=1.1.0-beta.2", default-features = false, features = ["tokio"] }
+azure_identity = "1.0.0"
+azure_core = { version = "1", default-features = false, features = ["reqwest_rustls", "hmac_rust", "xml"] }
 clap = { version = "4", features = ["derive", "env"] }
 rand = "0.9"
 sha1 = "0.10"
