@@ -30,6 +30,22 @@
 //! `If-Match` with **412 `ConditionNotMet`**; both are [`StoreError::PreconditionFailed`],
 //! whose `current` we fill with a follow-up HEAD, exactly as `s3.rs` does.
 //!
+//! Both the single-shot `Put Blob` and the `Put Block List` that ends a chunked
+//! upload take the mapping from [`put_conditions`], so every `PutMode` behaves
+//! the same at either size. `s3.rs` cannot do that — S3's
+//! `CreateMultipartUpload` carries no conditional header, so multipart there is
+//! `Overwrite`-only — but on Azure staging publishes nothing and the condition
+//! is evaluated atomically at the commit.
+//!
+//! ## Chunked PUT
+//!
+//! Bodies at or above `multipart_threshold` are staged as `multipart_part_size`
+//! blocks and committed in one call. Block ids are zero-padded decimal so they
+//! are all the same length (an Azure requirement) and sort in staging order;
+//! the SDK base64-encodes them on the wire, so they are passed as raw ASCII.
+//! Blocks staged for a commit that never happened belong to no blob and Azure
+//! collects them after seven days, so a failed upload needs no abort call.
+//!
 //! ## Conditional DELETE
 //!
 //! Unlike S3, Azure has a **native** conditional delete: `Delete Blob` takes
@@ -56,9 +72,8 @@
 //!
 //! ## Status
 //!
-//! Everything except chunked put is implemented. Bodies at or above
-//! `multipart_threshold` route to `chunked_put`, which lands in the task that
-//! follows — as do the SAS/accel paths the currently-unread fields below are for.
+//! The whole `ObjectStore` data plane is implemented. The SAS/accel paths the
+//! currently-unread fields below are for land in a later task.
 
 use std::num::NonZero;
 use std::ops::Range;
@@ -67,24 +82,26 @@ use std::sync::Arc;
 use azure_core::credentials::TokenCredential;
 use azure_core::error::ErrorKind;
 use azure_core::http::headers::{ETAG, HeaderName, Headers};
-use azure_core::http::{Etag, Url, UrlExt};
+use azure_core::http::{Etag, RequestContent, Url, UrlExt};
 use azure_identity::{
     ClientSecretCredential, DeveloperToolsCredential, ManagedIdentityCredential,
     WorkloadIdentityCredential,
 };
 use azure_storage_blob::models::{
     BlobClientDeleteOptions, BlobClientDownloadOptions, BlobClientGetPropertiesResultHeaders,
-    BlobContainerClientListBlobsOptions, BlobItem, BlockBlobClientUploadOptions, HttpRange,
+    BlobContainerClientListBlobsOptions, BlobItem, BlockBlobClientCommitBlockListOptions,
+    BlockBlobClientCommitBlockListResultHeaders, BlockBlobClientUploadOptions, BlockLookupList,
+    HttpRange,
 };
 use azure_storage_blob::{BlobContainerClient, BlobServiceClient};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use serde::Deserialize;
 use walgit_config::AzureCredentialKind;
 
 use crate::{
-    BoxStream, GetOptions, GetResult, ObjectMeta, ObjectStore, PutBody, PutMode, PutOptions,
-    Result, StoreError, Version, util,
+    BoxStream, ByteStream, GetOptions, GetResult, ObjectMeta, ObjectStore, PutBody, PutMode,
+    PutOptions, Result, StoreError, Version, util,
 };
 
 /// `Cache-Control` written for objects the caller marked immutable (`wal/`).
@@ -100,6 +117,13 @@ const SEQUENTIAL: NonZero<usize> = NonZero::<usize>::MIN;
 /// Items per listing page, matching `s3.rs`'s `max_keys(1000)`. Azure's own
 /// default is 5000; a smaller page bounds the memory one `Pager` step holds.
 const LIST_PAGE_SIZE: i32 = 1000;
+
+/// Blocks one `Put Block List` may name — a hard service limit.
+///
+/// Checked before staging so an oversized body fails naming its own numbers
+/// rather than as a 400 after everything has been uploaded. At the default
+/// 32 MiB part size this caps a chunked put at 1.5 TiB.
+const MAX_BLOCKS: u64 = 50_000;
 
 /// `x-ms-version` for the one call walgit makes without the SDK.
 ///
@@ -119,8 +143,8 @@ const MS_ERROR_CODE: &str = "x-ms-error-code";
 
 /// Azure Blob Storage object store.
 ///
-/// The `allow` covers `service`, `account` and `multipart_part_size`: populated
-/// here, first read by the tasks that follow (SAS signing, chunked put).
+/// The `allow` covers `service` and `account`: populated here, first read by
+/// the SAS-signing task that follows.
 #[allow(dead_code)]
 pub struct AzureStore {
     /// Client scoped to the container named by `store.bucket`.
@@ -291,20 +315,105 @@ impl AzureStore {
 
     /// Staged-block upload for bodies at or above `multipart_threshold`.
     ///
-    /// Stub until the chunked-put task lands; `put` routes to it by length so
-    /// the size decision already lives in one place.
-    // Nothing awaits yet — the signature is the one the chunked implementation needs.
-    #[allow(clippy::unused_async)]
+    /// Stages the body as `multipart_part_size` blocks — one request at a time,
+    /// no fan-out — then makes them the blob with a single `Put Block List`.
+    /// The conditional headers ride on that commit ([`put_conditions`], the
+    /// same mapping the single-shot path uses), so the whole upload publishes
+    /// atomically: readers see the previous blob, or none, until the commit
+    /// lands, and the CAS is evaluated against that instant.
+    ///
+    /// A failed or abandoned commit needs no cleanup call. Staged blocks belong
+    /// to no blob until a commit names them — they are invisible to reads and
+    /// listings — and Azure garbage-collects uncommitted blocks after seven
+    /// days. So there is no `abort` here, unlike `s3.rs`'s `abort_multipart`.
     async fn chunked_put(
         &self,
         key: &str,
-        _body: PutBody,
+        body: PutBody,
         len: u64,
-        _opts: &PutOptions,
+        opts: &PutOptions,
     ) -> Result<ObjectMeta> {
-        Err(StoreError::InvalidArgument(format!(
-            "azure: chunked put not implemented yet ({key}, {len} bytes)"
-        )))
+        let part = self.multipart_part_size;
+        let blocks = len.div_ceil(effective_part(len, part));
+        if blocks > MAX_BLOCKS {
+            return Err(StoreError::InvalidArgument(format!(
+                "azure put {key}: {len} bytes at a {part}-byte part size needs {blocks} blocks, \
+                 over the service limit of {MAX_BLOCKS}"
+            )));
+        }
+
+        // One stream for every body shape. `file_stream` already cuts a file at
+        // the part size and a `Bytes` body arrives whole, so both take
+        // `next_chunk`'s slicing path; only a caller's stream is regrouped.
+        let mut stream = match body {
+            PutBody::Bytes(b) => util::once(b),
+            PutBody::Stream { stream, .. } => stream,
+            // Saturating only bites on a 32-bit target, where a part that large
+            // could not be buffered anyway.
+            PutBody::File(path) => {
+                util::file_stream(path, None, usize::try_from(part).unwrap_or(usize::MAX))
+            }
+        };
+        let mut carry = Bytes::new();
+
+        let client = self.container.blob_client(key).block_blob_client();
+        let mut ids: Vec<Vec<u8>> = Vec::with_capacity(usize::try_from(blocks).unwrap_or(0));
+        for (i, want) in chunk_sizes(len, part).enumerate() {
+            let want = usize::try_from(want).unwrap_or(usize::MAX);
+            let chunk = next_chunk(key, &mut stream, &mut carry, want).await?;
+            let id = block_id(i as u64);
+            client
+                // `&id` is raw ASCII: the SDK base64-encodes block ids itself,
+                // for the `blockid` query parameter and for the commit body
+                // alike. `RequestContent::from` is the `Vec<u8>` constructor;
+                // the zero-copy `From<Bytes>` is reached through `into`.
+                .stage_block(&id, chunk.len() as u64, chunk.into(), None)
+                .await
+                .map_err(|e| classify(key, e))?;
+            ids.push(id);
+        }
+
+        // Order of the commit list is the order of the blob's bytes.
+        let list = BlockLookupList {
+            latest: Some(ids),
+            ..Default::default()
+        };
+        let (if_match, if_none_match) = put_conditions(&opts.mode);
+        let commit = BlockBlobClientCommitBlockListOptions {
+            if_match,
+            if_none_match,
+            blob_content_type: opts.content_type.map(str::to_owned),
+            blob_cache_control: opts.immutable.then(|| IMMUTABLE_CACHE_CONTROL.to_owned()),
+            ..Default::default()
+        };
+        let body = RequestContent::try_from(list).map_err(|e| classify(key, e))?;
+
+        match client.commit_block_list(body, Some(commit)).await {
+            // The commit answers with the new blob's ETag in a header, not a
+            // body; an unparsable one degrades to an empty version, exactly as
+            // a missing ETag does on the single-shot path.
+            Ok(resp) => Ok(ObjectMeta {
+                key: key.to_owned(),
+                size: len,
+                version: version_from_etag(resp.etag().ok().flatten().as_ref()),
+            }),
+            Err(e) => Err(self.put_error(key, e).await),
+        }
+    }
+
+    /// The `StoreError` for a failed write, with `current` filled in.
+    ///
+    /// On a CAS failure the service reports the conflict but not what won, so
+    /// one follow-up HEAD names the winner — as `s3.rs` does. Shared by the
+    /// single-shot upload and the chunked commit.
+    async fn put_error(&self, key: &str, e: azure_core::Error) -> StoreError {
+        let mut err = classify(key, e);
+        if let StoreError::PreconditionFailed { current, .. } = &mut err
+            && current.is_none()
+        {
+            *current = self.head(key).await.ok().flatten().map(|m| m.version);
+        }
+        err
     }
 }
 
@@ -474,6 +583,125 @@ async fn measure_body(body: PutBody) -> Result<(PutBody, u64)> {
             Ok((PutBody::File(path), len))
         }
     }
+}
+
+/// The conditional headers for one [`PutMode`], as `(If-Match, If-None-Match)`.
+///
+/// One mapping, two call sites — the single-shot `Put Blob` and the
+/// `Put Block List` that commits a chunked upload — so the modes cannot drift
+/// apart between the two paths.
+fn put_conditions(mode: &PutMode) -> (Option<Etag>, Option<Etag>) {
+    match mode {
+        PutMode::Overwrite => (None, None),
+        // `*` is the wildcard, not an ETag: it is never quoted.
+        PutMode::Create => (None, Some(Etag::from("*"))),
+        PutMode::Update(v) => (Some(to_wire_etag(v)), None),
+    }
+}
+
+// ---- chunked put -------------------------------------------------------
+
+/// The id of the `i`-th staged block.
+///
+/// Every block id in one blob must be the *same* length — an Azure requirement
+/// — and the commit list's order is the blob's byte order, so zero-padded
+/// decimal keeps byte order and staging order in step. 16 digits covers
+/// [`MAX_BLOCKS`] many times over, so the width is never exceeded.
+///
+/// Raw ASCII, never base64: the SDK encodes block ids itself, both into the
+/// `blockid` query parameter (`generated/clients/block_blob_client.rs:344`,
+/// `set_pair("blockid", base64::encode(block_id))`) and into the commit body
+/// (`BlockLookupList::latest` serializes through
+/// `models_serde::option_vec_encoded_bytes_std`). Encoding here would
+/// double-encode.
+fn block_id(i: u64) -> Vec<u8> {
+    format!("{i:016}").into_bytes()
+}
+
+/// The part size actually used for a `len`-byte body.
+///
+/// A configured size of zero would never terminate the split, so the whole body
+/// becomes one chunk instead. One definition, so the block-count guard and the
+/// staging loop always agree.
+fn effective_part(len: u64, part_size: u64) -> u64 {
+    if part_size == 0 {
+        len.max(1)
+    } else {
+        part_size
+    }
+}
+
+/// The successive chunk sizes a `len`-byte body splits into at `part_size`.
+///
+/// Pure arithmetic, kept apart from the I/O so the boundaries (exact multiple,
+/// shorter than a part, one byte over) are testable without a service. Total
+/// for inputs `chunked_put` never passes it: an empty body yields nothing, and
+/// a zero part size yields one chunk rather than dividing by zero.
+fn chunk_sizes(len: u64, part_size: u64) -> impl Iterator<Item = u64> {
+    let part = effective_part(len, part_size);
+    let mut remaining = len;
+    std::iter::from_fn(move || {
+        if remaining == 0 {
+            return None;
+        }
+        let n = part.min(remaining);
+        remaining -= n;
+        Some(n)
+    })
+}
+
+/// A body that ran out before the length its caller declared.
+///
+/// Raised before anything is committed: the alternative is publishing a
+/// truncated blob and reporting the length that was promised.
+fn short_body(key: &str, missing: usize) -> StoreError {
+    StoreError::InvalidArgument(format!(
+        "azure put {key}: body ended {missing} bytes short of its declared length"
+    ))
+}
+
+/// Pulls exactly `want` bytes off `stream`, holding any overshoot in `carry`.
+///
+/// A producer's chunk boundaries have nothing to do with the part size, so they
+/// are regrouped here. Whole producer chunks are pulled until one of them alone
+/// covers the request, and that one is sliced rather than copied — a `Bytes`
+/// body and a file stream (which `file_stream` already cuts at the part size)
+/// take that path every time; only a finer-grained producer is stitched.
+///
+/// A body *longer* than declared is truncated at `len`: the driver asks for
+/// exactly the chunks that length splits into and never comes back for more.
+async fn next_chunk(
+    key: &str,
+    stream: &mut ByteStream,
+    carry: &mut Bytes,
+    want: usize,
+) -> Result<Bytes> {
+    while carry.is_empty() {
+        match stream.next().await {
+            Some(next) => *carry = next?,
+            None => return Err(short_body(key, want)),
+        }
+    }
+    if carry.len() >= want {
+        return Ok(carry.split_to(want));
+    }
+
+    let mut buf = BytesMut::with_capacity(want);
+    buf.extend_from_slice(&std::mem::take(carry));
+    while buf.len() < want {
+        let Some(next) = stream.next().await else {
+            return Err(short_body(key, want - buf.len()));
+        };
+        let mut next = next?;
+        let take = want - buf.len();
+        if next.len() > take {
+            buf.extend_from_slice(&next.split_to(take));
+            *carry = next;
+        } else {
+            buf.extend_from_slice(&next);
+        }
+    }
+    Ok(buf.freeze())
 }
 
 /// Materializes a below-threshold body. Stream bodies are walgit's small
@@ -700,6 +928,12 @@ impl ObjectStore for AzureStore {
 
     async fn put(&self, key: &str, body: PutBody, opts: PutOptions) -> Result<ObjectMeta> {
         let (body, len) = measure_body(body).await?;
+
+        // Every mode chunks. `s3.rs` restricts multipart to `PutMode::Overwrite`
+        // because S3's `CreateMultipartUpload` cannot carry a conditional
+        // header, and the condition would have to be evaluated there; Azure has
+        // no such restriction, since staging publishes nothing and the
+        // condition rides on the atomic `Put Block List` that commits.
         if len >= self.multipart_threshold {
             return self.chunked_put(key, body, len, &opts).await;
         }
@@ -709,13 +943,10 @@ impl ObjectStore for AzureStore {
         // SDK only stages blocks when the content exceeds the partition size,
         // and anything big enough to want that took `chunked_put` above.
         let partition_size = NonZero::new(len.max(1)).unwrap_or(NonZero::<u64>::MIN);
+        let (if_match, if_none_match) = put_conditions(&opts.mode);
         let upload = BlockBlobClientUploadOptions {
-            if_match: match &opts.mode {
-                PutMode::Update(v) => Some(to_wire_etag(v)),
-                PutMode::Create | PutMode::Overwrite => None,
-            },
-            // `*` is the wildcard, not an ETag: it is never quoted.
-            if_none_match: matches!(opts.mode, PutMode::Create).then(|| Etag::from("*")),
+            if_match,
+            if_none_match,
             blob_content_type: opts.content_type.map(str::to_owned),
             blob_cache_control: opts.immutable.then(|| IMMUTABLE_CACHE_CONTROL.to_owned()),
             parallel: Some(SEQUENTIAL),
@@ -738,17 +969,7 @@ impl ObjectStore for AzureStore {
                 size: len,
                 version: version_from_etag(resp.etag.as_ref()),
             }),
-            Err(e) => {
-                let mut err = classify(key, e);
-                // Fill `current` via HEAD on a CAS failure — the service reports
-                // the conflict but not what won.
-                if let StoreError::PreconditionFailed { current, .. } = &mut err
-                    && current.is_none()
-                {
-                    *current = self.head(key).await.ok().flatten().map(|m| m.version);
-                }
-                Err(err)
-            }
+            Err(e) => Err(self.put_error(key, e).await),
         }
     }
 
@@ -1224,5 +1445,158 @@ mod tests {
             "https://acct.blob.core.windows.net/cont\
              ?comp=list&delimiter=%2F&maxresults=1000&restype=container"
         );
+    }
+
+    // ---- chunked put ---------------------------------------------------
+
+    /// Azure rejects a block list whose ids are not all the same length. Zero
+    /// padding to a fixed width is what makes that true across magnitudes.
+    #[test]
+    fn block_ids_are_uniform_length() {
+        for i in [0u64, 1, 9, 10, 99, 100, 999, 1_000, 49_999, MAX_BLOCKS - 1] {
+            assert_eq!(
+                block_id(i).len(),
+                16,
+                "block id for {i} is not 16 bytes: {:?}",
+                String::from_utf8_lossy(&block_id(i))
+            );
+        }
+    }
+
+    /// The commit lists ids in the order the blocks were staged, so byte order
+    /// and numeric order must agree — the property zero padding buys.
+    #[test]
+    fn block_ids_sort_like_their_numbers() {
+        assert!(block_id(2) < block_id(10), "2 must sort before 10");
+        let ids: Vec<Vec<u8>> = (0..2_000u64).map(block_id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "byte order diverges from numeric order");
+    }
+
+    /// Block ids are plain ASCII digits: the SDK base64-encodes them for both
+    /// the `blockid` query parameter and the commit body, so nothing here does.
+    #[test]
+    fn block_ids_are_ascii_digits() {
+        assert_eq!(block_id(0), b"0000000000000000");
+        assert_eq!(block_id(42), b"0000000000000042");
+    }
+
+    #[test]
+    fn chunks_split_an_exact_multiple_evenly() {
+        assert_eq!(chunk_sizes(300, 100).collect::<Vec<_>>(), [100, 100, 100]);
+    }
+
+    #[test]
+    fn chunks_below_the_part_size_are_one_chunk() {
+        assert_eq!(chunk_sizes(99, 100).collect::<Vec<_>>(), [99]);
+        assert_eq!(chunk_sizes(100, 100).collect::<Vec<_>>(), [100]);
+    }
+
+    #[test]
+    fn chunks_leave_a_remainder_last() {
+        assert_eq!(chunk_sizes(101, 100).collect::<Vec<_>>(), [100, 1]);
+        assert_eq!(chunk_sizes(250, 100).collect::<Vec<_>>(), [100, 100, 50]);
+    }
+
+    /// Total for the degenerate inputs `chunked_put` never passes it: an empty
+    /// body yields no chunks, and a zero part size does not divide by zero.
+    #[test]
+    fn chunks_are_total_for_degenerate_input() {
+        assert_eq!(chunk_sizes(0, 100).collect::<Vec<_>>(), Vec::<u64>::new());
+        assert_eq!(chunk_sizes(0, 0).collect::<Vec<_>>(), Vec::<u64>::new());
+        assert_eq!(chunk_sizes(7, 0).collect::<Vec<_>>(), [7]);
+    }
+
+    /// Chunk sizes always sum back to the body length, whatever the part size.
+    #[test]
+    fn chunks_sum_to_the_body_length() {
+        for len in [1u64, 5, 64, 65, 4096, 1_048_577] {
+            for part in [1u64, 7, 64, 4096] {
+                assert_eq!(
+                    chunk_sizes(len, part).sum::<u64>(),
+                    len,
+                    "len {len} part {part}"
+                );
+            }
+        }
+    }
+
+    /// The one mode→condition mapping both the single-shot upload and the
+    /// chunked commit use. `*` is the wildcard, never quoted; an `Update`
+    /// version goes back on the wire quoted.
+    #[test]
+    fn put_conditions_map_every_mode() {
+        let (m, n) = put_conditions(&PutMode::Overwrite);
+        assert!(m.is_none() && n.is_none());
+
+        let (m, n) = put_conditions(&PutMode::Create);
+        assert!(m.is_none());
+        assert_eq!(n.map(|e| e.to_string()).as_deref(), Some("*"));
+
+        let (m, n) = put_conditions(&PutMode::Update(Version::new("0x8D1")));
+        assert_eq!(m.map(|e| e.to_string()).as_deref(), Some("\"0x8D1\""));
+        assert!(n.is_none());
+    }
+
+    /// A body that runs out early must fail *before* the commit, not commit a
+    /// short blob and report the length the caller claimed.
+    #[tokio::test]
+    async fn a_short_stream_is_rejected() {
+        let mut stream = util::once(Bytes::from_static(b"abc"));
+        let mut carry = Bytes::new();
+        let err = next_chunk("k", &mut stream, &mut carry, 8)
+            .await
+            .expect_err("short body must error");
+        assert!(matches!(err, StoreError::InvalidArgument(_)), "{err:?}");
+    }
+
+    /// A producer chunk that already covers the request is sliced, not copied —
+    /// the path a `Bytes` body and `util::file_stream` take for every chunk of
+    /// a multi-gigabyte upload. Shared-allocation slices keep their addresses.
+    #[tokio::test]
+    async fn whole_chunks_are_sliced_not_copied() {
+        let body = Bytes::from_static(b"0123456789");
+        let base = body.as_ptr();
+        let mut stream = util::once(body);
+        let mut carry = Bytes::new();
+        for (i, want) in chunk_sizes(10, 4).enumerate() {
+            let chunk = next_chunk("k", &mut stream, &mut carry, usize::try_from(want).unwrap())
+                .await
+                .expect("chunk");
+            assert_eq!(
+                chunk.as_ptr(),
+                // SAFETY-free pointer arithmetic: comparing addresses only.
+                base.wrapping_add(i * 4),
+                "chunk {i} was copied out of the original allocation"
+            );
+        }
+    }
+
+    /// Regrouping is independent of how the producer chunked the body.
+    #[tokio::test]
+    async fn chunks_regroup_across_stream_boundaries() {
+        let parts = vec![
+            Bytes::from_static(b"ab"),
+            Bytes::from_static(b"cde"),
+            Bytes::from_static(b"fghi"),
+        ];
+        let mut stream: crate::ByteStream =
+            Box::pin(futures::stream::iter(parts.into_iter().map(Ok)));
+        let mut carry = Bytes::new();
+        let mut out: Vec<Bytes> = Vec::new();
+        for want in chunk_sizes(9, 4) {
+            out.push(
+                next_chunk(
+                    "k",
+                    &mut stream,
+                    &mut carry,
+                    usize::try_from(want).expect("fits"),
+                )
+                .await
+                .expect("chunk"),
+            );
+        }
+        assert_eq!(out, [&b"abcd"[..], &b"efgh"[..], &b"i"[..]]);
     }
 }
