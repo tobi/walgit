@@ -251,9 +251,11 @@ fn version_from_error(e: &azure_core::Error) -> Option<Version> {
     else {
         return None;
     };
+    // Through `version_from_etag`, so quote handling stays in the one place the
+    // module doc promises — a raw header is exactly what `Etag` wraps.
     raw.headers()
         .get_optional_str(&ETAG)
-        .map(|s| Version::new(s.trim_matches('"')))
+        .map(|s| version_from_etag(Some(&Etag::from(s))))
 }
 
 /// Maps an SDK error onto the store's error vocabulary.
@@ -262,16 +264,34 @@ fn version_from_error(e: &azure_core::Error) -> Option<Version> {
 /// and 412 (`ConditionNotMet`) → `PreconditionFailed`, 429 and 5xx → `Retryable`,
 /// everything else → `Other`. Callers that can observe the current version
 /// (`put`) fill `current` themselves.
+///
+/// An error with no status never reached (or never finished with) the service.
+/// `Io` and `Connection` are the transport failures — reset, TLS, timeout, DNS,
+/// refused connect — and are `Retryable`, matching what `s3.rs` does with the
+/// equivalent `reqwest` failure and what the SDK's own retry policy retries on.
+/// This matters beyond taste: [`coord::cas_update`](crate::coord) — the
+/// read-modify-write loop behind every manifest and lease — retries only
+/// `Retryable` and `PreconditionFailed` and returns anything else at once, and
+/// the server turns a retryable store error into a 503 the client can retry
+/// rather than a 500. A transport blip filed as `Other` would fail a push
+/// outright. Remaining status-less kinds (`Credential`, `DataConversion`,
+/// `Other`) are real faults → `Other`.
 fn classify(key: &str, e: azure_core::Error) -> StoreError {
-    match http_status(&e) {
-        Some(404) => StoreError::NotFound {
-            key: key.to_owned(),
-        },
-        Some(409 | 412) => StoreError::PreconditionFailed {
-            key: key.to_owned(),
-            current: None,
-        },
-        Some(429 | 500..=599) => StoreError::retryable(context(key, e)),
+    if let Some(status) = http_status(&e) {
+        return match status {
+            404 => StoreError::NotFound {
+                key: key.to_owned(),
+            },
+            409 | 412 => StoreError::PreconditionFailed {
+                key: key.to_owned(),
+                current: None,
+            },
+            429 | 500..=599 => StoreError::retryable(context(key, e)),
+            _ => StoreError::other(context(key, e)),
+        };
+    }
+    match e.kind() {
+        ErrorKind::Io | ErrorKind::Connection => StoreError::retryable(context(key, e)),
         _ => StoreError::other(context(key, e)),
     }
 }
@@ -634,9 +654,28 @@ mod tests {
     }
 
     #[test]
+    fn transport_errors_without_status_are_retryable() {
+        // A reset/TLS/timeout (`Io`) or a refused connect / DNS failure
+        // (`Connection`) must retry, as the same failure does on S3 — the WAL's
+        // manifest CAS loop gives up on anything that is not retryable.
+        assert!(classify("k", ErrorKind::Io.into_error()).is_retryable());
+        assert!(classify("k", ErrorKind::Connection.into_error()).is_retryable());
+    }
+
+    #[test]
     fn error_classification_without_status_is_other() {
-        let e = classify("k", ErrorKind::Io.into_error());
-        assert!(!e.is_not_found() && !e.is_precondition_failed() && !e.is_retryable());
+        // Non-transport, status-less kinds are real faults, not blips.
+        for kind in [
+            ErrorKind::Credential,
+            ErrorKind::DataConversion,
+            ErrorKind::Other,
+        ] {
+            let e = classify("k", kind.into_error());
+            assert!(
+                !e.is_not_found() && !e.is_precondition_failed() && !e.is_retryable(),
+                "expected Other, got {e:?}"
+            );
+        }
     }
 
     #[test]
