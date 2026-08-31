@@ -125,6 +125,10 @@ test-slow:
 test-gcs bucket:
     WALGIT_TEST_GCS_BUCKET={{bucket}} cargo test -p walgit-store --features gcs --test contract -- gcs_contract --nocapture
 
+# Store contract against a real Azure storage account (`az login` first; RBAC per docs/superpowers/specs/2026-08-31-azure-blob-store-design.md).
+test-azure account container="walgit-test":
+    WALGIT_TEST_AZURE_ACCOUNT={{account}} WALGIT_TEST_AZURE_CONTAINER={{container}} cargo test -p walgit-store --features azure --test contract -- azure_contract --nocapture
+
 # Run walgit-store contract tests against memory only.
 store-test:
     cargo test -p walgit-store --test contract -- memory_contract
