@@ -65,7 +65,7 @@ anonymous_read = true             # must be false in oidc mode
 # trusted_forwarders = []                  # principals allowed to set X-Walgit-Principal (a front in front of a push broker)
 
 [store]
-backend = "s3"                    # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "memory" (tests)
+backend = "s3"                    # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "azure" | "memory" (tests)
 bucket = "walgit"
 prefix = ""                       # global key prefix inside the bucket
 max_retries = 8                   # retries on retryable store errors (jittered backoff)
@@ -85,6 +85,14 @@ direct_connectivity = true
 # signing_service_account = "sa@project.iam.gserviceaccount.com"   # for bundles/lfs serve_via = "signed_url"
 bulk_clients = 4                  # separate data channels for pack/idx/side-file/bundle/LFS bytes + ranged reads
 bulk_concurrency = 32             # max concurrent bulk requests per process (control plane never queues behind them)
+
+# [store.azure]                   # backend = "azure": bucket above is the blob CONTAINER name
+# account = "mystorageacct"       # storage account (required)
+# endpoint = ""                   # "" = https://<account>.blob.core.windows.net; override for a sovereign cloud or a
+#                                 # custom domain. Must be https — the SDK rejects a plain-http endpoint once a
+#                                 # credential is attached, and this backend always attaches one (no Azurite)
+# credential = "developer_tools"  # "developer_tools" (az CLI/azd) | "client_secret" (AZURE_TENANT_ID/
+#                                 # AZURE_CLIENT_ID/AZURE_CLIENT_SECRET) | "managed_identity" | "workload_identity"
 
 [cache]
 dir = "/tmp/walgit"               # local materialized repos (+ tls/ for a self-signed certificate)

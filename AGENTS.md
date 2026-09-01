@@ -144,8 +144,9 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `fsck.pb` | Last connectivity audit (`FsckReport`), written by the maintainer's `fsck` unit, consumed by `repair` (`docs/INTEGRITY.md`). |
 | `events/cursor.json` | Durable acknowledged WAL sequence of the events bridge; advanced only after the webhook acknowledged (D32). |
 | `lfs/objects/<aa>/<bb>/<oid>` | LFS objects (sha256-addressed, immutable). Missing ones can be read through from `upstream.lfs` and persisted (`docs/LFS.md`). |
-Schema `crates/walgit-proto/proto/walgit/v1/wal.proto`; GCS over gRPC, S3 (AWS SDK) and in-memory stores share
-one contract suite (`crates/walgit-store/tests/contract.rs`, incl. compose).
+Schema `crates/walgit-proto/proto/walgit/v1/wal.proto`; GCS over gRPC, S3 (AWS SDK), Azure Blob
+(`azure_storage_blob`) and in-memory stores share one contract suite
+(`crates/walgit-store/tests/contract.rs`, incl. compose on the backends that support it).
 
 ### 2.2 Write path
 receive-pack (ours, `walgit-git/src/receive.rs`) → index the pack locally (`git index-pack --stdin --fix-thin
@@ -275,9 +276,11 @@ decision in §4 — or the PR is; never "fix later".
   table per chunk per thread (60 M entries × 44 threads ⇒ 178 GB RSS) and is the only place gix writes an object id
   into a pack (a mid-pack refresh once paired offsets with another pack's table ⇒ a wrong id). The gix pack source
   is a frozen snapshot (`frozen_pack_source`). Reproducer: `walgit-git/tests/upload_gix_scale.rs`.
-- **D3** `ObjectStore` trait with CAS version tokens, conditional GET, range, compose; gcs/s3/memory backends.
-  `compose` is native on GCS and a multipart `UploadPartCopy` on S3 (`compose_is_native` tells callers which);
-  `accel_target` gives an edge a URL (+ bearer on GCS, presigned on S3) to fetch an object itself.
+- **D3** `ObjectStore` trait with CAS version tokens, conditional GET, range, compose; gcs/s3/azure/memory
+  backends. `compose` is native on GCS and a multipart `UploadPartCopy` on S3 (`compose_is_native` tells callers
+  which; azure declines compose — `supports_compose = false` — and callers fall back to the byte path);
+  `accel_target` gives an edge a URL (+ bearer on GCS, presigned on S3) to fetch an object itself (azure has no
+  `accel_target`; it signs user-delegation SAS URLs for `signed_get_url` only).
 - **D4** protobuf on the wire and in the bucket; schema versioned, append-only.
 - **D5** Repo identity `<owner>/<repo>[.git]`, prefix `repos/<o>/<r>/`, creation = CAS create of the manifest.
 - **D6** Manifest CAS is the only commit point. **D7** No node identity, no elections; leases for exclusivity.
@@ -424,7 +427,9 @@ Decision identifiers are stable; gaps in the numbering are intentional.
   streamed by walgit). Anything an edge takes over is announced per request in `X-Walgit-Capabilities`; never
   infer an edge from config, never hardcode a hostname in `crates/` or `web/`.
 - **S3 and GCS are both first class.** Every store feature has both implementations and runs in the contract
-  suite (`just test-s3` against rustfs, `just test-gcs <bucket>`); "GCS only" is a bug.
+  suite (`just test-s3` against rustfs, `just test-gcs <bucket>`); "GCS only" is a bug. Azure Blob is the third
+  backend and runs the same suite (`just test-azure <account>`), minus the optional capabilities it declines
+  (`compose`, `accel_target`).
 - **Use the rig before prod** (`just dev-store` → `walgit-server --config walgit.standalone.toml`). Per-repo
   settings (D24) with minute-scale slots compress a week of bundle behaviour into 30 minutes.
 - No new auth paths (§1.3). No LIST on hot paths. No unbounded buffering of packs in memory. No full

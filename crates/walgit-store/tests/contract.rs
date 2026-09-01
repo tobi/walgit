@@ -8,7 +8,8 @@
 //!
 //! The suite is executed against `MemoryStore` always, and against `S3Store`
 //! when `WALGIT_TEST_S3_ENDPOINT` is set. `GcsStore` is tested when
-//! `WALGIT_TEST_GCS_BUCKET` is set (StoreGcs adds that wrapper).
+//! `WALGIT_TEST_GCS_BUCKET` is set (StoreGcs adds that wrapper), and
+//! `AzureStore` when `WALGIT_TEST_AZURE_ACCOUNT` is set (`just test-azure`).
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -32,17 +33,42 @@ pub async fn run_contract(store: DynStore, prefix: &str) {
         }
     };
 
-    test_put_create_wins_once(&store, &p("concurrent")).await;
-    test_update_cas(&store, &p("cas")).await;
-    test_get_if_none_match(&store, &p("inm")).await;
-    test_get_if_match_mismatch(&store, &p("im")).await;
-    test_range_reads(&store, &p("range")).await;
-    test_head_and_absent(&store, &p("head")).await;
-    test_delete(&store, &p("del")).await;
-    test_list(&store, &p("list")).await;
-    test_large_streamed_roundtrip(&store, &p("large")).await;
-    test_multipart_path(&store, &p("multi")).await;
-    test_compose(&store, &p("compose")).await;
+    // Each step announces itself on the way out. Eleven steps share one
+    // `#[tokio::test]`, so without this a green run says only `ok` — which is
+    // no use as evidence that a *particular* guarantee held against a real
+    // service, and no use for spotting which step got slow. A failure still
+    // names itself through the panic.
+    macro_rules! step {
+        ($name:literal, $call:expr) => {{
+            let t = std::time::Instant::now();
+            $call.await;
+            eprintln!("ok: {} ({:?})", $name, t.elapsed());
+        }};
+    }
+
+    step!(
+        "put_create_wins_once",
+        test_put_create_wins_once(&store, &p("concurrent"))
+    );
+    step!("update_cas", test_update_cas(&store, &p("cas")));
+    step!(
+        "get_if_none_match",
+        test_get_if_none_match(&store, &p("inm"))
+    );
+    step!(
+        "get_if_match_mismatch",
+        test_get_if_match_mismatch(&store, &p("im"))
+    );
+    step!("range_reads", test_range_reads(&store, &p("range")));
+    step!("head_and_absent", test_head_and_absent(&store, &p("head")));
+    step!("delete", test_delete(&store, &p("del")));
+    step!("list", test_list(&store, &p("list")));
+    step!(
+        "large_streamed_roundtrip",
+        test_large_streamed_roundtrip(&store, &p("large"))
+    );
+    step!("multipart_path", test_multipart_path(&store, &p("multi")));
+    step!("compose", test_compose(&store, &p("compose")));
 }
 
 /// `compose`: a small header object followed by a body larger than S3's 5 MiB minimum
@@ -766,6 +792,114 @@ async fn gcs_contract() {
         let _ = store.delete(&m.key, None).await;
     }
     eprintln!("[gcs_contract] cleanup done ({count} objects deleted)");
+}
+
+#[cfg(feature = "azure")]
+#[tokio::test]
+async fn azure_contract() {
+    let Ok(account) = std::env::var("WALGIT_TEST_AZURE_ACCOUNT") else {
+        eprintln!("skipping azure_contract: WALGIT_TEST_AZURE_ACCOUNT not set");
+        return;
+    };
+    let container =
+        std::env::var("WALGIT_TEST_AZURE_CONTAINER").unwrap_or_else(|_| "walgit-test".into());
+
+    // Unique prefix per run.
+    let prefix = format!("contract-test-{}", uuid::Uuid::new_v4().simple());
+    eprintln!("[azure_contract] account={account} container={container} prefix={prefix}");
+
+    let cfg = walgit_config::StoreConfig {
+        backend: walgit_config::StoreBackend::Azure,
+        bucket: container.clone(),
+        prefix: prefix.clone(),
+        azure: walgit_config::AzureConfig {
+            account,
+            ..Default::default()
+        },
+        // The same 5 MiB pair `s3_contract` uses, and for the same reason: with
+        // the default threshold the 6 MiB multipart case and the 8 MiB streamed
+        // roundtrip both fit a single upload, and the staged-block path
+        // (stage_block + commit_block_list) would never run against the service.
+        multipart_threshold: bytesize::ByteSize::mib(5),
+        multipart_part_size: bytesize::ByteSize::mib(5),
+        ..Default::default()
+    };
+
+    let store = walgit_store::azure::AzureStore::new(&cfg)
+        .await
+        .expect("AzureStore::new");
+    let store: DynStore = Arc::new(store);
+
+    run_contract(store.clone(), &prefix).await;
+
+    // The user-delegation SAS must be readable by a client holding no Azure
+    // credentials at all: a plain GET with no Authorization header.
+    //
+    // The URL is itself a credential (it ends in `sig=…`), so nothing below
+    // prints it — including on failure, where a `reqwest::Error`'s own Display
+    // would embed the URL it was fetching. Failures name the key and the HTTP
+    // status, never the URL or the error.
+    let sas_key = format!("{prefix}/sas-probe");
+    store
+        .put(
+            &sas_key,
+            PutBody::Bytes(Bytes::from_static(b"sas")),
+            PutOptions::from(PutMode::Create),
+        )
+        .await
+        .expect("sas probe put");
+    let url = store
+        .signed_get_url(&sas_key, std::time::Duration::from_secs(5 * 60))
+        .await
+        .expect("signed_get_url")
+        .expect("azure signs a URL for every key");
+    let resp = match reqwest::Client::new().get(url).send().await {
+        Ok(r) => r,
+        Err(e) => panic!(
+            "[azure_contract] sas probe {sas_key}: request failed (connect={}, timeout={})",
+            e.is_connect(),
+            e.is_timeout()
+        ),
+    };
+    let status = resp.status();
+    // The service's own error code (`AuthenticationFailed`, `AuthorizationFailure`,
+    // …) is a header, not part of the credential — the one useful thing to print
+    // when the probe fails.
+    let code = resp
+        .headers()
+        .get("x-ms-error-code")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_owned();
+    let Ok(body) = resp.bytes().await else {
+        // The error is dropped rather than printed: its Display carries the URL.
+        panic!("[azure_contract] sas probe {sas_key}: HTTP {status} {code}, body unreadable")
+    };
+    assert!(
+        status.is_success(),
+        "[azure_contract] sas probe {sas_key}: HTTP {status} {code} \
+         (a signed URL must need no credentials)"
+    );
+    assert_eq!(
+        &body[..],
+        b"sas",
+        "[azure_contract] sas probe {sas_key}: unexpected body"
+    );
+
+    // Cleanup: delete all objects under the prefix (the SAS probe included).
+    let to_delete: Vec<_> = futures::stream::iter(
+        walgit_store::ObjectStore::list(store.as_ref(), &prefix, None)
+            .collect::<Vec<_>>()
+            .await,
+    )
+    .filter_map(|r| async move { r.ok() })
+    .collect::<Vec<_>>()
+    .await;
+    let count = to_delete.len();
+    for m in &to_delete {
+        let _ = store.delete(&m.key, None).await;
+    }
+    eprintln!("[azure_contract] cleanup done ({count} objects deleted)");
 }
 
 /// Control plane must stay fast under bulk load (prod 2026-08-20: a 184-byte

@@ -6,3 +6,9 @@ allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
 allow-dbg-in-tests = true
+
+# The MSRV clippy must respect. `[workspace.package] rust-version` is not inherited by
+# the member crates, so clippy would otherwise assume the current toolchain and suggest
+# APIs newer than 1.90 (`Duration::from_hours`, `from_mins`, ...) — the lint gate is
+# `-D warnings`, so those suggestions would push code past the MSRV we declare.
+msrv = "1.90"
