@@ -49,7 +49,7 @@
 //!
 //! ## Chunked PUT
 //!
-//! Bodies at or above `multipart_threshold` are staged as `multipart_part_size`
+//! Bodies above `multipart_threshold` are staged as `multipart_part_size`
 //! blocks and committed in one call. A block id is a per-upload random nonce
 //! followed by a zero-padded decimal index: all one length (an Azure
 //! requirement), unique to their upload (the isolation above), and sorting in
@@ -350,7 +350,17 @@ impl AzureStore {
             Some(Arc::clone(&credential)),
             None,
         )?;
-        let http = reqwest::Client::builder().build()?;
+        // The supplemental REST path rides no SDK pipeline, so it inherits no
+        // timeout from one; without these a black-holed connection wedges the
+        // caller forever. 10s is generous for a TLS handshake against a blob
+        // endpoint, and 60s covers a whole delimited listing page
+        // (`maxresults=1000`) end to end — neither is a budget a healthy
+        // request comes near. Both surface as `reqwest` errors, which the
+        // listing already maps to `Retryable`.
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(60))
+            .build()?;
 
         Ok(AzureStore {
             container,
@@ -443,7 +453,7 @@ impl AzureStore {
         parse_hierarchy_page(&body)
     }
 
-    /// Staged-block upload for bodies at or above `multipart_threshold`.
+    /// Staged-block upload for bodies above `multipart_threshold`.
     ///
     /// Stages the body as `multipart_part_size` blocks — one request at a time,
     /// no fan-out — then makes them the blob with a single `Put Block List`.
@@ -691,10 +701,20 @@ fn version_from_error(e: &azure_core::Error) -> Option<Version> {
 
 /// Maps an SDK error onto the store's error vocabulary.
 ///
-/// 404 → `NotFound`, 409 (`BlobAlreadyExists`, a lost `If-None-Match: *` race)
-/// and 412 (`ConditionNotMet`) → `PreconditionFailed`, 429 and 5xx → `Retryable`,
-/// everything else → `Other`. Callers that can observe the current version
-/// (`put`) fill `current` themselves.
+/// 404 → `NotFound`, 412 (`ConditionNotMet`) → `PreconditionFailed`, 429 and
+/// 5xx → `Retryable`, everything else → `Other`. Callers that can observe the
+/// current version (`put`) fill `current` themselves.
+///
+/// 409 is the one status that needs the service's `x-ms-error-code` to read.
+/// [`BLOB_ALREADY_EXISTS`] is a lost `If-None-Match: *` race — the CAS the
+/// coordination loop expects — and is `PreconditionFailed`; so is a 409 that
+/// arrived with no code, since the live service does send one and its absence
+/// means a response the SDK could not parse rather than a different fault (the
+/// safe polarity, and the one this path has always taken). Every other code is
+/// something else entirely: [`CONTAINER_BEING_DELETED`] is transient container
+/// state → `Retryable`, and a lease/snapshot/append conflict is a real fault →
+/// `Other`. Laundering those into `PreconditionFailed` would make
+/// [`coord::cas_update`](crate::coord) spin on a race that never happened.
 ///
 /// An error with no status never reached (or never finished with) the service.
 /// `Io` and `Connection` are the transport failures — reset, TLS, timeout, DNS,
@@ -709,6 +729,16 @@ fn version_from_error(e: &azure_core::Error) -> Option<Version> {
 /// `Other`) are real faults → `Other`.
 fn classify(key: &str, e: azure_core::Error) -> StoreError {
     if let Some(status) = http_status(&e) {
+        if status == 409
+            && let Some(code) = error_code(&e)
+            && code != BLOB_ALREADY_EXISTS
+        {
+            return if code == CONTAINER_BEING_DELETED {
+                StoreError::retryable(context(key, e))
+            } else {
+                StoreError::other(context(key, e))
+            };
+        }
         return from_status(key, status, || context(key, e));
     }
     match e.kind() {
@@ -717,12 +747,37 @@ fn classify(key: &str, e: azure_core::Error) -> StoreError {
     }
 }
 
+/// The service's `x-ms-error-code`, as the SDK parsed it off the response.
+///
+/// Only [`ErrorKind::HttpResponse`] carries one, and even there it is optional
+/// — the SDK leaves it `None` when the error body is missing or unparsable.
+fn error_code(e: &azure_core::Error) -> Option<&str> {
+    match e.kind() {
+        ErrorKind::HttpResponse { error_code, .. } => error_code.as_deref(),
+        _ => None,
+    }
+}
+
+/// The `x-ms-error-code` for a lost `If-None-Match: *` create race — the only
+/// 409 that is genuinely a failed precondition.
+const BLOB_ALREADY_EXISTS: &str = "BlobAlreadyExists";
+
+/// The `x-ms-error-code` for a container caught mid-delete: transient state
+/// that will resolve on its own, so worth another attempt.
+const CONTAINER_BEING_DELETED: &str = "ContainerBeingDeleted";
+
 /// The status → error mapping [`classify`] documents, in one place.
 ///
 /// Shared with the supplemental REST path in `list_prefixes`, which has a
 /// `reqwest` response rather than an SDK error and so cannot go through
 /// [`classify`] — but must land on the same verdicts. `detail` is only built
 /// for the variants that carry a message.
+///
+/// [`classify`]'s 409 refinement deliberately does not live here. The only
+/// caller that bypasses `classify` is the delimited listing, which sends no
+/// conditional header and so can never be answered with a CAS-shaped 409;
+/// leaving this a pure status table keeps the raw path from having to parse an
+/// error body it never needs.
 fn from_status(key: &str, status: u16, detail: impl FnOnce() -> anyhow::Error) -> StoreError {
     match status {
         404 => StoreError::NotFound {
@@ -1399,7 +1454,7 @@ impl ObjectStore for AzureStore {
         // header, and the condition would have to be evaluated there; Azure has
         // no such restriction, since staging publishes nothing and the
         // condition rides on the atomic `Put Block List` that commits.
-        if len >= self.multipart_threshold {
+        if len > self.multipart_threshold {
             return self.chunked_put(key, body, len, &opts).await;
         }
         let bytes = collect_body(body, len).await?;
@@ -1586,6 +1641,17 @@ mod tests {
         .into_error()
     }
 
+    /// Same, but carrying the `x-ms-error-code` the SDK parsed off the
+    /// response — what [`classify`] consults to tell one 409 from another.
+    fn http_err_with_code(status: u16, code: &str) -> azure_core::Error {
+        ErrorKind::HttpResponse {
+            status: StatusCode::from(status),
+            error_code: Some(code.to_owned()),
+            raw_response: None,
+        }
+        .into_error()
+    }
+
     /// Same, but carrying a raw response with headers — what a 304 looks like.
     fn http_err_with_headers(status: u16, headers: Headers) -> azure_core::Error {
         ErrorKind::HttpResponse {
@@ -1656,6 +1722,57 @@ mod tests {
     fn error_classification_other() {
         let e = classify("k", http_err(400));
         assert!(!e.is_not_found() && !e.is_precondition_failed() && !e.is_retryable());
+    }
+
+    /// The 409 walgit actually races for: a lost `If-None-Match: *` create.
+    /// That is the CAS the coordination loop expects to retry.
+    #[test]
+    fn conflict_with_blob_already_exists_is_a_precondition_failure() {
+        assert!(
+            classify("k", http_err_with_code(409, BLOB_ALREADY_EXISTS)).is_precondition_failed()
+        );
+    }
+
+    /// A 409 with no code at all keeps the historical verdict: the live
+    /// service does send `BlobAlreadyExists`, so a missing code means a
+    /// response we could not parse, and the CAS reading is the safe polarity.
+    #[test]
+    fn conflict_without_a_code_is_a_precondition_failure() {
+        assert!(classify("k", http_err(409)).is_precondition_failed());
+    }
+
+    /// A container mid-delete is transient state, not a failed condition; the
+    /// CAS loop must retry rather than report a lost race that never happened.
+    #[test]
+    fn conflict_with_container_being_deleted_is_retryable() {
+        assert!(classify("k", http_err_with_code(409, CONTAINER_BEING_DELETED)).is_retryable());
+    }
+
+    /// Any other 409 — a lease conflict, a snapshot conflict, an append
+    /// position mismatch — is neither a lost CAS nor a blip, so it must not be
+    /// laundered into one: `Other` fails the operation instead of spinning.
+    #[test]
+    fn conflict_with_an_unrelated_code_is_other() {
+        for code in [
+            "LeaseIdMissing",
+            "LeaseAlreadyPresent",
+            "SnapshotOperationRateExceeded",
+        ] {
+            let e = classify("k", http_err_with_code(409, code));
+            assert!(
+                !e.is_not_found() && !e.is_precondition_failed() && !e.is_retryable(),
+                "409 {code} should be Other, got {e:?}"
+            );
+        }
+    }
+
+    /// The refinement is `classify`-only. `from_status` backs the delimited
+    /// listing, which sends no conditional header and so cannot be answered
+    /// with a CAS-shaped 409; it stays the coarse status table.
+    #[test]
+    fn from_status_keeps_the_coarse_conflict_mapping() {
+        let e = from_status("k", 409, || anyhow::anyhow!("listing"));
+        assert!(e.is_precondition_failed());
     }
 
     #[test]
