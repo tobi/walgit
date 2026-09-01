@@ -33,17 +33,39 @@ pub async fn run_contract(store: DynStore, prefix: &str) {
         }
     };
 
-    test_put_create_wins_once(&store, &p("concurrent")).await;
-    test_update_cas(&store, &p("cas")).await;
-    test_get_if_none_match(&store, &p("inm")).await;
-    test_get_if_match_mismatch(&store, &p("im")).await;
-    test_range_reads(&store, &p("range")).await;
-    test_head_and_absent(&store, &p("head")).await;
-    test_delete(&store, &p("del")).await;
-    test_list(&store, &p("list")).await;
-    test_large_streamed_roundtrip(&store, &p("large")).await;
-    test_multipart_path(&store, &p("multi")).await;
-    test_compose(&store, &p("compose")).await;
+    // Each step announces itself on the way out. Eleven steps share one
+    // `#[tokio::test]`, so without this a green run says only `ok` — which is
+    // no use as evidence that a *particular* guarantee held against a real
+    // service, and no use for spotting which step got slow. A failure still
+    // names itself through the panic.
+    macro_rules! step {
+        ($name:literal, $call:expr) => {{
+            let t = std::time::Instant::now();
+            $call.await;
+            eprintln!("ok: {} ({:?})", $name, t.elapsed());
+        }};
+    }
+
+    step!(
+        "put_create_wins_once",
+        test_put_create_wins_once(&store, &p("concurrent"))
+    );
+    step!("update_cas", test_update_cas(&store, &p("cas")));
+    step!("get_if_none_match", test_get_if_none_match(&store, &p("inm")));
+    step!(
+        "get_if_match_mismatch",
+        test_get_if_match_mismatch(&store, &p("im"))
+    );
+    step!("range_reads", test_range_reads(&store, &p("range")));
+    step!("head_and_absent", test_head_and_absent(&store, &p("head")));
+    step!("delete", test_delete(&store, &p("del")));
+    step!("list", test_list(&store, &p("list")));
+    step!(
+        "large_streamed_roundtrip",
+        test_large_streamed_roundtrip(&store, &p("large"))
+    );
+    step!("multipart_path", test_multipart_path(&store, &p("multi")));
+    step!("compose", test_compose(&store, &p("compose")));
 }
 
 /// `compose`: a small header object followed by a body larger than S3's 5 MiB minimum
