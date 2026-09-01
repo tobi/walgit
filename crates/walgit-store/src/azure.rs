@@ -169,6 +169,31 @@ const SAS_RESOURCE: &str = "b";
 /// cannot be observed in transit even if the URL is used carelessly.
 const SAS_PROTOCOL: &str = "https";
 
+/// `sv` — the service version whose string-to-sign layout [`SasFields::string_to_sign`]
+/// builds, and which every minted SAS therefore declares.
+///
+/// **This is deliberately not the delegation key's `skv`.** The two are
+/// independent: `skv` states which version *issued the key*, `sv` which
+/// version's signing rules the URL was built under, and the live service
+/// accepts a SAS whose `sv` is older than its `skv`.
+///
+/// It has to be pinned. `skv` comes back as whatever version the SDK
+/// negotiated — currently `2026-04-06` — and at that version the service
+/// builds a **28-field** string-to-sign, four more than the documented
+/// 24-field layout below. The four are interleaved, not appended: padding the
+/// layout out to 28 (or 29, or 30) trailing-empty fields still fails to match,
+/// and this preview version's field order is undocumented, so it cannot be
+/// guessed. `2020-12-06` is the version that introduced the 24-field layout
+/// (it added `signedEncryptionScope`) and is the oldest one this code signs
+/// correctly.
+///
+/// Verified against the live service (Task 8): at `sv = skv = 2026-04-06`
+/// every field count from 24 to 30 returns `AuthenticationFailed`, while
+/// `sv = 2020-12-06` with `skv` left as issued returns `200 OK`.
+///
+/// Raise this only alongside a layout change proven against the service.
+const SAS_VERSION: &str = "2020-12-06";
+
 /// Backdate applied to every `st`/`skt`, and the margin the cache keeps between
 /// a URL's expiry and its key's.
 ///
@@ -245,8 +270,9 @@ struct CachedDelegationKey {
     ske: String,
     /// `sks` — the service the key is good for (`b` for blob).
     sks: String,
-    /// `skv` — the service version that minted it. Also the SAS's own `sv`:
-    /// signing under one version and declaring another is `AuthenticationFailed`.
+    /// `skv` — the service version that minted it. Travels onto the URL as
+    /// `skv` and into the string-to-sign, but is *not* the SAS's own `sv`:
+    /// that is [`SAS_VERSION`], the version whose layout this code signs.
     skv: String,
     /// `ske` as an instant, for [`needs_new_delegation_key`].
     expiry: OffsetDateTime,
@@ -1051,7 +1077,7 @@ struct SasFields<'a> {
     /// *undecoded*. See [`canonical_resource`].
     resource: String,
     /// The delegation key: `skoid`/`sktid`/`skt`/`ske`/`sks`/`skv` travel from
-    /// here verbatim, and `sv` is its `skv`.
+    /// here verbatim. `sv` does not come from here — it is [`SAS_VERSION`].
     key: &'a CachedDelegationKey,
     /// `sr` — the kind of resource the signature covers.
     signed_resource: &'a str,
@@ -1061,12 +1087,13 @@ struct SasFields<'a> {
 
 impl SasFields<'_> {
     /// The 24 newline-separated fields Azure hashes for a user delegation SAS
-    /// at `sv >= 2020-12-06`, in the order the "Create a user delegation SAS"
+    /// at `sv` 2020-12-06, in the order the "Create a user delegation SAS"
     /// REST reference prescribes.
     ///
     /// The 23-field layout that predates `signedEncryptionScope` belongs to
-    /// `sv` 2020-02-10 and earlier; `sv` here is the key's own `skv`, which the
-    /// live service always sets far past that.
+    /// `sv` 2020-02-10 and earlier. The layout is chosen by `sv`, which is
+    /// [`SAS_VERSION`] and not the key's `skv` — see that constant for why the
+    /// two must not be tied together.
     ///
     /// Every field walgit does not use is present and **empty**. The separators
     /// are positional: dropping an unused field shifts every field after it and
@@ -1090,7 +1117,7 @@ impl SasFields<'_> {
             "",                   // scid   — signedCorrelationId
             "",                   // sip    — signedIP
             self.protocol,        // spr
-            &self.key.skv,        // sv     — the key's own service version
+            SAS_VERSION,          // sv     — the layout above, not `skv`
             self.signed_resource, // sr
             "",                   // signedSnapshotTime
             "",                   // ses    — signedEncryptionScope
@@ -1129,7 +1156,7 @@ fn signed_url(fields: &SasFields<'_>, mut url: Url) -> Result<Url> {
     {
         let mut query = url.query_builder();
         query
-            .set_pair("sv", fields.key.skv.as_str())
+            .set_pair("sv", SAS_VERSION)
             .set_pair("sr", fields.signed_resource)
             .set_pair("st", fields.start.as_str())
             .set_pair("se", fields.expiry.as_str())
@@ -2164,7 +2191,7 @@ mod tests {
         assert!(lines[12].is_empty(), "scid"); // signedCorrelationId
         assert!(lines[13].is_empty(), "sip"); // signedIP
         assert_eq!(lines[14], "https"); // spr
-        assert_eq!(lines[15], "2025-07-05"); // sv — the key's own skv
+        assert_eq!(lines[15], SAS_VERSION); // sv — the pinned layout version
         assert_eq!(lines[16], "b"); // sr
         assert!(lines[17].is_empty(), "snapshot time");
         assert!(lines[18].is_empty(), "ses"); // signedEncryptionScope
@@ -2175,15 +2202,25 @@ mod tests {
         assert!(lines[23].is_empty(), "rsct");
     }
 
-    /// `sv` is the delegation key's own `skv`: signing with one service version
-    /// and declaring another is the classic way to get `AuthenticationFailed`.
+    /// `sv` and `skv` are independent, and the test key's values differ so a
+    /// regression that re-ties them (the pre-Task-8 behaviour) shows up here
+    /// rather than as an opaque `AuthenticationFailed` from the service.
+    ///
+    /// `sv` selects the string-to-sign layout and must stay at the version
+    /// this code implements; `skv` is whatever version issued the key, which
+    /// the SDK's negotiated `x-ms-version` puts far ahead of it.
     #[test]
-    fn sas_signs_with_the_keys_own_service_version() {
+    fn sas_sv_is_pinned_and_independent_of_skv() {
         let key = test_key();
         let fields = test_fields(&key);
         let s = fields.string_to_sign();
         let lines: Vec<&str> = s.split('\n').collect();
-        assert_eq!(lines[15], lines[9], "sv must equal skv");
+        assert_eq!(lines[9], "2025-07-05", "skv travels verbatim from the key");
+        assert_eq!(lines[15], SAS_VERSION, "sv is the pinned layout version");
+        assert_ne!(
+            lines[15], lines[9],
+            "sv must not be re-tied to skv: the newer version signs a 28-field layout"
+        );
     }
 
     /// A fixed vector. The expectation was computed independently of this code
@@ -2192,11 +2229,15 @@ mod tests {
     /// chain: the layout, the base64 round trip the SDK's decoded `Value`
     /// forces, and the signature encoding. The live check is the contract test
     /// against Azure; this is the tripwire that catches a silent change first.
+    ///
+    /// The vector changed in Task 8 when `sv` was pinned to [`SAS_VERSION`]
+    /// rather than echoing `skv`: field 15 of the signed string is a different
+    /// value now, so every byte after it hashes differently.
     #[test]
     fn sas_signature_is_deterministic() {
         let key = test_key();
         let sig = sign(&test_fields(&key)).expect("sign");
-        assert_eq!(sig, "burryZaKvxR9OOUIPHL0z2NWs5hrxtKBQ8y/gwxZovg=");
+        assert_eq!(sig, "eNoFLfmA+/Jiz/FtbseXOGvCWvF0Fbe5eFAaA74bN/k=");
     }
 
     /// A signature is HMAC-SHA256: 32 bytes, base64.
@@ -2243,7 +2284,9 @@ mod tests {
         assert_eq!(pairs["sp"], "r");
         assert_eq!(pairs["sr"], "b");
         assert_eq!(pairs["spr"], "https");
-        assert_eq!(pairs["sv"], "2025-07-05");
+        // `sv` is the pinned layout version, `skv` the key's own — the URL
+        // carries both, and they differ.
+        assert_eq!(pairs["sv"], SAS_VERSION);
         assert_eq!(pairs["skv"], "2025-07-05");
         assert_eq!(pairs["skoid"], "oid-123");
         assert_eq!(pairs["sktid"], "tid-456");
