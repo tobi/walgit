@@ -223,11 +223,15 @@ pub struct AzureStore {
     container: BlobContainerClient,
     /// Account-scoped client — only `get_user_delegation_key` (SAS signing) needs it.
     service: BlobServiceClient,
-    /// The token source for the requests the SDK pipeline does not make:
-    /// the delimited listing, and the accel/SAS paths to come.
+    /// Token source for the one request the SDK pipeline does not make: the
+    /// delimited `List Blobs` behind [`ObjectStore::list_prefixes`], whose
+    /// `Authorization` header is built by hand in [`AzureStore::bearer`].
+    /// Signing does not come through here — a SAS is signed with the
+    /// delegation key `service` fetches, never with a bearer token.
     credential: Arc<dyn TokenCredential>,
-    /// reqwest client for the requests the SDK cannot make: the delimited
-    /// listing, and streaming GETs via SAS URLs.
+    /// reqwest client for that same delimited listing — the one call
+    /// `azure_storage_blob` cannot express. Nothing else uses it: a signed URL
+    /// is handed to the caller, never fetched by the store.
     http: reqwest::Client,
     account: String,
     bucket: String,
@@ -2447,9 +2451,9 @@ mod tests {
     /// service rejects.
     #[test]
     fn signing_ttl_rejects_what_no_key_can_cover() {
-        assert!(signing_ttl("k", std::time::Duration::from_hours(1)).is_ok());
+        assert!(signing_ttl("k", std::time::Duration::from_secs(60 * 60)).is_ok());
         assert!(matches!(
-            signing_ttl("k", std::time::Duration::from_hours(24)),
+            signing_ttl("k", std::time::Duration::from_secs(24 * 60 * 60)),
             Err(StoreError::InvalidArgument(_))
         ));
     }

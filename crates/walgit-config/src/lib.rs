@@ -299,7 +299,10 @@ pub enum AzureCredentialKind {
 pub struct AzureConfig {
     /// Storage account name (required; `bucket` is the container).
     pub account: String,
-    /// "" = `https://<account>.blob.core.windows.net`; override for Azurite/sovereign clouds.
+    /// "" = `https://<account>.blob.core.windows.net`; override for a sovereign
+    /// cloud or a custom domain. Must be `https`: the SDK rejects a plain-http
+    /// endpoint whenever a credential is attached, and this backend always
+    /// attaches one — so an http emulator such as Azurite cannot be reached.
     pub endpoint: String,
     pub credential: AzureCredentialKind,
 }

@@ -88,7 +88,9 @@ bulk_concurrency = 32             # max concurrent bulk requests per process (co
 
 # [store.azure]                   # backend = "azure": bucket above is the blob CONTAINER name
 # account = "mystorageacct"       # storage account (required)
-# endpoint = ""                   # "" = https://<account>.blob.core.windows.net
+# endpoint = ""                   # "" = https://<account>.blob.core.windows.net; override for a sovereign cloud or a
+#                                 # custom domain. Must be https — the SDK rejects a plain-http endpoint once a
+#                                 # credential is attached, and this backend always attaches one (no Azurite)
 # credential = "developer_tools"  # "developer_tools" (az CLI/azd) | "client_secret" (AZURE_TENANT_ID/
 #                                 # AZURE_CLIENT_ID/AZURE_CLIENT_SECRET) | "managed_identity" | "workload_identity"
 

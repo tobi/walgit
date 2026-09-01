@@ -849,7 +849,7 @@ async fn azure_contract() {
         .await
         .expect("sas probe put");
     let url = store
-        .signed_get_url(&sas_key, std::time::Duration::from_mins(5))
+        .signed_get_url(&sas_key, std::time::Duration::from_secs(5 * 60))
         .await
         .expect("signed_get_url")
         .expect("azure signs a URL for every key");
