@@ -1,13 +1,13 @@
 # walgit — a git server that is one binary in front of an object store
 
 walgit hosts git repositories with **no database, no leader and no local state that matters**. You run a
-single binary, point it at an S3 or GCS bucket, and you have: smart HTTP (v0/v2) fetch and push, `bundle-uri`
-clones served as static files, Git LFS, a browsing web UI, a JSON API with an SDK, per-repository push policy,
-webhooks — and a server that scales to repositories **larger than the machine it runs on**. Every machine that
-runs walgit is a disposable cache; the bucket is the repository.
+single binary, point it at an S3, GCS or Azure Blob bucket, and you have: smart HTTP (v0/v2) fetch and
+push, `bundle-uri` clones served as static files, Git LFS, a browsing web UI, a JSON API with an SDK,
+per-repository push policy, webhooks — and a server that scales to repositories **larger than the machine it
+runs on**. Every machine that runs walgit is a disposable cache; the bucket is the repository.
 
 ```sh
-# 1. a bucket (any S3-compatible store or GCS) and a config
+# 1. a bucket (any S3-compatible store, GCS, or an Azure Blob container) and a config
 cat > walgit.toml <<'EOF'
 [server]
 listen = "0.0.0.0:8080"
@@ -79,7 +79,7 @@ server entirely (**bundle-uri**: fresh clones and catch-ups are static files the
 | **events** | A small bridge tails the WAL and POSTs ref events to a webhook, exactly-once per (repo, seq, ref) with a durable cursor. `docs/EVENTS.md`. |
 | **maintenance** | Checkpoints, bundle builds, geometric compaction, base rebuilds, connectivity audits and repairs — one loop that computes the desired state from (config, WAL) every pass and does one bounded unit of the most important missing work. Self-healing by construction: an outage leaves no holes; a deleted artefact is "missing" and rebuilt identically. |
 | **auth** | `none` (loopback), `token` (static tokens), `oidc` (any OpenID Connect issuer: browser sign-in, ID tokens, and walgit-issued access tokens for git). `/services/public/install.sh` sets a developer's machine up in one idempotent command. |
-| **stores** | S3 and S3-compatible (AWS, MinIO, rustfs, R2, Ceph, …) and GCS, first class; an in-memory store for tests. |
+| **stores** | S3 and S3-compatible (AWS, MinIO, rustfs, R2, Ceph, …) and GCS, first class; Azure Blob (Entra credentials, user-delegation SAS URLs); an in-memory store for tests. |
 
 ## How it works, briefly
 
@@ -165,7 +165,7 @@ Code map:
 ```
 crates/
   walgit-proto    protobuf schema (wal.proto), log framing, store keys
-  walgit-store    ObjectStore trait (CAS versions, conditional GET, range, compose); backends s3, gcs, memory; leases
+  walgit-store    ObjectStore trait (CAS versions, conditional GET, range, compose); backends s3, gcs, azure, memory; leases
   walgit-git      bare repos on disk, receive-pack, pack ingest, refs ↔ packed-refs, advertisements, upload-pack drivers
   walgit-wal      RepoHandle: sync levels, publish (group commit + CAS), checkpoints, log reader, remote reader, tasks
   walgit-bundle   bundle-uri: slots and chains, building, header ∘ pack composition, lists, retention

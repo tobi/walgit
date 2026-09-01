@@ -2165,10 +2165,13 @@ mod tests {
 
     /// The executable record of the string-to-sign layout.
     ///
-    /// 24 fields for `sv >= 2020-12-06` (the 23-field layout is `sv` 2020-02-10
-    /// and earlier, which predates `signedEncryptionScope`). The separators are
-    /// positional: a dropped empty field shifts every field after it and the
-    /// service computes a different hash, so the count is asserted first.
+    /// 24 fields at exactly `sv` 2020-12-06 — the version [`SAS_VERSION`] pins.
+    /// The count is not monotonic in `sv`: newer versions sign *more* fields
+    /// (28 at `2026-04-06`, proven against the live service), and the 23-field
+    /// layout is `sv` 2020-02-10 and earlier, which predates
+    /// `signedEncryptionScope`. The separators are positional: a dropped empty
+    /// field shifts every field after it and the service computes a different
+    /// hash, so the count is asserted first.
     #[test]
     fn sas_string_to_sign_layout() {
         let key = test_key();

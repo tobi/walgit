@@ -51,7 +51,10 @@ pub async fn run_contract(store: DynStore, prefix: &str) {
         test_put_create_wins_once(&store, &p("concurrent"))
     );
     step!("update_cas", test_update_cas(&store, &p("cas")));
-    step!("get_if_none_match", test_get_if_none_match(&store, &p("inm")));
+    step!(
+        "get_if_none_match",
+        test_get_if_none_match(&store, &p("inm"))
+    );
     step!(
         "get_if_match_mismatch",
         test_get_if_match_mismatch(&store, &p("im"))

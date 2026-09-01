@@ -159,12 +159,15 @@ pub enum CoordError { Store(StoreError), Decode(prost::DecodeError), Aborted, Re
 pub struct S3Store; impl S3Store { pub async fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self>; }
 // gcs.rs
 pub struct GcsStore; impl GcsStore { pub async fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self>; }
+// azure.rs (added 2026-08-31; feature `azure`, in the default set)
+pub struct AzureStore; impl AzureStore { pub async fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self>; }
 // lib.rs
 pub async fn open_store(cfg: &walgit_config::Config) -> anyhow::Result<DynStore>; // by cfg.store.backend, applies Prefixed(cfg.store_prefix())
 ```
 Contract tests: `crates/walgit-store/tests/contract.rs` with a `run_contract(store: DynStore)` suite executed for
 memory always, for s3 when `WALGIT_TEST_S3_ENDPOINT` set (bucket `WALGIT_TEST_BUCKET`, default "walgit-test"),
-for gcs when `WALGIT_TEST_GCS_BUCKET` set.
+for gcs when `WALGIT_TEST_GCS_BUCKET` set, for azure when `WALGIT_TEST_AZURE_ACCOUNT` set (container
+`WALGIT_TEST_AZURE_CONTAINER`, default "walgit-test").
 
 ## walgit-wal (owner: Wal)
 
