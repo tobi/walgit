@@ -37,14 +37,26 @@
 //! `Overwrite`-only — but on Azure staging publishes nothing and the condition
 //! is evaluated atomically at the commit.
 //!
+//! What that commit-time atomicity buys is **visibility**: nothing is readable
+//! until the commit lands, and the condition is evaluated at that instant. It
+//! does *not* by itself isolate one chunked upload's staged bytes from
+//! another's. Azure's uncommitted-block namespace is keyed by *blob name*,
+//! shared by every writer of that key, and `Put Block List` commits the most
+//! recently staged version of each id no matter who staged it — so two
+//! concurrent uploads that reused ids could see the winner's satisfied CAS
+//! publish the loser's bytes. The staged-data isolation exists only because
+//! block ids are unique per upload; see [`block_id`] and [`upload_nonce`].
+//!
 //! ## Chunked PUT
 //!
 //! Bodies at or above `multipart_threshold` are staged as `multipart_part_size`
-//! blocks and committed in one call. Block ids are zero-padded decimal so they
-//! are all the same length (an Azure requirement) and sort in staging order;
-//! the SDK base64-encodes them on the wire, so they are passed as raw ASCII.
-//! Blocks staged for a commit that never happened belong to no blob and Azure
-//! collects them after seven days, so a failed upload needs no abort call.
+//! blocks and committed in one call. A block id is a per-upload random nonce
+//! followed by a zero-padded decimal index: all one length (an Azure
+//! requirement), unique to their upload (the isolation above), and sorting in
+//! staging order. The SDK base64-encodes them on the wire, so they are passed
+//! as raw ASCII. Blocks staged for a commit that never happened belong to no
+//! blob and Azure collects them after seven days, so a failed upload needs no
+//! abort call.
 //!
 //! ## Conditional DELETE
 //!
@@ -440,6 +452,13 @@ impl AzureStore {
     /// atomically: readers see the previous blob, or none, until the commit
     /// lands, and the CAS is evaluated against that instant.
     ///
+    /// That atomicity governs visibility, not isolation. Staged blocks live in
+    /// a namespace keyed by blob name and shared with every other writer of
+    /// that key, so a concurrent upload that staged the same ids could have
+    /// *its* bytes committed under *this* upload's satisfied CAS. What keeps
+    /// the two apart is the nonce drawn once here and threaded through
+    /// [`block_id`].
+    ///
     /// A failed or abandoned commit needs no cleanup call. Staged blocks belong
     /// to no blob until a commit names them — they are invisible to reads and
     /// listings — and Azure garbage-collects uncommitted blocks after seven
@@ -464,11 +483,14 @@ impl AzureStore {
         let mut carry = Bytes::new();
 
         let client = self.container.blob_client(key).block_blob_client();
+        // Drawn once, for the whole upload: this is what keeps these staged
+        // blocks out of a concurrent upload's commit list ([`upload_nonce`]).
+        let nonce = upload_nonce();
         let mut ids: Vec<Vec<u8>> = Vec::with_capacity(usize::try_from(blocks).unwrap_or(0));
         for (i, want) in chunk_sizes(len, part).enumerate() {
             let want = usize::try_from(want).unwrap_or(usize::MAX);
             let chunk = next_chunk(key, &mut stream, &mut carry, want).await?;
-            let id = block_id(i as u64);
+            let id = block_id(&nonce, i as u64);
             client
                 // `&id` is raw ASCII: the SDK base64-encodes block ids itself,
                 // for the `blockid` query parameter and for the commit body
@@ -791,12 +813,40 @@ fn put_conditions(mode: &PutMode) -> (Option<Etag>, Option<Etag>) {
 
 // ---- chunked put -------------------------------------------------------
 
-/// The id of the `i`-th staged block.
+/// A fresh block-id nonce for one chunked upload: 8 random bytes, 16 lowercase
+/// hex chars.
+///
+/// This is the whole of the staged-data isolation between concurrent writers.
+/// Azure's uncommitted-block namespace is keyed by *blob name*, not by upload,
+/// and `Put Block List` commits the most recently staged version of each id
+/// regardless of who staged it. With bare indices, two concurrent chunked
+/// uploads of one key — trivially reachable when they disagree on part size,
+/// as a rolled-out config change makes them — would overwrite each other's
+/// staged blocks, and the winner's commit would splice in the loser's bytes
+/// with its CAS still satisfied (neither had published anything). Prefixing
+/// every id with a per-upload nonce keeps the two sets of names disjoint. The
+/// SDK's own managed uploader takes the same precaution, with a UUID per block
+/// (`clients/block_blob_client.rs:274`).
+///
+/// 64 random bits: only uploads whose blocks are both still staged — never
+/// committed, under seven days old — can collide at all, and a collision there
+/// would take on the order of 2^32 of them against the same key.
+fn upload_nonce() -> String {
+    format!("{:016x}", rand::random::<u64>())
+}
+
+/// The id of the `i`-th block staged by the upload that drew `nonce`.
 ///
 /// Every block id in one blob must be the *same* length — an Azure requirement
-/// — and the commit list's order is the blob's byte order, so zero-padded
-/// decimal keeps byte order and staging order in step. 16 digits covers
-/// [`MAX_BLOCKS`] many times over, so the width is never exceeded.
+/// — so both halves are fixed width: [`upload_nonce`]'s 16 hex chars, then a
+/// zero-padded decimal index. 16 digits covers [`MAX_BLOCKS`] many times over,
+/// so the width is never exceeded, and the 32 ASCII chars together sit well
+/// inside the service's 64-byte pre-base64 id limit.
+///
+/// The nonce is what isolates concurrent uploads of one key from each other
+/// (see [`upload_nonce`]). The zero padding is not load-bearing for byte order
+/// — the commit list's order is the blob's byte order — but it keeps a staged-
+/// block listing in staging order, which is what makes one readable.
 ///
 /// Raw ASCII, never base64: the SDK encodes block ids itself, both into the
 /// `blockid` query parameter (`generated/clients/block_blob_client.rs:344`,
@@ -804,8 +854,8 @@ fn put_conditions(mode: &PutMode) -> (Option<Etag>, Option<Etag>) {
 /// (`BlockLookupList::latest` serializes through
 /// `models_serde::option_vec_encoded_bytes_std`). Encoding here would
 /// double-encode.
-fn block_id(i: u64) -> Vec<u8> {
-    format!("{i:016}").into_bytes()
+fn block_id(nonce: &str, i: u64) -> Vec<u8> {
+    format!("{nonce}{i:016}").into_bytes()
 }
 
 /// The chunk stream for one body, cut at the part size the split expects.
@@ -1890,37 +1940,94 @@ mod tests {
 
     // ---- chunked put ---------------------------------------------------
 
-    /// Azure rejects a block list whose ids are not all the same length. Zero
-    /// padding to a fixed width is what makes that true across magnitudes.
+    /// Azure rejects a block list whose ids are not all the same length. A
+    /// fixed-width nonce plus a zero-padded index is what makes that true
+    /// across magnitudes.
     #[test]
     fn block_ids_are_uniform_length() {
+        let nonce = upload_nonce();
         for i in [0u64, 1, 9, 10, 99, 100, 999, 1_000, 49_999, MAX_BLOCKS - 1] {
             assert_eq!(
-                block_id(i).len(),
-                16,
-                "block id for {i} is not 16 bytes: {:?}",
-                String::from_utf8_lossy(&block_id(i))
+                block_id(&nonce, i).len(),
+                32,
+                "block id for {i} is not 32 bytes: {:?}",
+                String::from_utf8_lossy(&block_id(&nonce, i))
             );
         }
     }
 
-    /// The commit lists ids in the order the blocks were staged, so byte order
-    /// and numeric order must agree — the property zero padding buys.
+    /// Every id in one upload carries that upload's nonce, so no concurrent
+    /// writer of the same key can be staging under the same names.
+    #[test]
+    fn block_ids_within_one_upload_share_their_nonce() {
+        let nonce = upload_nonce();
+        for i in [0u64, 1, 42, 1_000, MAX_BLOCKS - 1] {
+            let id = block_id(&nonce, i);
+            assert!(
+                id.starts_with(nonce.as_bytes()),
+                "block id {:?} does not carry the upload nonce {nonce}",
+                String::from_utf8_lossy(&id)
+            );
+        }
+    }
+
+    /// The isolation the nonce buys rests on two uploads never drawing the
+    /// same one: the uncommitted-block namespace is keyed by blob name and
+    /// shared by every writer of that key, so equal ids would let one upload's
+    /// commit publish another's bytes. 64 random bits make that collision
+    /// effectively impossible — two equal draws would mean no randomness at all.
+    #[test]
+    fn each_upload_draws_its_own_nonce() {
+        assert_ne!(
+            upload_nonce(),
+            upload_nonce(),
+            "two uploads drew the same block-id nonce"
+        );
+    }
+
+    /// The nonce is fixed-width lowercase hex, so ids stay uniform (Azure's
+    /// requirement) and stay well inside the 64-byte pre-base64 id limit.
+    #[test]
+    fn upload_nonce_is_fixed_width_lowercase_hex() {
+        let nonce = upload_nonce();
+        assert_eq!(nonce.len(), 16, "nonce {nonce} is not 16 chars");
+        assert!(
+            nonce
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "nonce {nonce} is not lowercase hex"
+        );
+    }
+
+    /// The commit list's order is the blob's byte order, but keeping byte
+    /// order in step with staging order within an upload makes a staged-block
+    /// listing readable — the property zero padding buys behind the nonce.
     #[test]
     fn block_ids_sort_like_their_numbers() {
-        assert!(block_id(2) < block_id(10), "2 must sort before 10");
-        let ids: Vec<Vec<u8>> = (0..2_000u64).map(block_id).collect();
+        let nonce = upload_nonce();
+        assert!(
+            block_id(&nonce, 2) < block_id(&nonce, 10),
+            "2 must sort before 10"
+        );
+        let ids: Vec<Vec<u8>> = (0..2_000u64).map(|i| block_id(&nonce, i)).collect();
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(ids, sorted, "byte order diverges from numeric order");
     }
 
-    /// Block ids are plain ASCII digits: the SDK base64-encodes them for both
-    /// the `blockid` query parameter and the commit body, so nothing here does.
+    /// Block ids are plain ASCII — the nonce's hex, then the decimal index:
+    /// the SDK base64-encodes them for both the `blockid` query parameter and
+    /// the commit body, so nothing here does.
     #[test]
-    fn block_ids_are_ascii_digits() {
-        assert_eq!(block_id(0), b"0000000000000000");
-        assert_eq!(block_id(42), b"0000000000000042");
+    fn block_ids_are_ascii_nonce_then_digits() {
+        assert_eq!(
+            block_id("0123456789abcdef", 0),
+            b"0123456789abcdef0000000000000000"
+        );
+        assert_eq!(
+            block_id("0123456789abcdef", 42),
+            b"0123456789abcdef0000000000000042"
+        );
     }
 
     #[test]
