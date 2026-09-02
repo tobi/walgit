@@ -102,8 +102,13 @@ warnings:
         printf '%s\n' "$out"
         echo; echo "cargo build failed — fix the errors above"; exit 1
     fi
-    if printf '%s\n' "$out" | grep -qE '^warning: (unused|function|variable|field|method|struct|enum|never|dead|irrefutable|unreachable|value assigned|deprecated|trait|type|constant|static|associated)'; then
-        printf '%s\n' "$out" | grep -E '^warning' -A4 | grep -vE '^warning: `walgit-[a-z]+`'
+    # CI sets CARGO_TERM_COLOR=always, which prefixes every diagnostic with ANSI
+    # escapes — an anchored `^warning:` then never matches and this gate passes on
+    # a warning-bearing tree (issue #29). Strip the escapes before matching; the
+    # ESC is embedded as a bash $'…' literal so BSD and GNU sed both take it.
+    plain="$(printf '%s\n' "$out" | sed $'s/\x1b\\[[0-9;]*m//g')"
+    if printf '%s\n' "$plain" | grep -qE '^warning: (unused|function|variable|field|method|struct|enum|never|dead|irrefutable|unreachable|value assigned|deprecated|trait|type|constant|static|associated)'; then
+        printf '%s\n' "$plain" | grep -E '^warning' -A4 | grep -vE '^warning: `walgit-[a-z]+`'
         echo; echo "rustc warnings present — fix them (just warnings is part of just ci and the deploy preflight)"; exit 1
     fi
     echo "no rustc warnings"
