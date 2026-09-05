@@ -193,7 +193,7 @@ struct Discovery<'a> {
     base: String,
     browser_base: String,
     sdk: String,
-    docs: &'a str,
+    docs: String,
     auth: DiscoveryAuth<'a>,
     endpoints: Vec<&'a str>,
 }
@@ -216,7 +216,7 @@ async fn discovery(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         // D27: non-repo browser lane (popup). Repo JSON is /{o}/{r}/api-browser/*.
         browser_base: format!("{base_url}{API_BROWSER}/v1"),
         sdk: format!("{base_url}/repos.js"),
-        docs: "https://git.example.com/api",
+        docs: format!("{base_url}/api"),
         auth: DiscoveryAuth {
             bearer: "Authorization: Bearer <token>  (an access token from /_auth/tokens, a static token, or an ID token)".to_string(),
             setup: format!("{base_url}/services/setup.json"),
@@ -237,7 +237,6 @@ async fn discovery(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respo
             "GET  /{owner}/{repo}/api/blob/{rev}/{path}[?raw]",
             "GET  /{owner}/{repo}/api/commits?ref&path&skip&n",
             "GET  /{owner}/{repo}/api/commit/{sha}",
-            "GET  /{owner}/{repo}/api/commit/{sha}/merge-queue",
             "GET  /{owner}/{repo}/api/overview",
             "GET  /{owner}/{repo}/api/tasks[/{id}]",
             "GET  /{owner}/{repo}/api/ops",

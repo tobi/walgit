@@ -265,7 +265,7 @@ removes it (admin permission) — the same handlers as `PUT|DELETE /{owner}/{rep
 `GET|PUT|DELETE …/policy` is the push policy document (`docs/POLICY.md`).
 
 `GET|PUT|DELETE /{o}/{r}/api/settings` (D24, 2026-08-21) is the repository's **settings in the WAL**: a TOML document
-restricted to `[bundles]`, `[maintenance]`, `[compaction]`, `[upstream]`, and `[integrations]`, merged over the
+restricted to `[bundles]`, `[maintenance]`, `[compaction]` and `[upstream]`, merged over the
 host's config (`effective config`).
 `GET` → `{revision, author, updated_at, message, toml}` (`revision: 0` = none). `PUT` body = the TOML
 (`?message=` optional), validated against the serving host's build — 400 with the reason and nothing published
@@ -464,7 +464,7 @@ list by `commit_date` day and shows `subject` + `author`.
 
 Backs the "WAL" tab. Not needed by Code/Commits pages; a host without a
 WAL should return `404` (the tab then shows the error text). Shape is in
-`api.ts#Overview` / `overview.go`: `repo`, `clone_url`, `hostname`,
+`api.ts#Overview` / `struct Overview` in `crates/walgit-server/src/web/ui.rs`: `repo`, `clone_url`, `hostname`,
 `health{status: ok|degraded|error, issues[], deep, suggestions[{op, params?, reason, auto?}]}` — `deep` is the
 last connectivity audit as recorded in the store (`fsck.pb`, any maintainer), `auto` says how/when the
 maintainer loop performs a suggestion by itself (absent = a human must) — `manifest{version,
@@ -505,14 +505,16 @@ redelivers). Never cached, never served to the SPA.
   sha-addressed JSON in an LRU, since it can never go stale.
 - Reads must be as fresh as a `git fetch` from the same host would be:
   after a push is acknowledged, the next API call (any node) reflects it.
-- Writes on the JSON surface are admin only: `PUT|DELETE /{o}/{r}/api`,
-  `PUT|DELETE …/policy`, `POST …/ops/{op}`. Content moves over git
+- Writes on the JSON surface need a token with the matching permission:
+  write for `PUT /{o}/{r}/api` (create) and `POST …/ops/{op}`, admin for
+  `DELETE /{o}/{r}/api`, `PUT|DELETE …/policy` and `PUT|DELETE …/settings`
+  (D24: write is push, not admin). Content moves over git
   (`git-receive-pack`) and LFS, never through JSON.
 
 ## 6. Minimal conformance checklist
 
 ```
-GET /api/v1                                     → 200 {version:1, base, browser_base=/api/v1, sdk, auth, endpoints}
+GET /api/v1                                     → 200 {name, version:1, base, browser_base=/api-browser/v1, sdk, docs, auth, endpoints}
 GET /api/v1/me                                  → 200 {principal,write,anonymous} | 401; no-store
 GET /api/v1/owners                              → 200 [..]   ([] when empty)
 GET /api/v1/owners/nobody/repos                 → 200 []

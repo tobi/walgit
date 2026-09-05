@@ -78,7 +78,7 @@ export function ApiPage() {
         </Box>
       </div>
 
-      <Box title="Endpoints (GET unless noted) — /api/v1">
+      <Box title="Endpoints (GET unless noted)">
         <table className="api-table">
           <thead>
             <tr>
@@ -97,42 +97,47 @@ export function ApiPage() {
               desc={<>Repo summary: <code>{`{owner,name,full_name,head,branches,tags,clone_url,html_url,api_url}`}</code> (O(1) ref counts). <code>PUT</code> creates (write), <code>DELETE</code> removes (admin).</>}
               cache="SWR + ETag"
             />
-            <Row path={`…/${r}/refs`} desc={<>Default branch only: <code>{`{head:{name,sha}|null}`}</code>. O(1) whatever the ref count.</>} cache="SWR + ETag" />
+            <Row path={`/${r}/api/refs`} desc={<>Default branch only: <code>{`{head:{name,sha}|null}`}</code>. O(1) whatever the ref count.</>} cache="SWR + ETag" />
             <Row
-              path={`…/${r}/refs/{branches|tags}?prefix=&q=&after=&n=`}
+              path={`/${r}/api/refs/{branches|tags}?prefix=&q=&after=&n=`}
               desc={<>One name-sorted page <code>{`{refs:[{name,sha}],more}`}</code>; tags peeled; <code>n</code> ≤ 1000. With <code>Accept: text/event-stream</code>: one <code>ref</code> event per match as found.</>}
               cache="SWR"
             />
             <Row
-              path={`…/${r}/resolve/{ref/path…}`}
+              path={`/${r}/api/resolve/{ref/path…}`}
               desc={<>Splits a GitHub-shaped <code>ref/path</code> into <code>{`{ref,sha,path,kind}`}</code>; longest existing branch/tag wins, then a revision. Do this once, then address by sha.</>}
               cache="SWR + ETag"
             />
             <Row
-              path={`…/${r}/tree/{rev}/{path}`}
+              path={`/${r}/api/tree/{rev}/{path}`}
               desc={<>Directory listing <code>{`{entries:[{name,type,mode,size,sha}],commit?,readme?}`}</code>, dirs first, with the latest commit touching the path and README contents.</>}
               cache="sha → immutable · name → SWR + ETag"
             />
             <Row
-              path={`…/${r}/blob/{rev}/{path}[?raw]`}
+              path={`/${r}/api/blob/{rev}/{path}[?raw]`}
               desc={<><code>{`{name,size,contents}`}</code> or <code>binary:true</code> / <code>too_large:true</code>; <code>?raw</code> returns the bytes as <code>text/plain</code>.</>}
               cache="sha → immutable · name → SWR + ETag"
             />
             <Row
-              path={`…/${r}/commits?ref=&path=&skip=&n=`}
+              path={`/${r}/api/commits?ref=&path=&skip=&n=`}
               desc={<>History page <code>{`{commits:[Commit],more}`}</code>, optionally for one path; <code>n</code> ≤ 200; paginate with <code>skip += commits.length</code>.</>}
               cache="sha → immutable · name → SWR + ETag"
             />
             <Row
-              path={`…/${r}/commit/{sha}`}
+              path={`/${r}/api/commit/{sha}`}
               desc={<><code>{`{commit,stats:[{path,additions,deletions}],patch}`}</code> — unified diff against the first parent; any revision accepted.</>}
               cache="full sha → immutable · else SWR + ETag"
             />
-            <Row path={`…/${r}/policy`} desc={<>Push policy document (<code>GET</code>/<code>PUT</code>/<code>DELETE</code>, write).</>} cache="no-store" />
-            <Row path={`…/${r}/overview`} desc="WAL health, manifest, packs, bundles (what the WAL tab shows)." cache="no-store" />
+            <Row path={`/${r}/api/policy`} desc={<>Push policy document (<code>GET</code> read; <code>PUT</code>/<code>DELETE</code> admin).</>} cache="no-store" />
             <Row
-              path={`…/${r}/tasks · /tasks/{id} · POST /ops/{op}`}
-              desc={<>What the answering instance is doing to the repo (<code>{`{hostname,running,recent}`}</code>); attach to a task or start a maintenance op as an SSE stream.</>}
+              path={`/${r}/api/settings`}
+              desc={<>Per-repository settings in the WAL (<code>GET</code> read; <code>PUT</code>/<code>DELETE</code> admin); also <code>/effective</code>, <code>/history</code>, <code>/describe</code> and <code>POST /validate</code>.</>}
+              cache="no-store"
+            />
+            <Row path={`/${r}/api/overview`} desc="WAL health, manifest, packs, bundles (what the WAL tab shows)." cache="no-store" />
+            <Row
+              path={`/${r}/api/tasks · /tasks/{id} · POST /ops/{op}`}
+              desc={<>What the answering instance is doing to the repo (<code>{`{hostname,running,recent}`}</code>); attach to a task or start a maintenance op (write) as an SSE stream.</>}
               cache="no-store"
             />
           </tbody>

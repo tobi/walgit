@@ -714,7 +714,7 @@ export class RepoClient {
       }),
   };
 
-  /** D24: WAL-backed TOML overrides of [bundles], [maintenance], [compaction], [upstream], and [integrations]. */
+  /** D24: WAL-backed TOML overrides of [bundles], [maintenance], [compaction] and [upstream]. */
   readonly settings = {
     /** The settings document (`revision: 0` = none). */
     get: (opts?: CallOptions) => this.client.json<RepoSettings>(`${this.p}/settings`, opts),

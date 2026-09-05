@@ -1888,6 +1888,8 @@ listen = \"0.0.0.0:1\"\n",
             .unwrap_err()
             .to_string();
         assert!(e.contains("[server]"), "{e}");
+        // A section the docs once promised but the code never accepted.
+        assert!(base.with_settings("[integrations]\nx = 1\n").is_err());
         // Unknown key inside an allowed section.
         assert!(base.with_settings("[bundles]\nnope = 1\n").is_err());
         // Invalid effective config (incremental without a base).
