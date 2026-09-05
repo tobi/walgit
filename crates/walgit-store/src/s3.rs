@@ -306,9 +306,9 @@ where
 
 fn classify_put_error(
     key: &str,
-    err: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>,
+    err: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>,
 ) -> StoreError {
-    let code = err_code(err).unwrap_or("");
+    let code = err_code(&err).unwrap_or("");
     match code {
         "PreconditionFailed" | "ConditionalRequestConflict" => StoreError::PreconditionFailed {
             key: key.into(),
@@ -319,7 +319,7 @@ fn classify_put_error(
 }
 
 fn classify_list_error(
-    err: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error>,
+    err: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error>,
 ) -> StoreError {
     classify_error("s3 list error", err)
 }
@@ -412,7 +412,7 @@ impl ObjectStore for S3Store {
                 })
             }
             Err(e) => {
-                let mut err = classify_put_error(key, &e);
+                let mut err = classify_put_error(key, e);
                 // Fill `current` via HEAD if we got a PreconditionFailed.
                 if let StoreError::PreconditionFailed { current: c, .. } = &mut err
                     && c.is_none()
@@ -545,7 +545,7 @@ impl ObjectStore for S3Store {
                         let item = state.buffer.next();
                         item.map(|i| (i, state))
                     }
-                    Err(err) => Some((Err(classify_list_error(&err)), state)),
+                    Err(err) => Some((Err(classify_list_error(err)), state)),
                 }
             },
         ))
@@ -565,7 +565,7 @@ impl ObjectStore for S3Store {
             if let Some(ct) = &continuation_token {
                 builder = builder.continuation_token(ct);
             }
-            let resp = builder.send().await.map_err(|e| classify_list_error(&e))?;
+            let resp = builder.send().await.map_err(classify_list_error)?;
             out.extend(
                 resp.common_prefixes()
                     .iter()
