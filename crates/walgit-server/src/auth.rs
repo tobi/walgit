@@ -895,7 +895,7 @@ fn edge_owns_authorization(headers: &HeaderMap) -> bool {
 }
 
 /// The client's `Authorization` header value (edge-forwarded copy first).
-fn client_authorization(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn client_authorization(headers: &HeaderMap) -> Option<String> {
     if let Some(v) = headers
         .get(FORWARDED_AUTHORIZATION_HEADER)
         .and_then(|v| v.to_str().ok())

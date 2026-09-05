@@ -27,10 +27,20 @@ pub struct MemoryStore {
     /// Tests of edge offload (X-Accel-Redirect): when set, `accel_target` returns a
     /// URL + bearer pair like GCS would.
     pub fake_object_urls: std::sync::atomic::AtomicBool,
-    /// Test switch: `signed_get_url` fails like a store whose signing permission
-    /// is unavailable or denied.
+    /// Test switch: `signed_get_url` / `signed_put_url` fail like a store whose
+    /// signing permission is unavailable or denied.
     pub signing_fails: bool,
+    /// Tests of `serve_via = "signed_url"` uploads. With a base URL set,
+    /// `signed_put_url` answers like a backend that can sign a checksummed PUT:
+    /// `<base>/<key>` plus the checksum header such a backend would sign. Unset =
+    /// this backend's real answer (`Ok(None)`). Point it at a mock bucket and the
+    /// whole client-side flow is testable without one.
+    pub fake_signed_put_base: Mutex<Option<String>>,
 }
+
+/// Header the fake presigned PUT makes the client send. A real backend names its
+/// own (`x-amz-checksum-sha256` on S3); callers copy whatever they are handed.
+pub const FAKE_SIGNED_PUT_CHECKSUM_HEADER: &str = "x-walgit-test-checksum-sha256";
 
 impl MemoryStore {
     pub fn new() -> Self {
@@ -79,6 +89,31 @@ impl ObjectStore for MemoryStore {
             )));
         }
         Ok(None)
+    }
+
+    async fn signed_put_url(
+        &self,
+        key: &str,
+        ttl: std::time::Duration,
+        checksum_sha256: &[u8; 32],
+    ) -> Result<Option<crate::SignedPut>> {
+        use base64::Engine;
+        if self.signing_fails {
+            return Err(StoreError::other(anyhow::anyhow!(
+                "signBlob for {key}: PERMISSION_DENIED (VPC_SERVICE_CONTROLS) [test]"
+            )));
+        }
+        let Some(base) = self.fake_signed_put_base.lock().clone() else {
+            return Ok(None);
+        };
+        Ok(Some(crate::SignedPut {
+            url: format!("{base}/{key}?X-Test-Signature=1"),
+            headers: vec![(
+                FAKE_SIGNED_PUT_CHECKSUM_HEADER.to_string(),
+                base64::engine::general_purpose::STANDARD.encode(checksum_sha256),
+            )],
+            expires_in: ttl,
+        }))
     }
 
     fn backend(&self) -> &'static str {

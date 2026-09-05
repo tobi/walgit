@@ -245,9 +245,13 @@ signed_url_for = []               # repos whose bundle URIs are presigned store 
 
 [lfs]
 enabled = true
-serve_via = "proxy"               # "proxy" | "signed_url"
+serve_via = "proxy"               # "proxy" (bytes through walgit or the edge) | "signed_url" (store URLs both ways:
+                                  # presigned GETs, and presigned PUTs that only accept the oid's own bytes —
+                                  # `x-amz-checksum-sha256` on S3, signed, so a client cannot drop it). A backend
+                                  # that cannot bind the sha256 (GCS: no sha256 upload checksum; docs/LFS.md §1)
+                                  # keeps proxying uploads; `verify` is always walgit's
 signed_url_ttl = "1h"
-max_object_bytes = "16GiB"
+max_object_bytes = "16GiB"        # only enforceable on the proxy path, so a bigger object is never signed
 
 # Where a repository's history lives when it is not (all) here. Usually a per-repo setting
 # (`walgit repo settings set owner/name` → `[upstream] …`); one token for both services.

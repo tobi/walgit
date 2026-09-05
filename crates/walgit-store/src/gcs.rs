@@ -1055,6 +1055,24 @@ impl ObjectStore for GcsStore {
             Err(e) => Err(StoreError::other(e)),
         }
     }
+
+    /// Not on GCS — a signed PUT here cannot bind a SHA-256, and the contract has
+    /// no weaker form. GCS validates only what `x-goog-hash` carries (CRC32C, MD5),
+    /// neither of which walgit knows for an object it has never seen: it holds the
+    /// oid, which *is* the SHA-256, and nothing else. The other candidate,
+    /// `x-goog-content-sha256`, is documented as the payload portion of the V4
+    /// canonical request and as `UNSIGNED-PAYLOAD` for signed URLs; GCS does not
+    /// check an uploaded body against it on that path. Signing anyway would hand
+    /// out a write for one content address that accepts any bytes, so LFS uploads
+    /// stay proxied on GCS while downloads keep using `signed_get_url` above.
+    async fn signed_put_url(
+        &self,
+        _key: &str,
+        _ttl: std::time::Duration,
+        _checksum_sha256: &[u8; 32],
+    ) -> Result<Option<crate::SignedPut>> {
+        Ok(None)
+    }
 }
 
 // ---- helpers ----

@@ -81,11 +81,23 @@ impl S3Store {
             anyhow::anyhow!("s3: env var {} not set (secret key)", cfg.s3.secret_key_env)
         })?;
 
-        let creds = static_credentials(
+        Self::with_credentials(
+            cfg,
             &access_key,
             &secret_key,
             std::env::var("AWS_SESSION_TOKEN").ok(),
-        );
+        )
+    }
+
+    /// Same, with the credentials already in hand. Signing is offline, so this is
+    /// also how the signing tests build a client without touching the process env.
+    fn with_credentials(
+        cfg: &walgit_config::StoreConfig,
+        access_key: &str,
+        secret_key: &str,
+        session_token: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let creds = static_credentials(access_key, secret_key, session_token);
         let region = aws_sdk_s3::config::Region::new(cfg.s3.region.clone());
 
         let mut s3_config = aws_sdk_s3::Config::builder()
@@ -761,6 +773,77 @@ impl ObjectStore for S3Store {
             .map_err(|e| StoreError::other(anyhow::anyhow!("presigning: {e}")))?;
         Ok(Some(presigned.uri().to_owned()))
     }
+
+    /// A presigned `PutObject` whose signature covers `x-amz-checksum-sha256`:
+    /// S3 rejects a body whose SHA-256 differs (`BadDigest`) and a client that
+    /// omits or edits the header gets `SignatureDoesNotMatch`, so the URL writes
+    /// the named content or nothing. If the header is not in the signature —
+    /// an SDK that stopped serializing it, or a signing profile that excludes
+    /// it — the URL would accept arbitrary bytes, so it is discarded (`Ok(None)`)
+    /// and the caller keeps its own proxying href.
+    async fn signed_put_url(
+        &self,
+        key: &str,
+        ttl: Duration,
+        checksum_sha256: &[u8; 32],
+    ) -> Result<Option<crate::SignedPut>> {
+        use base64::Engine;
+        let presigning = PresigningConfig::expires_in(ttl)
+            .map_err(|e| StoreError::other(anyhow::anyhow!("presigning config: {e}")))?;
+        let presigned = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .checksum_sha256(base64::engine::general_purpose::STANDARD.encode(checksum_sha256))
+            .presigned(presigning)
+            .await
+            .map_err(|e| StoreError::other(anyhow::anyhow!("presigning put: {e}")))?;
+        let headers: Vec<(String, String)> = presigned
+            .headers()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect();
+        if !signature_covers(presigned.uri(), &headers, CHECKSUM_SHA256_HEADER) {
+            tracing::warn!(
+                key,
+                header = CHECKSUM_SHA256_HEADER,
+                "s3 presigned put does not sign the checksum header; falling back to a proxied upload"
+            );
+            return Ok(None);
+        }
+        Ok(Some(crate::SignedPut {
+            url: presigned.uri().to_owned(),
+            headers,
+            expires_in: ttl,
+        }))
+    }
+}
+
+/// The header S3 validates the uploaded body's SHA-256 against.
+const CHECKSUM_SHA256_HEADER: &str = "x-amz-checksum-sha256";
+
+/// Whether `header` is both required of the client and inside the signature:
+/// present in the headers the caller must send, and listed in the URL's
+/// `X-Amz-SignedHeaders`. Either one alone is not a lock — an unsigned header
+/// can be dropped, and a signed header nobody sends is never checked.
+fn signature_covers(url: &str, headers: &[(String, String)], header: &str) -> bool {
+    if !headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(header)) {
+        return false;
+    }
+    let Some(query) = url.split_once('?').map(|(_, q)| q) else {
+        return false;
+    };
+    query
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .filter(|(k, _)| k.eq_ignore_ascii_case("X-Amz-SignedHeaders"))
+        .any(|(_, v)| {
+            // A percent-encoded `;`-separated list: `host%3Bx-amz-checksum-sha256`.
+            v.replace("%3B", ";")
+                .replace("%3b", ";")
+                .split(';')
+                .any(|signed| signed.eq_ignore_ascii_case(header))
+        })
 }
 
 /// State for the lazy list stream.
@@ -964,5 +1047,93 @@ mod tests {
         assert_eq!(creds.access_key_id(), "access");
         assert_eq!(creds.secret_access_key(), "secret");
         assert_eq!(creds.session_token(), None);
+    }
+
+    fn test_config() -> walgit_config::StoreConfig {
+        walgit_config::StoreConfig {
+            backend: walgit_config::StoreBackend::S3,
+            bucket: "walgit-test".into(),
+            s3: walgit_config::S3Config {
+                endpoint: "https://s3.us-east-1.amazonaws.test".into(),
+                region: "us-east-1".into(),
+                force_path_style: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn test_store() -> S3Store {
+        S3Store::with_credentials(&test_config(), "access", "secret", None).expect("S3Store")
+    }
+
+    /// Signing is offline, so the one guarantee LFS signed uploads rest on is
+    /// checkable without a bucket: the presigned PUT makes the client send
+    /// `x-amz-checksum-sha256` for the oid it asked to upload, and that header is
+    /// inside the signature (`X-Amz-SignedHeaders`), so it cannot be dropped.
+    #[tokio::test]
+    async fn presigned_put_signs_the_sha256_the_client_must_send() {
+        use base64::Engine;
+        let digest = [7u8; 32];
+        let store = test_store();
+        let put = store
+            .signed_put_url(
+                "repos/o/r/lfs/objects/aa/bb/aabb",
+                Duration::from_secs(90),
+                &digest,
+            )
+            .await
+            .expect("signing")
+            .expect("s3 signs checksummed PUTs");
+
+        assert!(
+            put.url
+                .starts_with("https://s3.us-east-1.amazonaws.test/walgit-test/"),
+            "{}",
+            put.url
+        );
+        assert_eq!(put.expires_in, Duration::from_secs(90));
+        let checksum = put
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(CHECKSUM_SHA256_HEADER))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(
+            checksum,
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(digest)
+                    .as_str()
+            ),
+            "headers: {:?}",
+            put.headers
+        );
+        assert!(
+            signature_covers(&put.url, &put.headers, CHECKSUM_SHA256_HEADER),
+            "checksum header is not in X-Amz-SignedHeaders: {}",
+            put.url
+        );
+    }
+
+    /// A header the client must send but that the signature does not cover can be
+    /// dropped, which would leave a PUT that accepts any bytes: not a lock.
+    #[test]
+    fn a_header_outside_the_signature_is_not_a_lock() {
+        let headers = vec![(CHECKSUM_SHA256_HEADER.to_string(), "digest".to_string())];
+        let signed = "https://s3.test/b/k?X-Amz-SignedHeaders=host%3Bx-amz-checksum-sha256";
+        let unsigned = "https://s3.test/b/k?X-Amz-SignedHeaders=host";
+
+        assert!(signature_covers(signed, &headers, CHECKSUM_SHA256_HEADER));
+        assert!(!signature_covers(
+            unsigned,
+            &headers,
+            CHECKSUM_SHA256_HEADER
+        ));
+        assert!(!signature_covers(signed, &[], CHECKSUM_SHA256_HEADER));
+        assert!(!signature_covers(
+            "https://s3.test/b/k",
+            &headers,
+            CHECKSUM_SHA256_HEADER
+        ));
     }
 }

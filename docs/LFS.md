@@ -13,6 +13,40 @@ LFS pre-push. `AGENTS.md §1.4` lists LFS as part of the surface; this is the de
   Range/If-Range, HEAD; `X-Accel-Redirect` to an edge's cache when one announces it, D23). `PUT` verifies size +
   sha256 before the store write. `lfs.max_object_bytes` (16 GiB) bounds an upload.
 
+### `lfs.serve_via` — proxy (default) or straight to the bucket
+`proxy` streams every byte through walgit (or an edge). `signed_url` hands out store URLs instead, in both
+directions, and falls back to the proxying href per object whenever it cannot: signing is never load-bearing and
+a signing failure is a WARN line, not a failed push.
+
+| | `proxy` | `signed_url` |
+|---|---|---|
+| batch `download` | our href (`static_object`) | `signed_get_url` |
+| batch `upload` | our href (`PUT objects/<oid>`, size + sha256 checked here) | `signed_put_url`: a presigned `PUT` whose signature covers a header carrying the oid's sha256 |
+| `verify` | ours | **ours**, unchanged |
+| `authenticated` | absent — git-lfs authenticates our hrefs itself | `true` for the object holding a store URL |
+
+**A signed `PUT` is only ever handed out bound to the oid.** The keyspace is content-addressed and served back to
+everyone as immutable, so a `PUT` that accepts any bytes is a write primitive for every oid a client can name.
+`ObjectStore::signed_put_url` therefore takes the sha256 and answers `Ok(None)` unless the backend both rejects a
+body that does not match it and puts the header carrying it inside the signature (so a client cannot drop it):
+- **S3** signs `x-amz-checksum-sha256`; a mismatching body is `BadDigest`, a missing header is
+  `SignatureDoesNotMatch`. If the header ever falls outside `X-Amz-SignedHeaders`, the URL is discarded.
+- **GCS** cannot: `x-goog-hash` validates only CRC32C/MD5, which walgit does not know for an object it has never
+  seen, and `x-goog-content-sha256` is `UNSIGNED-PAYLOAD` on the signed-URL path. Uploads stay proxied there.
+- **memory** signs nothing.
+
+Two things follow. `verify` stays walgit's: the store guarantees the content, we still confirm the object arrived
+at the size git-lfs promised — and since `authenticated: true` tells git-lfs to add no credential (it applies the
+flag to the `verify` POST as well), the `verify` action carries the credential the client used on the batch,
+the way `X-Amz-*` rides the upload href. And `lfs.max_object_bytes` can only be enforced where the bytes pass
+through, so an object over the cap is not signed; it goes to the proxy href and is refused there with 413.
+
+Tests: `crates/walgit-server/tests/lfs_signed_url.rs` (a store that signs and one that cannot; the cap; and a
+real `git lfs push` against a mock bucket that checks the signed checksum the way S3 does, then `verify` here),
+`crates/walgit-store/tests/contract.rs` (`signed_put_url` is bound or absent, on every backend) and the S3
+signing unit tests in `crates/walgit-store/src/s3.rs` (the checksum header is required *and* inside
+`X-Amz-SignedHeaders`; signing needs no bucket).
+
 ## 2. Read-through upstream `upstream.lfs` (✅)
 A repository imported from another host keeps its LFS history in that host's LFS server (the import copies packs
 and refs, never LFS — without this, `repos/<o>/<r>/` has no `lfs/` prefix and every push with an LFS-tracked file
@@ -56,6 +90,7 @@ from a machine with disk and bandwidth: bare clone/fetch of the upstream, `git l
 
 ## 4. Not done / open
 - Upstream `verify` is not called (we only ever ask the upstream for downloads).
-- `lfs.serve_via = "signed_url"` hands out presigned store URLs (S3, or GCS with a signer); the default `proxy`
-  streams through walgit or the edge.
+- GCS signs no uploads (§1): the XML API has no sha256 upload checksum to bind them to. A GCS deployment that
+  wants signed LFS uploads needs a different lock — a `x-goog-content-length-range` bound plus a maintainer unit
+  that re-hashes and drops mismatches would be one, at the cost of a window where a bad object is servable.
 - Size accounting of LFS bytes per repository in the overview.

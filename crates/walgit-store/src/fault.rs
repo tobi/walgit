@@ -512,6 +512,14 @@ impl ObjectStore for FaultStore {
     async fn signed_get_url(&self, key: &str, ttl: Duration) -> Result<Option<String>> {
         self.inner.signed_get_url(key, ttl).await
     }
+    async fn signed_put_url(
+        &self,
+        key: &str,
+        ttl: Duration,
+        checksum_sha256: &[u8; 32],
+    ) -> Result<Option<crate::SignedPut>> {
+        self.inner.signed_put_url(key, ttl, checksum_sha256).await
+    }
     fn supports_compose(&self) -> bool {
         self.inner.supports_compose()
     }

@@ -123,6 +123,11 @@ pub async fn batch(
             upload: None,
             verify: None,
         };
+        // git-lfs reads `authenticated` once per object and applies it to the
+        // transfer *and* to `verify`: true = "the hrefs carry their own
+        // authorization, add none". Only a store URL is in that position, so it
+        // is set exactly where one is handed out.
+        let mut authenticated = None;
         if is_upload && (exists || at_upstream) {
             // We (or the upstream) already hold it: NO `actions` key at all =
             // "server has it", the push proceeds without bytes. A verify-only
@@ -141,16 +146,45 @@ pub async fn batch(
             continue;
         }
         if is_upload {
-            actions.upload = Some(Action {
-                href: format!("{base}/info/lfs/objects/{}", o.oid),
-                header: None,
-                expires_in: None,
-            });
-            actions.verify = Some(Action {
-                href: format!("{base}/info/lfs/verify"),
-                header: None,
-                expires_in: None,
-            });
+            // The bytes go straight to the bucket when the store can sign a PUT
+            // that only accepts this oid's content; otherwise they come through us.
+            match signed_upload(st, &cfg, &store, &key, &o.oid, o.size).await {
+                Some(put) => {
+                    actions.upload = Some(Action {
+                        href: put.url,
+                        header: Some(put.headers.into_iter().collect()),
+                        expires_in: Some(put.expires_in.as_secs()),
+                    });
+                    authenticated = Some(true);
+                    // `verify` stays walgit's either way: the store guarantees the
+                    // content, we still confirm the object arrived at the promised
+                    // size. It needs a credential, and `authenticated` has just
+                    // told git-lfs to add none — so it carries the one the client
+                    // used on this batch, the way `X-Amz-*` rides the upload href.
+                    actions.verify = Some(Action {
+                        href: format!("{base}/info/lfs/verify"),
+                        header: crate::auth::client_authorization(headers).map(|value| {
+                            std::collections::HashMap::from([(
+                                axum::http::header::AUTHORIZATION.as_str().to_owned(),
+                                value,
+                            )])
+                        }),
+                        expires_in: None,
+                    });
+                }
+                None => {
+                    actions.upload = Some(Action {
+                        href: format!("{base}/info/lfs/objects/{}", o.oid),
+                        header: None,
+                        expires_in: None,
+                    });
+                    actions.verify = Some(Action {
+                        href: format!("{base}/info/lfs/verify"),
+                        header: None,
+                        expires_in: None,
+                    });
+                }
+            }
         } else if at_upstream {
             // Streamed through us (and persisted) on GET. The upstream's batch
             // demands the exact size and a bare GET has none, so the href carries
@@ -161,17 +195,19 @@ pub async fn batch(
                 expires_in: None,
             });
         } else if exists {
-            let href = match cfg.lfs.serve_via {
+            let signed = match cfg.lfs.serve_via {
                 walgit_config::BundleServe::SignedUrl => store
                     .signed_get_url(&key, st.cfg.lfs.signed_url_ttl)
                     .await
                     .ok()
-                    .flatten()
-                    .unwrap_or_else(|| format!("{base}/info/lfs/objects/{}", o.oid)),
-                _ => format!("{base}/info/lfs/objects/{}", o.oid),
+                    .flatten(),
+                walgit_config::BundleServe::Proxy => None,
             };
+            if signed.is_some() {
+                authenticated = Some(true);
+            }
             actions.download = Some(Action {
-                href,
+                href: signed.unwrap_or_else(|| format!("{base}/info/lfs/objects/{}", o.oid)),
                 header: None,
                 expires_in: None,
             });
@@ -192,7 +228,7 @@ pub async fn batch(
         objs.push(BatchRespObject {
             oid: o.oid.clone(),
             size: o.size,
-            authenticated: None,
+            authenticated,
             actions: Some(actions),
             error: None,
         });
@@ -207,7 +243,52 @@ pub async fn batch(
         axum::http::header::CONTENT_TYPE,
         "application/vnd.git-lfs+json".parse().unwrap(),
     );
+    // Per principal, and the answer can carry signed store URLs and the
+    // credential `verify` needs: never a cache's business.
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
     Ok(resp)
+}
+
+/// A presigned PUT for `key`, or `None` to keep the proxying href.
+///
+/// Asked for only under `lfs.serve_via = "signed_url"`, and not for an object
+/// bigger than `lfs.max_object_bytes` — a signed PUT bypasses walgit, so the
+/// only place that cap can still be applied is the proxy path. The store answers
+/// `None` unless it can sign a PUT that accepts nothing but this oid's content
+/// (`ObjectStore::signed_put_url`), and a signing failure is a fallback, never a
+/// failed push.
+async fn signed_upload(
+    st: &AppState,
+    cfg: &walgit_config::Config,
+    store: &walgit_store::Prefixed,
+    key: &str,
+    oid: &str,
+    size: u64,
+) -> Option<walgit_store::SignedPut> {
+    if cfg.lfs.serve_via != walgit_config::BundleServe::SignedUrl
+        || size > st.cfg.lfs.max_object_bytes.as_u64()
+    {
+        return None;
+    }
+    // The oid *is* the sha256 (`require_lfs_oid` checked the shape), so it is
+    // also the checksum the PUT has to be bound to.
+    let mut digest = [0u8; 32];
+    if hex::decode_to_slice(oid, &mut digest).is_err() {
+        return None;
+    }
+    match store
+        .signed_put_url(key, st.cfg.lfs.signed_url_ttl, &digest)
+        .await
+    {
+        Ok(put) => put,
+        Err(error) => {
+            tracing::warn!(oid, %error, "lfs: signing an upload failed; proxying it instead");
+            None
+        }
+    }
 }
 
 /// `GET|HEAD /{repo}/info/lfs/objects/{oid}` — stream the object with the full
