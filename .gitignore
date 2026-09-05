@@ -11,6 +11,7 @@ target/
 
 # local review dumps (findings, smoketests, notes — not for the repo)
 .review/
+reports/
 
 # built web assets (embedded into the binary at build time; `just web-build`)
 web/dist/
