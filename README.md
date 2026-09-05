@@ -115,7 +115,9 @@ with its reasoning, the invariants, and the cost model (round trips to the bucke
 ## Running it
 
 ```sh
-# build (needs rust per rust-toolchain.toml, protoc, node 24 + pnpm for the web UI)
+# build — Nix devshell is the canonical path (pins all tools: rust, protoc, node, pnpm, just, podman):
+nix develop
+# or bring your own tools: see docs/DEV_SETUP.md for platform-specific instructions
 just web-build && cargo build --release -p walgit-cli
 # or: nix build .#walgit        or: podman build -t walgit -f Containerfile .
 
