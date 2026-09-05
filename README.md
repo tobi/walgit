@@ -126,6 +126,7 @@ open https://walgit.localhost:8080/
 ```
 
 * `walgit.standalone.toml` — the one-machine shape (self-signed TLS, rustfs, every role). Start here.
+* `docs/DEV_SETUP.md` — full local setup (prerequisites, build, `just dev-local`, tests, the macOS port-9000 caveat).
 * `walgit.example.toml` — every key with its default and a comment.
 * `Containerfile`, `flake.nix` — an OCI image and a Nix package/devshell.
 * `deploy/nginx.conf.example` — an optional nginx in front: public TLS, one `auth_request` per credential, and
