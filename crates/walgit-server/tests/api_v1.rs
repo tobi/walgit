@@ -564,6 +564,8 @@ async fn repository_delete_requires_admin() -> TestResult {
 /// but the policy and settings documents move only with admin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn policy_and_settings_writes_require_admin() -> TestResult {
+    const POLICY: &str = r#"{"version":1,"groups":[],"rules":[]}"#;
+    const SETTINGS: &str = "[bundles]\nmin_commits = 3\n";
     let server = Server::start_with_tweak(|c| {
         c.server.auth.mode = walgit_config::AuthMode::Token;
         c.server.auth.anonymous_read = false;
@@ -595,8 +597,6 @@ async fn policy_and_settings_writes_require_admin() -> TestResult {
         "write permission creates the repository"
     );
 
-    const POLICY: &str = r#"{"version":1,"groups":[],"rules":[]}"#;
-    const SETTINGS: &str = "[bundles]\nmin_commits = 3\n";
     for (path, body) in [
         ("/gates/repo/api/policy", POLICY),
         ("/gates/repo/api/settings", SETTINGS),
