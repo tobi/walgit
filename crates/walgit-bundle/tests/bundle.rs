@@ -337,7 +337,7 @@ async fn full_bundle_passes_verify() {
     assert!(!entry.tips.is_empty(), "bundle entry should have tips");
     assert!(entry.tips.iter().any(|t| t.name == "refs/heads/main"));
     assert!(entry.tips.iter().any(|t| t.name == "refs/tags/v1.0"));
-    assert!(entry.kind == "full");
+    assert_eq!(entry.kind, "full");
     assert!(entry.base_id.is_empty());
 }
 
