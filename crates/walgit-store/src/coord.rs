@@ -133,9 +133,8 @@ where
     T: prost::Message + Default,
 {
     match store.get_if_changed(key, known).await {
-        Err(StoreError::NotFound { .. }) => Ok(None),
+        Err(StoreError::NotFound { .. }) | Ok(None) => Ok(None),
         Err(e) => Err(CoordError::Store(e)),
-        Ok(None) => Ok(None),
         Ok(Some((meta, bytes))) => {
             let msg = T::decode(bytes)?;
             Ok(Some((meta, msg)))
@@ -173,6 +172,10 @@ pub struct LeaseGuard {
 }
 
 impl LeaseGuard {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Lease construction collects its store identity and timing in one place"
+    )]
     fn new(
         store: DynStore,
         key: &str,
@@ -226,9 +229,9 @@ impl LeaseGuard {
             .delete(&self.key, Some(self.version.clone()))
             .await
         {
-            Ok(())
-            | Err(StoreError::PreconditionFailed { .. })
-            | Err(StoreError::NotFound { .. }) => Ok(()),
+            Ok(()) | Err(StoreError::PreconditionFailed { .. } | StoreError::NotFound { .. }) => {
+                Ok(())
+            }
             Err(e) => Err(CoordError::Store(e)),
         }
     }
@@ -286,9 +289,9 @@ impl Drop for LeaseGuard {
         let key = self.key.clone();
         let version = self.version.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let _ = handle.spawn(async move {
+            drop(handle.spawn(async move {
                 let _ = store.delete(&key, Some(version)).await;
-            });
+            }));
         }
     }
 }
@@ -327,8 +330,7 @@ pub async fn try_acquire(
             let expires_at = existing
                 .expires_at
                 .as_ref()
-                .map(time::to_system)
-                .unwrap_or(UNIX_EPOCH);
+                .map_or(UNIX_EPOCH, time::to_system);
             if now >= expires_at + LEASE_SKEW_TOLERANCE {
                 let epoch = existing.epoch + 1;
                 let lease = make_lease(holder, purpose, now, ttl, epoch);
@@ -422,9 +424,10 @@ mod tests {
 
     #[tokio::test]
     async fn cas_update_convergence_64_incrementers() {
+        const N: u32 = 64;
+
         let store = dyn_store();
         let key = "counter.pb";
-        const N: u32 = 64;
 
         let mut handles = Vec::new();
         for i in 0..N {
@@ -465,9 +468,10 @@ mod tests {
 
     #[tokio::test]
     async fn lease_exclusivity_32_concurrent() {
+        const N: u32 = 32;
+
         let store = dyn_store();
         let key = "leases/excl.pb";
-        const N: u32 = 32;
 
         let mut handles = Vec::new();
         for i in 0..N {
@@ -475,7 +479,7 @@ mod tests {
             let k = key.to_string();
             handles.push(tokio::spawn(async move {
                 let holder = format!("h{i}");
-                try_acquire(s, &k, &holder, "test", Duration::from_secs(60)).await
+                try_acquire(s, &k, &holder, "test", Duration::from_mins(1)).await
             }));
         }
         let mut successes = 0;
@@ -614,7 +618,7 @@ mod tests {
         let store = dyn_store();
         let key = "leases/timeout.pb";
 
-        let _g1 = try_acquire(store.clone(), key, "h1", "test", Duration::from_secs(60))
+        let _g1 = try_acquire(store.clone(), key, "h1", "test", Duration::from_mins(1))
             .await
             .unwrap()
             .unwrap();

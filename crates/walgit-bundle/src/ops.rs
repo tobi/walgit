@@ -1,3 +1,4 @@
+#![allow(clippy::needless_continue, clippy::too_many_arguments)]
 //! Core bundling operations: ref resolution, bundle creation, store upload,
 //! bundle-list CAS management, pruning, and per-strategy leasing.
 //!
@@ -70,7 +71,7 @@ pub(crate) fn filter_refs(snap: &RefSnapshotData, patterns: &[String]) -> (Vec<S
     let effective: Vec<&str> = if patterns.is_empty() {
         vec!["refs/heads/*", "refs/tags/*", "HEAD"]
     } else {
-        patterns.iter().map(|s| s.as_str()).collect()
+        patterns.iter().map(std::string::String::as_str).collect()
     };
 
     let mut ref_names = Vec::new();
@@ -88,7 +89,7 @@ pub(crate) fn filter_refs(snap: &RefSnapshotData, patterns: &[String]) -> (Vec<S
     }
 
     // Include HEAD if requested and not already captured as a named ref.
-    let want_head = effective.iter().any(|p| *p == "HEAD");
+    let want_head = effective.contains(&"HEAD");
     if want_head && !ref_names.iter().any(|n| n == "HEAD") {
         // HEAD's oid = the oid of head_target (if set).
         if let Some(head_ref) = snap.refs.iter().find(|r| r.name == snap.head_target) {
@@ -158,7 +159,7 @@ pub async fn create_bundle(
         if stats.objects == 0 {
             return Err(BundleError::NoNewObjects);
         }
-        return Ok(std::fs::metadata(out).map(|m| m.len()).unwrap_or(0));
+        return Ok(std::fs::metadata(out).map_or(0, |m| m.len()));
     }
     // Stock git: our own header + `pack-objects` WITHOUT `--thin`. `git bundle
     // create` always packs thin (deltas against the prerequisites' objects),
@@ -230,12 +231,12 @@ pub async fn create_bundle(
         "--stdout",
     ]
     .iter()
-    .map(|s| s.to_string())
+    .map(std::string::ToString::to_string)
     .collect();
     if let Some(f) = filter {
         po_args.push(format!("--filter={f}"));
     }
-    let po_args: Vec<&str> = po_args.iter().map(|s| s.as_str()).collect();
+    let po_args: Vec<&str> = po_args.iter().map(std::string::String::as_str).collect();
     let mut child = git(&po_args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -244,7 +245,10 @@ pub async fn create_bundle(
         .map_err(|e| BundleError::Io(e.to_string()))?;
     {
         use tokio::io::AsyncWriteExt;
-        let mut stdin = child.stdin.take().expect("stdin");
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| BundleError::Io("git pack-objects stdin was not piped".into()))?;
         stdin
             .write_all(revs.as_bytes())
             .await
@@ -262,12 +266,19 @@ pub async fn create_bundle(
             .await
             .map_err(|e| BundleError::Io(e.to_string()))?;
     }
-    let mut stdout = child.stdout.take().expect("stdout");
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| BundleError::Io("git pack-objects stdout was not piped".into()))?;
     let mut first = [0u8; 12];
     tokio::io::AsyncReadExt::read_exact(&mut stdout, &mut first)
         .await
         .map_err(|e| BundleError::Io(format!("pack header: {e}")))?;
-    let objects = u32::from_be_bytes([first[8], first[9], first[10], first[11]]);
+    let count_bytes: [u8; 4] = first
+        .get(8..12)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| BundleError::Other("pack header lacks an object count".into()))?;
+    let objects = u32::from_be_bytes(count_bytes);
     {
         use tokio::io::AsyncWriteExt;
         file.write_all(&first)
@@ -326,7 +337,10 @@ pub fn bundle_checksum_file(path: &std::path::Path) -> std::io::Result<String> {
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
+        let chunk = buf
+            .get(..n)
+            .ok_or_else(|| std::io::Error::other("read exceeded checksum buffer"))?;
+        hasher.update(chunk);
     }
     Ok(hex::encode(hasher.finalize()))
 }
@@ -531,13 +545,14 @@ impl LeaseGuard {
             .delete(&self.key, Some(self.version.clone()))
             .await
         {
-            Ok(()) => Ok(()),
-            Err(StoreError::PreconditionFailed { .. }) | Err(StoreError::NotFound { .. }) => Ok(()),
+            Ok(()) | Err(StoreError::PreconditionFailed { .. } | StoreError::NotFound { .. }) => {
+                Ok(())
+            }
             Err(e) => Err(e.into()),
         }
     }
 
-    /// CAS-extend the lease's expires_at (heartbeat).
+    /// CAS-extend the lease's `expires_at` (heartbeat).
     pub async fn heartbeat(&mut self, ttl: Duration) -> Result<(), BundleError> {
         let now = SystemTime::now();
         let expires = now + ttl;
@@ -615,8 +630,7 @@ pub async fn try_acquire_lease(
             let expired = existing
                 .expires_at
                 .as_ref()
-                .map(|t| time::to_system(t) <= now)
-                .unwrap_or(true);
+                .is_none_or(|t| time::to_system(t) <= now);
             if !expired {
                 return Ok(None);
             }
@@ -698,7 +712,7 @@ pub async fn hold_lease(
 /// What a bundle is cut for: a calendar slot with the ref state as of that
 /// slot (`snapshot`, WAL `seq`), or "now" (legacy: token = max(prev+1, now)).
 pub struct Cut {
-    /// Slot epoch seconds = creation_token (0 = no slot: token from `now`).
+    /// Slot epoch seconds = `creation_token` (0 = no slot: token from `now`).
     pub slot: u64,
     /// Ref state to cut from (None = the local copy's current refs).
     pub snapshot: Option<RefSnapshotData>,
@@ -724,7 +738,7 @@ pub async fn build_and_upload(
     // 1. Resolve refs (tips): the slot's ref state, or the local copy's.
     let snap = match &cut.snapshot {
         Some(s) => s.clone(),
-        None => local.refs().map_err(|e| BundleError::Git(e))?,
+        None => local.refs().map_err(BundleError::Git)?,
     };
     let (ref_names, tips) = filter_refs(&snap, ref_patterns);
     // A tip whose object this copy cannot resolve (a ref published ahead of a
@@ -796,7 +810,7 @@ pub async fn build_and_upload(
             build_span.record("bytes", s);
             build_span.record("outcome", "ok");
             metrics::histogram!("walgit_bundle_build_seconds", "strategy" => strategy_name.to_string(), "kind" => match kind { BundleKind::Full => "full", BundleKind::Incremental => "incremental" }).record(t_build.elapsed().as_secs_f64());
-            metrics::histogram!("walgit_bundle_build_bytes", "strategy" => strategy_name.to_string()).record(s as f64);
+            metrics::histogram!("walgit_bundle_build_bytes", "strategy" => strategy_name.to_string()).record(metric_u64(s));
             s
         }
         Err(BundleError::Git(GitError::Subprocess { stderr, .. }))
@@ -880,6 +894,13 @@ pub async fn build_and_upload(
     Ok(entry)
 }
 
+/// Metrics use `f64`; values beyond its exact integer range are still useful as
+/// approximate byte counts.
+#[allow(clippy::cast_precision_loss)]
+fn metric_u64(value: u64) -> f64 {
+    value as f64
+}
+
 /// Find the most recent bundle entry for `strategy` in `list`.
 pub fn last_for_strategy<'a>(list: &'a BundleList, strategy: &str) -> Option<&'a BundleEntry> {
     list.bundles
@@ -920,7 +941,7 @@ pub fn unchanged_since<'a>(
     (a == b).then_some(prev)
 }
 
-/// Max creation_token across all entries in `list` (0 if empty).
+/// Max `creation_token` across all entries in `list` (0 if empty).
 pub fn max_creation_token(list: &BundleList) -> u64 {
     list.bundles
         .iter()
@@ -934,7 +955,7 @@ pub async fn delete_pruned(store: &Prefixed, keys_to_delete: &[String]) {
     let span = tracing::info_span!("bundle.retention", pruned = keys_to_delete.len());
     delete_pruned_inner(store, keys_to_delete)
         .instrument(span)
-        .await
+        .await;
 }
 
 async fn delete_pruned_inner(store: &Prefixed, keys_to_delete: &[String]) {
@@ -954,46 +975,6 @@ pub fn pruned_diff(old: &BundleList, new: &BundleList) -> Vec<String> {
         .map(|b| b.key.clone())
         .filter(|k| !new_keys.contains(k.as_str()))
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rfc3339_compact_format() {
-        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        assert_eq!(rfc3339_compact(t), "20231114T221320Z");
-    }
-
-    #[test]
-    fn checksum_deterministic() {
-        let data = b"hello world";
-        let c1 = bundle_checksum(data);
-        let c2 = bundle_checksum(data);
-        assert_eq!(c1, c2);
-        assert_eq!(c1.len(), 40);
-    }
-
-    #[test]
-    fn bundle_key_format() {
-        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        assert_eq!(
-            bundle_key("weekly", t, "abc123"),
-            "bundles/weekly/20231114T221320Z-abc123.bundle"
-        );
-    }
-
-    #[test]
-    fn pattern_matching() {
-        assert!(matches_pattern("refs/heads/main", "refs/heads/*"));
-        assert!(matches_pattern("refs/heads/feature/x", "refs/heads/*"));
-        assert!(!matches_pattern("refs/tags/v1", "refs/heads/*"));
-        assert!(matches_pattern("HEAD", "HEAD"));
-        assert!(!matches_pattern("refs/heads/main", "HEAD"));
-        assert!(matches_pattern("refs/heads/main", "refs/heads/main"));
-        assert!(!matches_pattern("refs/heads/dev", "refs/heads/main"));
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1211,4 +1192,44 @@ pub(crate) async fn count_commits(
         .trim()
         .parse()
         .unwrap_or(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rfc3339_compact_format() {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        assert_eq!(rfc3339_compact(t), "20231114T221320Z");
+    }
+
+    #[test]
+    fn checksum_deterministic() {
+        let data = b"hello world";
+        let c1 = bundle_checksum(data);
+        let c2 = bundle_checksum(data);
+        assert_eq!(c1, c2);
+        assert_eq!(c1.len(), 40);
+    }
+
+    #[test]
+    fn bundle_key_format() {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        assert_eq!(
+            bundle_key("weekly", t, "abc123"),
+            "bundles/weekly/20231114T221320Z-abc123.bundle"
+        );
+    }
+
+    #[test]
+    fn pattern_matching() {
+        assert!(matches_pattern("refs/heads/main", "refs/heads/*"));
+        assert!(matches_pattern("refs/heads/feature/x", "refs/heads/*"));
+        assert!(!matches_pattern("refs/tags/v1", "refs/heads/*"));
+        assert!(matches_pattern("HEAD", "HEAD"));
+        assert!(!matches_pattern("refs/heads/main", "HEAD"));
+        assert!(matches_pattern("refs/heads/main", "refs/heads/main"));
+        assert!(!matches_pattern("refs/heads/dev", "refs/heads/main"));
+    }
 }

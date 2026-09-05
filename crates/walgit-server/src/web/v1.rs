@@ -329,7 +329,7 @@ struct RepoSummary {
 }
 
 /// `GET /{owner}/{repo}/api[-browser]` — one cheap, ref-level summary (SWR +
-/// ETag on the head sha). Counts are O(1) from the ref index.
+/// `ETag` on the head sha). Counts are O(1) from the ref index.
 async fn repo_summary(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -346,7 +346,7 @@ async fn repo_summary(
         None,
         move |r| async move {
             let head = r.index.head().map(|(name, sha)| RefInfo { name, sha });
-            let etag = etag_for(head.as_ref().map(|h| h.sha.as_str()).unwrap_or("unborn"));
+            let etag = etag_for(head.as_ref().map_or("unborn", |h| h.sha.as_str()));
             let full = format!("{o}/{n}");
             Ok(json_swr(
                 &RepoSummary {

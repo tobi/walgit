@@ -1,3 +1,12 @@
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(
+    clippy::panic,
+    clippy::string_slice,
+    clippy::unwrap_used,
+    clippy::field_reassign_with_default,
+    clippy::cast_sign_loss
+)]
+
 //! Integration tests for walgit-bundle: real upstream `git` + `MemoryStore`.
 //!
 //! These tests create bare repos via `LocalRepo::init`, push commits from a
@@ -18,8 +27,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use tokio::process::Command;
 
-use walgit_bundle::{BundleError, BundleRepoHandle, BundleSource, Bundler, RepoId, ops};
-use walgit_config::{BundleKind, BundleServe, BundleStrategy, BundlesConfig, Config};
+use walgit_bundle::{
+    BundleEngine, BundleError, BundleRepoHandle, BundleSource, Bundler, RepoId, ops,
+};
+use walgit_config::{BundleKind, BundleServe, BundleStrategy, BundlesConfig, ByteSize, Config};
 use walgit_git::{LocalRepo, ObjectFormat as GitObjectFormat};
 use walgit_store::{DynStore, ObjectStore, ObjectStoreExt, Prefixed, memory::MemoryStore};
 
@@ -96,7 +107,7 @@ impl TestRepo {
     }
 }
 
-/// Test BundleSource: holds one or more repos.
+/// Test `BundleSource`: holds one or more repos.
 struct TestSource {
     repos: HashMap<RepoId, (LocalRepo, Prefixed, Arc<AtomicU64>)>,
 }
@@ -127,7 +138,7 @@ impl BundleSource for TestSource {
             local: local.clone(),
             store: store.clone(),
             head_seq: head_seq.load(Ordering::Relaxed),
-            engine: Default::default(),
+            engine: BundleEngine::default(),
             cfg: None,
         })
     }
@@ -144,14 +155,13 @@ async fn run_git(cwd: &Path, args: &[&str]) -> String {
         .current_dir(cwd)
         .output()
         .await
-        .unwrap_or_else(|e| panic!("git {:?}: {e}", args));
-    if !output.status.success() {
-        panic!(
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+        .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
@@ -173,9 +183,9 @@ fn cfg_full_only(keep: usize) -> Config {
             chain: false,
         }],
         min_commits: 0,
-        min_bytes: Default::default(),
+        min_bytes: ByteSize::default(),
         serve_via: BundleServe::Proxy,
-        signed_url_ttl: Duration::from_secs(3600),
+        signed_url_ttl: Duration::from_hours(1),
         advertise: true,
         advertise_filtered: false,
         require: Vec::new(),
@@ -218,9 +228,9 @@ fn cfg_weekly_daily(keep_full: usize, keep_inc: usize) -> Config {
             },
         ],
         min_commits: 0,
-        min_bytes: Default::default(),
+        min_bytes: ByteSize::default(),
         serve_via: BundleServe::Proxy,
-        signed_url_ttl: Duration::from_secs(3600),
+        signed_url_ttl: Duration::from_hours(1),
         advertise: true,
         advertise_filtered: false,
         require: Vec::new(),
@@ -264,7 +274,7 @@ async fn get_refs(repo_path: &Path) -> Vec<String> {
         .await
         .unwrap();
     let s = String::from_utf8_lossy(&output.stdout);
-    let mut refs: Vec<String> = s.lines().map(|l| l.to_string()).collect();
+    let mut refs: Vec<String> = s.lines().map(std::string::ToString::to_string).collect();
     refs.sort();
     refs
 }
@@ -396,8 +406,7 @@ async fn incremental_has_prerequisites() {
         let oid = prereq_line[1..].split_whitespace().next().unwrap_or("");
         assert!(
             base_tips.contains(&oid),
-            "prerequisite {oid} should be in base tips {:?}",
-            base_tips
+            "prerequisite {oid} should be in base tips {base_tips:?}"
         );
     }
 }
@@ -555,7 +564,7 @@ async fn run_due_respects_schedule_and_lease() {
 
     let future2 = walgit_bundle::schedule::next_fire_after(&schedule, future).unwrap()
         + Duration::from_secs(1);
-    ops::hold_lease(&tr.store, "weekly", "test-holder", Duration::from_secs(60))
+    ops::hold_lease(&tr.store, "weekly", "test-holder", Duration::from_mins(1))
         .await
         .unwrap();
     let built5 = bundler.run_due(&id, future2).await.unwrap();
@@ -855,7 +864,7 @@ async fn min_commits_gate_skips_small_incrementals() {
     tr.advance_seq();
     match bundler.build(&id, "daily").await {
         Err(walgit_bundle::BundleError::TooSmall { commits, min }) => {
-            assert_eq!((commits, min), (2, 3))
+            assert_eq!((commits, min), (2, 3));
         }
         other => panic!("expected TooSmall, got {:?}", other.map(|e| e.id)),
     }

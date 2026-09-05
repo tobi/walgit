@@ -46,7 +46,7 @@ pub async fn run(action: RepoAction, cfg: &Arc<Config>) -> Result<()> {
                 println!("(no repositories)");
             } else {
                 for id in repos {
-                    println!("{}", id);
+                    println!("{id}");
                 }
             }
         }
@@ -58,8 +58,7 @@ pub async fn run(action: RepoAction, cfg: &Arc<Config>) -> Result<()> {
             let manifest = handle.manifest();
             let version = handle
                 .manifest_version()
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "(none)".into());
+                .map_or_else(|| "(none)".into(), |v| v.to_string());
 
             println_kv("repo", &id);
             println_kv("object_format", &manifest.object_format);
@@ -102,19 +101,19 @@ async fn policy(action: PolicyAction, store: &walgit_store::DynStore) -> Result<
     match action {
         PolicyAction::Get { repo } => {
             let id = repo_id(&repo)?;
-            let policy = policy::load(&store, &id).await?;
+            let policy = policy::load(store, &id).await?;
             println!("{}", serde_json::to_string_pretty(&policy)?);
         }
         PolicyAction::Set { repo, file } => {
             let id = repo_id(&repo)?;
             let bytes = std::fs::read(&file)?;
             let doc: RepoPolicy = serde_json::from_slice(&bytes)?;
-            policy::save(&store, &id, &doc).await?;
+            policy::save(store, &id, &doc).await?;
             info!(repo = %id, "policy saved");
         }
         PolicyAction::Clear { repo } => {
             let id = repo_id(&repo)?;
-            policy::clear(&store, &id).await?;
+            policy::clear(store, &id).await?;
             info!(repo = %id, "policy cleared");
         }
     }

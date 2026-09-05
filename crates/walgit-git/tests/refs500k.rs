@@ -1,3 +1,10 @@
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(
+    clippy::unwrap_used,
+    clippy::ignore_without_reason,
+    clippy::used_underscore_binding
+)]
+
 //! `cargo test -p walgit-git --test refs500k -- --ignored --nocapture`: the per-push ref
 //! bookkeeping at 500 k refs (AGENTS §1.4: cost must not scale with ref count on a hot path).
 use std::io::Write;
@@ -87,9 +94,13 @@ fn fixture(n_heads: usize, n_tags: usize) -> (tempfile::TempDir, LocalRepo) {
     names.sort();
     for n in &names {
         if n.starts_with("refs/tags/") {
-            packed.push_str(&format!("{tag} {n}\n^{c}\n"));
+            {
+                let _ = std::fmt::Write::write_fmt(&mut packed, format_args!("{tag} {n}\n^{c}\n"));
+            };
         } else {
-            packed.push_str(&format!("{c} {n}\n"));
+            {
+                let _ = std::fmt::Write::write_fmt(&mut packed, format_args!("{c} {n}\n"));
+            };
         }
     }
     std::fs::write(dir.join("packed-refs"), packed).unwrap();
@@ -111,7 +122,7 @@ fn txn(name: &str, old: &str, new: &str) -> walgit_proto::v1::RefTransaction {
 }
 
 #[test]
-#[ignore]
+#[ignore = "500k ref benchmark; run in test-slow tier"]
 fn push_bookkeeping_at_500k_refs() {
     let (_root, repo) = fixture(400_000, 100_000);
     let c2 = commit(repo.path(), "two");

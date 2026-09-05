@@ -1,3 +1,6 @@
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(clippy::unwrap_used, clippy::many_single_char_names)]
+
 mod common;
 
 use std::process::Command;

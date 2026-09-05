@@ -238,8 +238,7 @@ impl Remote {
             let entries = self.tree_entries(&cur).await?;
             let Some(e) = entries.into_iter().find(|e| e.name == seg.as_bytes()) else {
                 return Err(not_found(format!(
-                    "path '{}' does not exist in {}",
-                    path, commit
+                    "path '{path}' does not exist in {commit}"
                 )));
             };
             cur = e.oid;
@@ -248,8 +247,7 @@ impl Remote {
                 self.fault(&cur).await?;
             } else if i + 1 < segs.len() {
                 return Err(not_found(format!(
-                    "path '{}' does not exist in {}",
-                    path, commit
+                    "path '{path}' does not exist in {commit}"
                 )));
             } else if e.mode.is_blob() {
                 // blob: caller decides whether to fault (size check)
@@ -349,7 +347,7 @@ impl Remote {
                     .notice(format!("{label}: gave up after {budget} commits"));
                 break;
             }
-            if popped % 100 == 0 {
+            if popped.is_multiple_of(100) {
                 self.reporter
                     .bar(label.to_string(), popped as u64, None, "commits");
             }
@@ -366,13 +364,12 @@ impl Remote {
                 } else {
                     let mut treesame_parent = None;
                     for par in &meta.parents {
-                        let pm = match metas.get(par) {
-                            Some(m) => m.clone(),
-                            None => {
-                                let m = self.commit(par).await?;
-                                metas.insert(*par, m.clone());
-                                m
-                            }
+                        let pm = if let Some(m) = metas.get(par) {
+                            m.clone()
+                        } else {
+                            let m = self.commit(par).await?;
+                            metas.insert(*par, m.clone());
+                            m
                         };
                         let theirs = self.path_oid(&mut path_cache, pm.tree, p).await?;
                         if theirs == mine {
@@ -395,13 +392,12 @@ impl Remote {
             for par in follow {
                 if seen.insert(par) {
                     seq += 1;
-                    let pm = match metas.get(&par) {
-                        Some(m) => m.clone(),
-                        None => {
-                            let m = self.commit(&par).await?;
-                            metas.insert(par, m.clone());
-                            m
-                        }
+                    let pm = if let Some(m) = metas.get(&par) {
+                        m.clone()
+                    } else {
+                        let m = self.commit(&par).await?;
+                        metas.insert(par, m.clone());
+                        m
                     };
                     heap.push(Item(pm.commit_time, seq, par));
                 }

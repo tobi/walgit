@@ -1,3 +1,5 @@
+#![allow(clippy::format_collect)]
+
 mod common;
 
 use std::path::Path;
@@ -41,7 +43,7 @@ async fn ingest_pack_objects_present_fsck_ok() {
     assert!(ingested.object_count > 0);
     assert_eq!(
         ingested.pack_path.file_name().unwrap().to_string_lossy(),
-        format!("pack-{}.pack", checksum)
+        format!("pack-{checksum}.pack")
     );
 
     // Objects present.
@@ -232,17 +234,34 @@ async fn ingest_large_delta_pack() {
     );
     let mut stream = String::new();
     for i in 1..=2000 {
-        stream.push_str(&format!(
-            "commit refs/heads/main\nmark :{i}\nauthor bench <bench@example.com> {i} +0000\ncommitter bench <bench@example.com> {i} +0000\n"
-        ));
+        {
+            let _ = std::fmt::Write::write_fmt(
+                &mut stream,
+                format_args!(
+                    "commit refs/heads/main\nmark :{i}\nauthor bench <bench@example.com> {i} +0000\ncommitter bench <bench@example.com> {i} +0000\n"
+                ),
+            );
+        };
         let message = format!("commit {i}\n");
-        stream.push_str(&format!("data {}\n{}\n", message.len(), message));
+        {
+            let _ = std::fmt::Write::write_fmt(
+                &mut stream,
+                format_args!("data {}\n{}\n", message.len(), message),
+            );
+        };
         if i > 1 {
-            stream.push_str(&format!("from :{}\n", i - 1));
+            {
+                let _ = std::fmt::Write::write_fmt(&mut stream, format_args!("from :{}\n", i - 1));
+            };
         }
         stream.push_str("M 100644 inline file.txt\n");
         let content = format!("content {i} {}\n", "x".repeat(256));
-        stream.push_str(&format!("data {}\n{}\n", content.len(), content));
+        {
+            let _ = std::fmt::Write::write_fmt(
+                &mut stream,
+                format_args!("data {}\n{}\n", content.len(), content),
+            );
+        };
     }
     let mut fast_import = Command::new("git")
         .current_dir(source.path())
@@ -276,7 +295,7 @@ async fn ingest_large_delta_pack() {
         out.stdout
     };
     assert!(full.starts_with(b"PACK"));
-    let expected_count = u32::from_be_bytes(full[8..12].try_into().unwrap()) as u64;
+    let expected_count = u64::from(u32::from_be_bytes(full[8..12].try_into().unwrap()));
 
     let full_root = tempfile::TempDir::new().unwrap();
     let full_repo = LocalRepo::init(
@@ -409,15 +428,14 @@ async fn ingest_failures_name_the_cause_and_leave_nothing_behind() {
         max_bytes,
         thin,
     };
-    let pack_count = || repo.packs().map(|p| p.len()).unwrap_or(0);
+    let pack_count = || repo.packs().map_or(0, |p| p.len());
 
     // 1. Oversize: refused while streaming, before index-pack ever runs.
     let full = src.pack(&[b.as_str()], &[], false);
     let err = repo
         .ingest_pack(cm::cursor(full.clone()), opts(false, Some(64)))
         .await
-        .err()
-        .expect("too big");
+        .expect_err("too big");
     assert!(err.to_string().contains("max_bytes 64"), "{err}");
     assert_eq!(pack_count(), 0);
 
@@ -428,8 +446,7 @@ async fn ingest_failures_name_the_cause_and_leave_nothing_behind() {
     let err = repo
         .ingest_pack(cm::cursor(corrupt), opts(false, None))
         .await
-        .err()
-        .expect("corrupt");
+        .expect_err("corrupt");
     let s = err.to_string();
     assert!(
         s.contains("index-pack")
@@ -452,8 +469,7 @@ async fn ingest_failures_name_the_cause_and_leave_nothing_behind() {
     let err = repo
         .ingest_pack(cm::cursor(thin.clone()), opts(true, None))
         .await
-        .err()
-        .expect("no base");
+        .expect_err("no base");
     assert!(err.to_string().contains("index-pack"), "{err}");
     assert_eq!(pack_count(), 0);
 
@@ -461,8 +477,7 @@ async fn ingest_failures_name_the_cause_and_leave_nothing_behind() {
     let err = repo
         .ingest_pack(cm::cursor(thin), opts(false, None))
         .await
-        .err()
-        .expect("thin without fix-thin");
+        .expect_err("thin without fix-thin");
     assert!(err.to_string().contains("index-pack"), "{err}");
     assert_eq!(pack_count(), 0);
 
@@ -472,8 +487,7 @@ async fn ingest_failures_name_the_cause_and_leave_nothing_behind() {
     let err = repo
         .ingest_pack(cm::cursor(pack.clone()), opts(false, None))
         .await
-        .err()
-        .expect("fsck");
+        .expect_err("fsck");
     assert!(err.to_string().contains("index-pack"), "{err}");
     assert_eq!(pack_count(), 0);
     // …and accepted with fsck off (the knob is `wal.fsck_objects`).

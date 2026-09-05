@@ -4,6 +4,7 @@
 mod harness;
 
 use harness::{Server, git, git_in};
+use std::collections::HashMap;
 
 /// Every await is bounded so a hang names the step instead of stalling CI.
 macro_rules! step {
@@ -16,6 +17,8 @@ macro_rules! step {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pass_checkpoints_due_repos_refs_level_and_reports_tasks() -> anyhow::Result<()> {
+    use walgit_server::maintain::{Unit, next_unit, run_pass};
+
     // Writer front: count trigger off, so nothing auto-checkpoints on push.
     let front = step!("start front", Server::start())?;
     step!("put repo", front.put_repo("o", "r"))?;
@@ -111,7 +114,6 @@ async fn pass_checkpoints_due_repos_refs_level_and_reports_tasks() -> anyhow::Re
     // not due), one unit per pass, next pass moves to the daily chain, and a
     // re-run after everything is built is idempotent (Idle).
     let id = walgit_git::RepoId::new("o", "r")?;
-    use walgit_server::maintain::{Unit, next_unit, run_pass};
     assert!(
         matches!(step!("unit 1", next_unit(&bundler.state, &id))?, Unit::BundleSlot(ref s, _) if s == "weekly")
     );
@@ -277,7 +279,7 @@ async fn fsck_unit_records_missing_objects_and_repair_unit_fetches_them_from_ups
             c.maintenance.checkpoints = false;
             c.compaction.enabled = false;
             c.bundles.enabled = false;
-            c.maintenance.fsck_interval = std::time::Duration::from_secs(3600);
+            c.maintenance.fsck_interval = std::time::Duration::from_hours(1);
         })
     )?;
     step!("put repo", server.put_repo("o", "r"))?;
@@ -357,7 +359,7 @@ async fn fsck_unit_records_missing_objects_and_repair_unit_fetches_them_from_ups
     };
     step!(
         "move main",
-        h.publish_push_synced(None, txn, Default::default())
+        h.publish_push_synced(None, txn, HashMap::default())
     )?;
 
     // Pass 1: the audit (never audited) → fsck.pb lists the blob; the unit succeeds (a finding, not a failure).
@@ -522,7 +524,7 @@ async fn connectivity_failure_is_reported_per_ref_not_as_remote_failure() -> any
     };
     step!(
         "advertise x",
-        h.publish_push_synced(None, txn, Default::default())
+        h.publish_push_synced(None, txn, HashMap::default())
     )?;
     // A new commit on top whose tree still references the missing blob (b.txt
     // unchanged): git sends commit 3 + its root tree, the server walks into b.txt.
@@ -732,11 +734,7 @@ async fn bundle_list_shows_a_bundle_right_after_this_host_builds_it() -> anyhow:
         .await
         .map_err(|_| anyhow::anyhow!("op start failed"))?;
     assert!(t.wait_done(std::time::Duration::from_secs(30)).await);
-    assert!(
-        t.outcome().map(|o| o.is_ok()).unwrap_or(false),
-        "{:?}",
-        t.outcome()
-    );
+    assert!(t.outcome().is_some_and(|o| o.is_ok()), "{:?}", t.outcome());
     let list2 = step!("list 2", server.get_text("/o/r.git/bundles/list", &[]))?;
     assert!(
         list2.contains("[bundle \"daily-"),
@@ -797,7 +795,7 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
             c.maintenance.fsck_interval = std::time::Duration::ZERO;
             // weekly (full) + hourly on weekly: the closed hours since the weekly are empty.
             c.bundles.strategy.retain(|s| s.name != "daily");
-            for s in c.bundles.strategy.iter_mut() {
+            for s in &mut c.bundles.strategy {
                 if s.name == "hourly" {
                     s.base = Some("weekly".into());
                     s.backfill_max = 0;
@@ -838,7 +836,7 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
         .clone();
     let sunday = walgit_bundle::slots::last_slot_at_or_before(
         &weekly,
-        now - std::time::Duration::from_secs(36 * 3600),
+        now - std::time::Duration::from_hours(36),
     )?
     .unwrap();
     let mut params = std::collections::HashMap::new();
@@ -1020,7 +1018,7 @@ async fn weekly_slot_rebuilds_the_base_then_composes_it_on_an_ssd_maintainer() -
     };
     step!(
         "import refs",
-        h.publish_push_synced(None, txn, Default::default())
+        h.publish_push_synced(None, txn, HashMap::default())
     )?;
     step!("sync after base", h.sync())?;
     std::fs::write(src.path().join("g.txt"), "two\n")?;
@@ -1172,12 +1170,12 @@ async fn weekly_slot_rebuilds_the_base_then_composes_it_on_an_ssd_maintainer() -
         "the base is the biggest tier-2 pack, not the newest"
     );
     let next_weekly =
-        walgit_bundle::slots::from_epoch(weekly.slot) + std::time::Duration::from_secs(7 * 86400);
+        walgit_bundle::slots::from_epoch(weekly.slot) + std::time::Duration::from_hours(168);
     let up = walgit_server::maintain::upcoming(
         &h,
         &h.effective_config(),
         &walgit_server::maintain::heartbeats(&server.state).await?,
-        next_weekly - std::time::Duration::from_secs(60),
+        next_weekly - std::time::Duration::from_mins(1),
     )
     .await;
     let w = up
@@ -1299,7 +1297,7 @@ async fn maintainer_builds_and_publishes_missing_rev_indexes() -> anyhow::Result
     let task = walgit_server::ops::start(server.state.clone(), id.clone(), "rev-index", params)
         .await
         .map_err(|_| anyhow::anyhow!("rev-index op did not start"))?;
-    assert!(task.wait_done(std::time::Duration::from_secs(60)).await);
+    assert!(task.wait_done(std::time::Duration::from_mins(1)).await);
     assert!(
         matches!(task.outcome(), Some(Ok(_))),
         "{:?}",
@@ -1366,7 +1364,7 @@ async fn identical_incremental_slots_are_skipped_as_unchanged() -> anyhow::Resul
             c.maintenance.checkpoints = false;
             c.maintenance.fsck_interval = std::time::Duration::ZERO;
             c.bundles.strategy.retain(|s| s.name != "daily");
-            for s in c.bundles.strategy.iter_mut() {
+            for s in &mut c.bundles.strategy {
                 if s.name == "hourly" {
                     s.base = Some("weekly".into());
                     s.backfill_max = 0;
@@ -1394,7 +1392,7 @@ async fn identical_incremental_slots_are_skipped_as_unchanged() -> anyhow::Resul
     let id = walgit_git::RepoId::new("o", "r")?;
     let h = step!("open", server.state.registry.open(&id))?;
     let now = std::time::SystemTime::now();
-    let hour = std::time::Duration::from_secs(3600);
+    let hour = std::time::Duration::from_hours(1);
     // History with explicit times: c1 ten days ago (so a weekly slot with state
     // exists — a full with no state is cut from now), c2 six hours ago, nothing since.
     let pack_of = |revs: &str| -> anyhow::Result<Vec<u8>> {
@@ -1436,7 +1434,7 @@ async fn identical_incremental_slots_are_skipped_as_unchanged() -> anyhow::Resul
         h.publish_push_at(
             Some(p1),
             txn("refs/heads/main", "", &c1),
-            Default::default(),
+            HashMap::default(),
             now - 240 * hour
         )
     )?;
@@ -1446,7 +1444,7 @@ async fn identical_incremental_slots_are_skipped_as_unchanged() -> anyhow::Resul
         h.publish_push_at(
             Some(p2),
             txn("refs/heads/main", &c1, &c2),
-            Default::default(),
+            HashMap::default(),
             now - 6 * hour
         )
     )?;
@@ -1679,7 +1677,7 @@ async fn blobless_bundle_family_is_composed_from_the_history_pack_and_served_on_
     };
     step!(
         "import refs",
-        h.publish_push_synced(None, txn, Default::default())
+        h.publish_push_synced(None, txn, HashMap::default())
     )?;
     std::fs::write(src.path().join("f2.txt"), "one and a half\n")?;
     git_in(src.path(), &["add", "."])?;
@@ -1897,7 +1895,7 @@ async fn maintainer_pass_brings_an_overgrown_bundle_list_to_retention() -> anyho
             c.server.roles = vec![walgit_config::Role::Serve, walgit_config::Role::Maintain];
             c.bundles.enabled = true;
             // The D21 shape this test pins (the default chains the dailies since 2026-08-22).
-            for s in c.bundles.strategy.iter_mut() {
+            for s in &mut c.bundles.strategy {
                 s.chain = false;
             }
         })

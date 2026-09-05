@@ -110,7 +110,7 @@ impl Upstream {
         match result {
             Ok(m) => m,
             Err(error) => {
-                tracing::warn!(%error, elapsed_ms = started.elapsed().as_millis() as u64, "lfs upstream batch failed; treating as absent");
+                tracing::warn!(%error, elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX), "lfs upstream batch failed; treating as absent");
                 HashMap::new()
             }
         }

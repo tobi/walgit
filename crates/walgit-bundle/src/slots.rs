@@ -1,3 +1,4 @@
+#![allow(clippy::doc_lazy_continuation)]
 //! Calendar-slot scheduling with backfill.
 //!
 //! A strategy's cron expression defines **slots** (its fire times). Each
@@ -64,9 +65,7 @@ pub struct SlotPlan {
 }
 
 pub fn epoch(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 pub fn from_epoch(s: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(s)
@@ -106,7 +105,7 @@ pub fn slot_closed(_strategy: &BundleStrategy, slot: u64, now: SystemTime) -> bo
 }
 
 /// Clock-skew margin before a slot's verdict is treated as final.
-pub const SLOT_CLOSE_GRACE: Duration = Duration::from_secs(120);
+pub const SLOT_CLOSE_GRACE: Duration = Duration::from_mins(2);
 
 /// The newest slot of `strategy` at or before `t` (its most recent fire ≤ t).
 pub fn last_slot_at_or_before(
@@ -146,8 +145,7 @@ pub fn base_for_slot<'a>(
 ) -> Option<&'a BundleEntry> {
     entries_of(list, strategy)
         .into_iter()
-        .filter(|b| b.creation_token <= slot)
-        .last()
+        .rfind(|b| b.creation_token <= slot)
 }
 
 /// The base bundle of an incremental at `slot`, **up the chain**: the newest
@@ -205,8 +203,7 @@ pub fn base_for_incremental<'a>(
     }
     let own = entries_of(list, &strat.name)
         .into_iter()
-        .filter(|b| b.creation_token < at)
-        .last();
+        .rfind(|b| b.creation_token < at);
     // `>=`: at a tie (Sunday's daily and the weekly fire at the same instant, so their tips are the
     // same objects) the chain continues through its own link. A fresh clone has the weekly's objects
     // and therefore that link's prerequisites; a stale client walks daily → daily straight across
@@ -249,7 +246,7 @@ fn chain_up<'a>(cfg: &'a BundlesConfig, base: &'a str) -> Vec<&'a str> {
 /// What the planner knows about the repository and this host.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlanContext {
-    /// Earliest WAL state (created_at of the first entry / checkpoint); slots
+    /// Earliest WAL state (`created_at` of the first entry / checkpoint); slots
     /// before it are `Unavailable`. None = unknown → never unavailable.
     pub first_state: Option<SystemTime>,
     /// Whether this host can cut a **full** bundle for the repo (a compose of
@@ -291,7 +288,7 @@ pub fn plan_with(
     let mut rows = Vec::new();
     for strat in &cfg.strategy {
         let built = entries_of(list, &strat.name);
-        let (anchor_excl, _): (SystemTime, ()) = match strat.kind {
+        let (anchor_excl, ()): (SystemTime, ()) = match strat.kind {
             BundleKind::Full => match built.last() {
                 // Newest built full: everything after it is a candidate.
                 Some(b) => (from_epoch(b.creation_token), ()),
@@ -322,8 +319,7 @@ pub fn plan_with(
                             .iter()
                             .rev()
                             .nth(1)
-                            .map(|prev| prev.creation_token)
-                            .unwrap_or(b.creation_token);
+                            .map_or(b.creation_token, |prev| prev.creation_token);
                         (from_epoch(oldest_relevant), ())
                     }
                     _ => {
@@ -373,11 +369,7 @@ pub fn plan_with(
             // earliest state (for a large repository, the import) — that is what "weekly =
             // import state" means; later slots are as-of by construction.
             let first_full = strat.kind == BundleKind::Full && built.is_empty();
-            let unavailable = !first_full
-                && ctx
-                    .first_state
-                    .map(|t| from_epoch(slot) < t)
-                    .unwrap_or(false);
+            let unavailable = !first_full && ctx.first_state.is_some_and(|t| from_epoch(slot) < t);
             let skipped = list.skipped.iter().find(|k| {
                 k.strategy == strat.name
                     && k.slot == slot
@@ -402,7 +394,6 @@ pub fn plan_with(
                             .unwrap_or("full bundles need the base pack locally (ssd host)")
                             .into(),
                     ),
-                    BundleKind::Full => SlotStatus::Missing,
                     BundleKind::Incremental if base_id.is_none() => {
                         SlotStatus::Blocked("no base bundle at or before this slot".into())
                     }
@@ -411,7 +402,7 @@ pub fn plan_with(
                             .unwrap_or("the serving copy does not fit this host")
                             .into(),
                     ),
-                    BundleKind::Incremental => SlotStatus::Missing,
+                    BundleKind::Full | BundleKind::Incremental => SlotStatus::Missing,
                 },
             };
             rows.push(SlotPlan {
@@ -451,9 +442,7 @@ pub fn chain_window(cfg: &BundlesConfig, strat: &BundleStrategy) -> usize {
     let Some(b2) = crate::schedule::next_fire_after(&bs, b1) else {
         return usize::MAX;
     };
-    slots_between(strat, b1, b2)
-        .map(|v| v.len())
-        .unwrap_or(usize::MAX)
+    slots_between(strat, b1, b2).map_or(usize::MAX, |v| v.len())
 }
 
 /// How many bundles of an incremental strategy stay listed: the newest, and the one
@@ -522,18 +511,14 @@ pub fn retain(cfg: &BundlesConfig, list: &mut BundleList) -> Vec<String> {
             let in_group: Vec<&BundleEntry> =
                 v.iter().copied().filter(|b| group_of(b) == g).collect();
             if strat.chain {
-                let base_newest = strat
-                    .base
-                    .as_deref()
-                    .map(|n| {
-                        entries_of(list, n)
-                            .into_iter()
-                            .filter(|b| keep.contains(&b.id) && group_of(b) == g)
-                            .map(|b| b.creation_token)
-                            .max()
-                            .unwrap_or(0)
-                    })
-                    .unwrap_or(0);
+                let base_newest = strat.base.as_deref().map_or(0, |n| {
+                    entries_of(list, n)
+                        .into_iter()
+                        .filter(|b| keep.contains(&b.id) && group_of(b) == g)
+                        .map(|b| b.creation_token)
+                        .max()
+                        .unwrap_or(0)
+                });
                 // Oldest first so a link's base (the previous link) is decided before it. The first
                 // link of a group may point at a pruned link of the previous group (Monday on Sunday's
                 // daily): its prerequisites are the group's full's tips, so it stays while the full does.
@@ -597,7 +582,7 @@ mod tests {
     /// The D21 shape (every incremental on its base): what the two-newest tests below pin.
     fn cfg() -> BundlesConfig {
         let mut c = BundlesConfig::default();
-        for s in c.strategy.iter_mut() {
+        for s in &mut c.strategy {
             s.chain = false;
         }
         c
@@ -614,7 +599,7 @@ mod tests {
     }
     fn t(s: &str) -> SystemTime {
         let dt = chrono::DateTime::parse_from_rfc3339(s).unwrap();
-        from_epoch(dt.timestamp() as u64)
+        from_epoch(dt.timestamp().max(0).unsigned_abs())
     }
     fn entry(strategy: &str, slot: u64, base_id: &str) -> BundleEntry {
         BundleEntry {
@@ -951,8 +936,8 @@ mod tests {
             .push(entry("hourly", h2, &format!("hourly-{h1}")));
         let pruned = retain(&c, &mut list);
         let mut kept: Vec<&str> = list.bundles.iter().map(|b| b.id.as_str()).collect();
-        kept.sort();
-        let mut want = vec![
+        kept.sort_unstable();
+        let mut want = [
             format!("weekly-{w1}"),
             format!("daily-{}", ds[0]),
             format!("daily-{}", ds[1]),

@@ -1,3 +1,4 @@
+#![allow(clippy::many_single_char_names)]
 //! `/api/v1` (D20): the versioned programmatic surface, its browser-lane alias
 //! (`/api-browser`), CORS for foreign origins, discovery, `me`, repo summary and
 //! admin, and the SDK artefact route.

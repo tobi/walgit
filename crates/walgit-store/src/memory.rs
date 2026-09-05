@@ -63,7 +63,9 @@ impl MemoryStore {
 async fn body_bytes(body: PutBody) -> Result<Bytes> {
     Ok(match body {
         PutBody::Bytes(b) => b,
-        PutBody::Stream { len, stream } => util::collect(stream, len as usize).await?,
+        PutBody::Stream { len, stream } => {
+            util::collect(stream, usize::try_from(len).map_err(StoreError::other)?).await?
+        }
         PutBody::File(p) => Bytes::from(tokio::fs::read(&p).await.map_err(StoreError::other)?),
     })
 }
@@ -115,8 +117,8 @@ impl ObjectStore for MemoryStore {
         let size = data.len() as u64;
         let slice = match &opts.range {
             Some(r) => {
-                let start = r.start.min(size) as usize;
-                let end = r.end.min(size) as usize;
+                let start = usize::try_from(r.start.min(size)).map_err(StoreError::other)?;
+                let end = usize::try_from(r.end.min(size)).map_err(StoreError::other)?;
                 if start > end {
                     return Err(StoreError::InvalidArgument(format!(
                         "bad range {r:?} for size {size}"
@@ -151,8 +153,7 @@ impl ObjectStore for MemoryStore {
         let mut g = self.objects.lock();
         let current = g.get(key).map(|(v, _)| v.clone());
         match (&opts.mode, &current) {
-            (PutMode::Overwrite, _) => {}
-            (PutMode::Create, None) => {}
+            (PutMode::Overwrite, _) | (PutMode::Create, None) => {}
             (PutMode::Create, Some(v)) => {
                 return Err(StoreError::PreconditionFailed {
                     key: key.into(),
@@ -245,8 +246,9 @@ impl ObjectStore for MemoryStore {
             .range(prefix.to_owned()..)
             .take_while(|(k, _)| k.starts_with(prefix))
             .filter_map(|(k, _)| {
-                let rest = &k[prefix.len()..];
-                rest.find('/').map(|i| format!("{prefix}{}/", &rest[..i]))
+                let rest = k.strip_prefix(prefix)?;
+                rest.split_once('/')
+                    .map(|(head, _)| format!("{prefix}{head}/"))
             })
             .collect();
         out.dedup();

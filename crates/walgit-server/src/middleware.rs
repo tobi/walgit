@@ -86,8 +86,10 @@ pub async fn request_id(
         .get(REQUEST_ID_HEADER)
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+        .map_or_else(
+            || Uuid::new_v4().to_string(),
+            std::string::ToString::to_string,
+        );
     if let Ok(hv) = HeaderValue::from_str(&id) {
         req.headers_mut().insert(REQUEST_ID_HEADER, hv);
     }

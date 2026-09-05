@@ -26,7 +26,7 @@ pub fn record(
     warn_after: Duration,
 ) {
     metrics::histogram!("walgit_lock_wait_seconds", "lock" => lock).record(waited.as_secs_f64());
-    let ms = waited.as_millis() as u64;
+    let ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
     {
         let mut s = STATS.lock();
         match s.iter_mut().find(|(l, _, _)| *l == lock) {

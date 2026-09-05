@@ -51,7 +51,7 @@ pub async fn run(
         if once {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        tokio::time::sleep(std::time::Duration::from_mins(1)).await;
     }
     Ok(())
 }
@@ -82,7 +82,12 @@ async fn compact_one(
         // The weekly bundle is composed from this base with the refs at its
         // seq: write the checkpoint now so `walgit bundle compose` finds them.
         let cp = handle.write_checkpoint().await?;
-        summary.push_str(&format!("; checkpoint at seq {}", cp.seq));
+        {
+            let _ = std::fmt::Write::write_fmt(
+                &mut summary,
+                format_args!("; checkpoint at seq {}", cp.seq),
+            );
+        };
     }
     Ok(summary)
 }

@@ -86,7 +86,11 @@ impl From<CommitMeta> for Commit {
         let (body, trailers) = super::trailers::split_trailers(&m.body);
         Commit {
             sha: m.id.to_string(),
-            parents: m.parents.iter().map(|p| p.to_string()).collect(),
+            parents: m
+                .parents
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             author: m.author,
             author_email: m.author_email,
             author_date: m.author_date,
@@ -239,7 +243,7 @@ pub struct Repo {
     pub(crate) index: Arc<RefIndex>,
     handle: Arc<RepoHandle>,
     access: ObjectAccess,
-    /// Whether objects are readable (Need::Objects satisfied).
+    /// Whether objects are readable (`Need::Objects` satisfied).
     objects: bool,
     reporter: Reporter,
     /// Shared render cache (object store) — set for remotely served repos.
@@ -375,18 +379,17 @@ where
             metrics::counter!("walgit_api_immutable_hit", "tier" => "memory").increment(1);
             return Ok(Rendered::json(hit, IMMUTABLE, None).into_response(headers));
         }
-        if slow && st.cfg.cache.shared_render_cache {
-            if let Ok(walgit_store::GetResult::Object { body, meta }) = handle
+        if slow
+            && st.cfg.cache.shared_render_cache
+            && let Ok(walgit_store::GetResult::Object { body, meta }) = handle
                 .store()
                 .get(&shared_key(key), GetOptions::default())
                 .await
-            {
-                if let Ok(b) = walgit_store::util::collect(body, meta.size as usize).await {
-                    metrics::counter!("walgit_api_immutable_hit", "tier" => "store").increment(1);
-                    st.caches.api_immutable.insert(key.clone(), b.clone());
-                    return Ok(Rendered::json(b, IMMUTABLE, None).into_response(headers));
-                }
-            }
+            && let Ok(b) = walgit_store::util::collect(body, meta.size as usize).await
+        {
+            metrics::counter!("walgit_api_immutable_hit", "tier" => "store").increment(1);
+            st.caches.api_immutable.insert(key.clone(), b.clone());
+            return Ok(Rendered::json(b, IMMUTABLE, None).into_response(headers));
         }
     }
     if slow && crate::sse::wants_sse(headers) {
@@ -511,7 +514,7 @@ async fn refs(
         None,
         |r| async move {
             let head = r.index.head().map(|(name, sha)| RefInfo { name, sha });
-            let etag = etag_for(head.as_ref().map(|h| h.sha.as_str()).unwrap_or("unborn"));
+            let etag = etag_for(head.as_ref().map_or("unborn", |h| h.sha.as_str()));
             Ok(json_swr(&Refs { head }, Some(&etag)))
         },
     )
@@ -542,7 +545,7 @@ async fn ref_list(
     let needle =
         q.q.as_deref()
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_ascii_lowercase());
+            .map(str::to_ascii_lowercase);
     let after = q.after.as_deref().unwrap_or("");
     // Byte-sorted: skip straight to the first candidate (> after, >= prefix).
     let lower = match &prefix {
@@ -555,15 +558,15 @@ async fn ref_list(
     let mut refs = Vec::with_capacity(n.min(256));
     let mut more = false;
     for (name, sha) in &list[start..] {
-        if let Some(p) = &prefix {
-            if !name.starts_with(p.as_str()) {
-                break; // sorted: no further names share the prefix
-            }
+        if let Some(p) = &prefix
+            && !name.starts_with(p.as_str())
+        {
+            break; // sorted: no further names share the prefix
         }
-        if let Some(nd) = &needle {
-            if !name.to_ascii_lowercase().contains(nd.as_str()) {
-                continue;
-            }
+        if let Some(nd) = &needle
+            && !name.to_ascii_lowercase().contains(nd.as_str())
+        {
+            continue;
         }
         if refs.len() == n {
             more = true;
@@ -646,15 +649,15 @@ async fn resolve_rest(r: &Repo, rest: &str) -> Result<Resolved, ApiError> {
 
 /// Resolve a single revision name (no path): branch, tag, then git rev-parse.
 async fn resolve_name(r: &Repo, name: &str) -> Result<Resolved, ApiError> {
-    if name.is_empty() || name == "HEAD" {
-        if let Some((n, sha)) = r.index.head() {
-            return Ok(Resolved {
-                ref_name: n,
-                sha,
-                path: String::new(),
-                kind: "branch",
-            });
-        }
+    if (name.is_empty() || name == "HEAD")
+        && let Some((n, sha)) = r.index.head()
+    {
+        return Ok(Resolved {
+            ref_name: n,
+            sha,
+            path: String::new(),
+            kind: "branch",
+        });
     }
     if let Some(sha) = r.index.branch(name) {
         return Ok(Resolved {
@@ -750,7 +753,7 @@ async fn resolve_impl(
 }
 
 /// Split `{ref}/{path}` for tree/blob: a leading full sha is taken verbatim
-/// (immutable response); otherwise §3 resolution (SWR + ETag).
+/// (immutable response); otherwise §3 resolution (SWR + `ETag`).
 fn split_addr(rest: &str) -> Option<(Resolved, bool)> {
     let rest = rest.trim_matches('/');
     let (first, path) = match rest.split_once('/') {
@@ -850,10 +853,8 @@ async fn tree(
         move |r| async move {
             let (res, immutable) = resolve_addr(&r, &rest).await?;
             let key = tree_key(&r.id, &res.sha, &res.path);
-            if immutable {
-                if let Some(hit) = st2.caches.api_immutable.get(&key) {
-                    return Ok(Rendered::json(hit, IMMUTABLE, None));
-                }
+            if immutable && let Some(hit) = st2.caches.api_immutable.get(&key) {
+                return Ok(Rendered::json(hit, IMMUTABLE, None));
             }
             let body = match r.remote() {
                 Some(remote) => render_tree_remote(&remote, &res).await?,
@@ -914,16 +915,14 @@ async fn render_tree(
         .ok()
         .and_then(|b| parse_commits(&b).into_iter().next());
     let mut readme = None;
-    if let Some(e) = readme_entry(&entries) {
-        if let Ok(content) = git(local, vec!["cat-file".into(), "blob".into(), e.sha.clone()]).await
-        {
-            if let Ok(s) = String::from_utf8(content) {
-                readme = Some(Readme {
-                    name: e.name.clone(),
-                    contents: s,
-                });
-            }
-        }
+    if let Some(e) = readme_entry(&entries)
+        && let Ok(content) = git(local, vec!["cat-file".into(), "blob".into(), e.sha.clone()]).await
+        && let Ok(s) = String::from_utf8(content)
+    {
+        readme = Some(Readme {
+            name: e.name.clone(),
+            contents: s,
+        });
     }
     Ok(json_bytes(&Tree {
         ref_name: res.ref_name.clone(),
@@ -977,7 +976,7 @@ async fn render_tree_remote(remote: &Remote, res: &Resolved) -> Result<bytes::By
     }
     let raw = remote.tree_entries(&target).await?;
     let total = raw.len();
-    let entries: Vec<TreeEntry> = futures::stream::iter(raw.into_iter())
+    let entries: Vec<TreeEntry> = futures::stream::iter(raw)
         .map(|e| async move {
             let kind = match e.mode.kind() {
                 gix_object::tree::EntryKind::Tree => "tree",
@@ -990,8 +989,7 @@ async fn render_tree_remote(remote: &Remote, res: &Resolved) -> Result<bytes::By
                     .await
                     .ok()
                     .flatten()
-                    .map(|(_, s)| s as i64)
-                    .unwrap_or(-1)
+                    .map_or(-1, |(_, s)| s as i64)
             } else {
                 -1
             };
@@ -1016,17 +1014,15 @@ async fn render_tree_remote(remote: &Remote, res: &Resolved) -> Result<bytes::By
         .await?
         .map(Commit::from);
     let mut readme = None;
-    if let Some(e) = readme_entry(&entries) {
-        if let Ok(oid) = gix_hash::ObjectId::from_hex(e.sha.as_bytes()) {
-            if let Ok(o) = remote.get(&oid).await {
-                if let Ok(s) = String::from_utf8(o.data.to_vec()) {
-                    readme = Some(Readme {
-                        name: e.name.clone(),
-                        contents: s,
-                    });
-                }
-            }
-        }
+    if let Some(e) = readme_entry(&entries)
+        && let Ok(oid) = gix_hash::ObjectId::from_hex(e.sha.as_bytes())
+        && let Ok(o) = remote.get(&oid).await
+        && let Ok(s) = String::from_utf8(o.data.to_vec())
+    {
+        readme = Some(Readme {
+            name: e.name.clone(),
+            contents: s,
+        });
     }
     Ok(json_bytes(&Tree {
         ref_name: res.ref_name.clone(),
@@ -1094,46 +1090,42 @@ async fn blob(
                 return Err(not_found("blob path"));
             }
             let name = res.path.rsplit('/').next().unwrap_or(&res.path).to_string();
-            let (size, bytes): (i64, Option<Vec<u8>>) = match r.remote() {
-                Some(remote) => {
-                    let sha = gix_hash::ObjectId::from_hex(res.sha.as_bytes())
-                        .map_err(|_| not_found("revision"))?;
-                    remote
-                        .reporter
-                        .notice(format!("Reading {} from the WAL pack set", res.path));
-                    let (_c, target, mode) = remote.fault_path(&sha, &res.path).await?;
-                    if !mode.is_blob_or_symlink() {
-                        return Err(not_found(format!("'{}' is not a file", res.path)));
-                    }
-                    let (_, size) = remote
-                        .kind_and_size(&target)
-                        .await?
-                        .ok_or_else(|| not_found("blob"))?;
-                    if size as usize > MAX_BLOB {
-                        (size as i64, None)
-                    } else {
-                        let o = remote.get(&target).await?;
-                        (size as i64, Some(o.data.to_vec()))
-                    }
+            let (size, bytes): (i64, Option<Vec<u8>>) = if let Some(remote) = r.remote() {
+                let sha = gix_hash::ObjectId::from_hex(res.sha.as_bytes())
+                    .map_err(|_| not_found("revision"))?;
+                remote
+                    .reporter
+                    .notice(format!("Reading {} from the WAL pack set", res.path));
+                let (_c, target, mode) = remote.fault_path(&sha, &res.path).await?;
+                if !mode.is_blob_or_symlink() {
+                    return Err(not_found(format!("'{}' is not a file", res.path)));
                 }
-                None => {
-                    let bytes = git(
-                        &r.local,
-                        vec![
-                            "cat-file".into(),
-                            "blob".into(),
-                            format!("{}:{}", res.sha, res.path),
-                        ],
-                    )
-                    .await?;
-                    (bytes.len() as i64, Some(bytes))
+                let (_, size) = remote
+                    .kind_and_size(&target)
+                    .await?
+                    .ok_or_else(|| not_found("blob"))?;
+                if size as usize > MAX_BLOB {
+                    (size as i64, None)
+                } else {
+                    let o = remote.get(&target).await?;
+                    (size as i64, Some(o.data.to_vec()))
                 }
+            } else {
+                let bytes = git(
+                    &r.local,
+                    vec![
+                        "cat-file".into(),
+                        "blob".into(),
+                        format!("{}:{}", res.sha, res.path),
+                    ],
+                )
+                .await?;
+                (bytes.len() as i64, Some(bytes))
             };
             let is_text = size <= MAX_BLOB as i64
                 && bytes
                     .as_ref()
-                    .map(|b| !b.contains(&0) && std::str::from_utf8(b).is_ok())
-                    .unwrap_or(false);
+                    .is_some_and(|b| !b.contains(&0) && std::str::from_utf8(b).is_ok());
             if raw && is_text {
                 let etag = etag_for(&res.sha);
                 return Ok(Rendered {
@@ -1227,48 +1219,43 @@ async fn commits(
                 (resolve_name(&r, &reference).await?, false)
             };
             let key = commits_key(&r.id, &res.sha, &path, skip, n);
-            if immutable {
-                if let Some(hit) = st2.caches.api_immutable.get(&key) {
-                    return Ok(Rendered::json(hit, IMMUTABLE, None));
-                }
+            if immutable && let Some(hit) = st2.caches.api_immutable.get(&key) {
+                return Ok(Rendered::json(hit, IMMUTABLE, None));
             }
-            let mut cs: Vec<Commit> = match r.remote() {
-                Some(remote) => {
-                    let start = gix_hash::ObjectId::from_hex(res.sha.as_bytes())
-                        .map_err(|_| not_found("revision"))?;
-                    let label = if path.is_empty() {
-                        "Walking history".to_string()
-                    } else {
-                        format!("Walking history of {path}")
-                    };
-                    remote.reporter.notice(format!(
-                        "{label} from {} (reading commits from the WAL pack set)",
-                        &res.sha[..12]
-                    ));
-                    let all = remote
-                        .walk(
-                            start,
-                            (!path.is_empty()).then_some(path.as_str()),
-                            skip + n + 1,
-                            &label,
-                        )
-                        .await?;
-                    all.into_iter().skip(skip).map(Commit::from).collect()
+            let mut cs: Vec<Commit> = if let Some(remote) = r.remote() {
+                let start = gix_hash::ObjectId::from_hex(res.sha.as_bytes())
+                    .map_err(|_| not_found("revision"))?;
+                let label = if path.is_empty() {
+                    "Walking history".to_string()
+                } else {
+                    format!("Walking history of {path}")
+                };
+                remote.reporter.notice(format!(
+                    "{label} from {} (reading commits from the WAL pack set)",
+                    &res.sha[..12]
+                ));
+                let all = remote
+                    .walk(
+                        start,
+                        (!path.is_empty()).then_some(path.as_str()),
+                        skip + n + 1,
+                        &label,
+                    )
+                    .await?;
+                all.into_iter().skip(skip).map(Commit::from).collect()
+            } else {
+                let mut a = vec![
+                    "log".into(),
+                    format!("--format={}", log_format()),
+                    "--no-color".into(),
+                    format!("--skip={skip}"),
+                    format!("-{count}", count = n.saturating_add(1)),
+                    res.sha.clone(),
+                ];
+                if !path.is_empty() {
+                    a.extend(["--".into(), path.clone()]);
                 }
-                None => {
-                    let mut a = vec![
-                        "log".into(),
-                        format!("--format={}", log_format()),
-                        "--no-color".into(),
-                        format!("--skip={skip}"),
-                        format!("-{count}", count = n.saturating_add(1)),
-                        res.sha.clone(),
-                    ];
-                    if !path.is_empty() {
-                        a.extend(["--".into(), path.clone()]);
-                    }
-                    parse_commits(&git(&r.local, a).await?)
-                }
+                parse_commits(&git(&r.local, a).await?)
             };
             let more = cs.len() > n;
             if more {
@@ -1314,10 +1301,8 @@ async fn commit_detail(
                 resolve_name(&r, &rev).await?.sha
             };
             let key = commit_key(&r.id, &sha);
-            if immutable {
-                if let Some(hit) = st2.caches.api_immutable.get(&key) {
-                    return Ok(Rendered::json(hit, IMMUTABLE, None));
-                }
+            if immutable && let Some(hit) = st2.caches.api_immutable.get(&key) {
+                return Ok(Rendered::json(hit, IMMUTABLE, None));
             }
             if let Some(remote) = r.remote() {
                 // Fault the commit, its first parent and every object the diff
@@ -1420,16 +1405,16 @@ fn parse_stats(bytes: &[u8]) -> Vec<Stat> {
 /// `git --numstat -M` prints renames as `old => new` or `prefix/{old => new}/suffix`;
 /// return the new path.
 fn normalize_rename(s: &str) -> String {
-    if let (Some(open), Some(close)) = (s.find('{'), s.rfind('}')) {
-        if open < close {
-            let inner = &s[open + 1..close];
-            if let Some((_, new)) = inner.split_once(" => ") {
-                let mut out = String::with_capacity(s.len());
-                out.push_str(&s[..open]);
-                out.push_str(new);
-                out.push_str(&s[close + 1..]);
-                return out.replace("//", "/");
-            }
+    if let (Some(open), Some(close)) = (s.find('{'), s.rfind('}'))
+        && open < close
+    {
+        let inner = &s[open + 1..close];
+        if let Some((_, new)) = inner.split_once(" => ") {
+            let mut out = String::with_capacity(s.len());
+            out.push_str(&s[..open]);
+            out.push_str(new);
+            out.push_str(&s[close + 1..]);
+            return out.replace("//", "/");
         }
     }
     if let Some((_, new)) = s.split_once(" => ") {

@@ -41,7 +41,7 @@ message Manifest {
   // Log segments covering [min_seq, head_seq], ascending, contiguous,
   // non-overlapping. Kept short by merging segments during compaction.
   repeated LogSegmentRef log_segments = 7;
-  // Denormalized live pack set after applying every entry <= head_seq
+  // Denormalized live pack set after applying every entry <= `head_seq`
   // (checkpoint packs + packs of later PUSH entries − superseded). Sorted by
   // seq. Materialize = these packs + checkpoint refs + replay log > checkpoint.
   repeated PackRef packs = 8;
@@ -86,7 +86,7 @@ message LogSegmentRef {
 }
 
 // Body of a log object. Encoding on the wire is a sequence of length-prefixed
-// frames (uvarint len + LogEntry bytes) so appendable objects can grow without
+// frames (uvarint len + `LogEntry` bytes) so appendable objects can grow without
 // rewriting; `LogSegment` is the in-memory/decoded form and the encoding used
 // for sealed immutable segments written whole.
 message LogSegment {
@@ -143,7 +143,7 @@ message LogEntry {
   EntryKind kind = 2;
   // Present for PUSH (when objects were pushed) and COMPACT.
   PackRef pack = 3;
-  // Present for PUSH and REF_UPDATE.
+  // Present for PUSH and `REF_UPDATE`.
   RefTransaction txn = 4;
   // COMPACT only: pack checksums removed from the live set by this entry.
   repeated string supersedes = 5;
@@ -153,7 +153,7 @@ message LogEntry {
   string writer = 8;
   // Free-form provenance (push-options, client agent, principal). Small.
   map<string, string> meta = 9;
-  // ENTRY_KIND_SETTINGS: the settings as published at this seq.
+  // `ENTRY_KIND_SETTINGS`: the settings as published at this seq.
   RepoSettings settings = 10;
 }
 
@@ -184,7 +184,7 @@ message Checkpoint {
   // Packs that fully represent the repository at `seq` (typically 1 base pack
   // (+ 1 medium)). Keys are wal/<checksum>.pack.
   repeated PackRef packs = 3;
-  // Key of the RefSnapshot, e.g. "checkpoints/<seq>/refs.pb".
+  // Key of the `RefSnapshot`, e.g. "checkpoints/<seq>/refs.pb".
   string refs_key = 4;
   uint64 ref_count = 5;
   // Optional rendered full bundle for bundle-uri, e.g. "checkpoints/<seq>/<sha>.bundle".
@@ -201,12 +201,12 @@ message CheckpointRef {
   // fetching the checkpoint object).
   google.protobuf.Timestamp created_at = 3;
   // Earliest WAL state this repository ever had (carried forward from the
-  // previous checkpoint, else the first folded entry's created_at): bundle
+  // previous checkpoint, else the first folded entry's `created_at`: bundle
   // slots before it are "unavailable"; slots after it are backfillable even
   // on a maintainer that cold-starts from this checkpoint (D22).
   google.protobuf.Timestamp first_state_at = 4;
-  // created_at of the newest entry this checkpoint folded: the state it holds
-  // is the repository "as of" this instant (≠ created_at, the write time).
+  // `created_at` of the newest entry this checkpoint folded: the state it holds
+  // is the repository "as of" this instant (≠ `created_at`, the write time).
   google.protobuf.Timestamp as_of = 5;
 }
 
@@ -252,7 +252,7 @@ message BundleList {
   repeated BundleEntry bundles = 3;
   google.protobuf.Timestamp updated_at = 4;
   // Closed slots measured and NOT cut (too small / no state as of the slot):
-  // final for (strategy, slot, base_id) — every host and every restart skips
+  // final for (strategy, slot, `base_id`) — every host and every restart skips
   // them in O(1) instead of re-measuring (a unit's worth of work each; after
   // a restart the SSD host re-walked ~30 of them before reaching the live slot,
   // 2026-08-21). A new base bundle for the slot re-opens the question.
@@ -287,7 +287,7 @@ message BundleEntry {
   // Id of the bundle this incremental one is based on (empty for full).
   string base_id = 8;
   google.protobuf.Timestamp created_at = 9;
-  // Object store version tag (ETag/generation) at upload; used for HTTP ETag.
+  // Object store version tag (ETag/generation) at upload; used for HTTP `ETag`.
   string version = 10;
   // Ref tips the bundle contains (refs/heads/*, refs/tags/*, HEAD). For
   // incremental bundles, the base bundle's tips are the prerequisites.

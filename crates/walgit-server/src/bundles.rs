@@ -1,6 +1,6 @@
 //! Bundle serving: `GET /{repo}/bundles/list` (git bundle-list text, no-cache)
 //! and `GET|HEAD /{repo}/bundles/{strategy}/{name}` (streamed bundle with
-//! strong ETag = store version, immutable caching, Range/If-Range,
+//! strong `ETag` = store version, immutable caching, Range/If-Range,
 //! If-None-Match, HEAD — `static_object`).
 
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -106,7 +106,7 @@ fn render_bundle_list_response(text: String) -> Response {
 }
 
 /// `GET|HEAD /{repo}/bundles/{strategy}/{name}` — streamed from the store
-/// with the full immutable-object contract (strong ETag, 304, Range/If-Range,
+/// with the full immutable-object contract (strong `ETag`, 304, Range/If-Range,
 /// HEAD, Content-Length); see `static_object`.
 pub async fn object(
     st: &AppState,
@@ -196,18 +196,17 @@ pub async fn compose_full_from_base(
     // rig's weekly compose failed every pass for as long as the churn kept refs moving, 2026-08-22);
     // only a log folded away below the base's seq with no checkpoint before it is unrecoverable.
     let refs_key = walgit_proto::keys::checkpoint_refs_key(seq);
-    let snap = match store.get_bytes(&refs_key).await? {
-        Some((_, bytes)) => walgit_proto::v1::RefSnapshot::decode(bytes.as_ref())?,
-        None => {
-            info!(
-                base_seq = seq,
-                head = manifest.head_seq,
-                "no checkpoint at the base's seq: replaying the refs at that seq from the WAL for the compose"
-            );
-            handle.refs_at_seq(seq).await.map_err(|e| {
-                anyhow::anyhow!("refs at the base's seq {seq} (head {}): {e} — run `walgit compact --base` again so a checkpoint exists at the base", manifest.head_seq)
-            })?
-        }
+    let snap = if let Some((_, bytes)) = store.get_bytes(&refs_key).await? {
+        walgit_proto::v1::RefSnapshot::decode(bytes.as_ref())?
+    } else {
+        info!(
+            base_seq = seq,
+            head = manifest.head_seq,
+            "no checkpoint at the base's seq: replaying the refs at that seq from the WAL for the compose"
+        );
+        handle.refs_at_seq(seq).await.map_err(|e| {
+            anyhow::anyhow!("refs at the base's seq {seq} (head {}): {e} — run `walgit compact --base` again so a checkpoint exists at the base", manifest.head_seq)
+        })?
     };
     let list = walgit_bundle::ops::read_list(store)
         .await?

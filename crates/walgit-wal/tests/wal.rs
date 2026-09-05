@@ -1,6 +1,15 @@
+#![allow(
+    clippy::cast_sign_loss,
+    clippy::field_reassign_with_default,
+    clippy::unreadable_literal,
+    clippy::zombie_processes
+)]
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(clippy::unwrap_used)]
+
 //! Integration tests for walgit-wal.
 //!
-//! Uses MemoryStore + real LocalRepo tempdir + upstream git to create
+//! Uses `MemoryStore` + real `LocalRepo` tempdir + upstream git to create
 //! objects/packs.
 
 use std::collections::HashMap;
@@ -832,7 +841,7 @@ async fn test_orphan_log_invisible_and_cleaned() {
         .store()
         .put(
             &orphan_key,
-            bytes::Bytes::from(orphan_bytes).into(),
+            orphan_bytes.into(),
             walgit_store::PutMode::Create.into(),
         )
         .await
@@ -950,7 +959,9 @@ async fn test_serve_level_links_base_from_store_mount() {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            body.push_str(&format!("{x:016x}"));
+            {
+                let _ = std::fmt::Write::write_fmt(&mut body, format_args!("{x:016x}"));
+            };
         }
         let c = work.commit(&format!("base_{i}"), &body);
         let pack = if prev.is_empty() {
@@ -1191,7 +1202,7 @@ fn checkpoint_due_triggers() {
     use walgit_wal::{CheckpointTrigger, checkpoint_due};
     let mut cfg = walgit_config::WalConfig::default();
     cfg.snapshot_every_entries = 10;
-    cfg.checkpoint_interval = Duration::from_secs(3600);
+    cfg.checkpoint_interval = Duration::from_hours(1);
     cfg.checkpoint_tail_bytes = walgit_config::ByteSize::kib(1);
     let seg = |first: u64, last: u64, size: u64| LogSegmentRef {
         key: String::new(),
@@ -1221,7 +1232,7 @@ fn checkpoint_due_triggers() {
     assert_eq!(checkpoint_due(&m, &cfg), Some(CheckpointTrigger::TailBytes));
 
     m.log_segments = vec![seg(1, 3, 100)];
-    let old = std::time::SystemTime::now() - Duration::from_secs(7200);
+    let old = std::time::SystemTime::now() - Duration::from_hours(2);
     m.updated_at = Some(walgit_proto::time::from_system(old));
     assert_eq!(
         checkpoint_due(&m, &cfg),
@@ -1271,6 +1282,8 @@ fn checkpoint_due_triggers() {
 /// from checkpoint + tail.
 #[tokio::test]
 async fn test_checkpoint_from_refs_level_instance() {
+    use prost::Message;
+
     let cache = tempfile::tempdir().unwrap();
     let store = MemoryStore::shared();
     let registry = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
@@ -1349,7 +1362,7 @@ async fn test_checkpoint_from_refs_level_instance() {
     assert_eq!(handle2.checkpoint_due(), None);
 
     // The checkpoint object carries the pack inventory with side-file flags.
-    use prost::Message;
+
     let (_, bytes) = walgit_store::ObjectStoreExt::get_bytes(handle2.store(), &cp.key)
         .await
         .unwrap()
@@ -1393,7 +1406,9 @@ async fn test_serve_level_remote_serves_base_without_mount() {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            body.push_str(&format!("{x:016x}"));
+            {
+                let _ = std::fmt::Write::write_fmt(&mut body, format_args!("{x:016x}"));
+            };
         }
         let c = work.commit(&format!("base_{i}"), &body);
         let pack = if prev.is_empty() {
@@ -1524,7 +1539,7 @@ async fn test_serve_level_remote_serves_base_without_mount() {
     assert_eq!(stats.objects, 3, "{stats:?}");
     let (faulted, rounds) = faulter.stats();
     assert!(
-        faulted >= 1 && faulted <= 3,
+        (1..=3).contains(&faulted),
         "faulted {faulted} (parent commit + root tree)"
     );
     assert!(rounds <= 3);
@@ -1600,6 +1615,8 @@ async fn test_annotate_pack_retrofits_commit_graph() {
 /// so `sync_refs()` on a cold instance answers while packs still download.
 #[tokio::test]
 async fn test_refs_sync_is_not_blocked_by_pack_materialization() {
+    use futures::StreamExt;
+
     let cache = tempfile::tempdir().unwrap();
     let store = MemoryStore::shared();
     let registry = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
@@ -1634,7 +1651,7 @@ async fn test_refs_sync_is_not_blocked_by_pack_materialization() {
         inner.latency = Some(Duration::from_millis(150));
     }
     // Copy the data over.
-    use futures::StreamExt;
+
     let mut keys = store.list("", None);
     while let Some(m) = keys.next().await {
         let m = m.unwrap();
@@ -1707,7 +1724,9 @@ async fn test_history_pack_keeps_tree_walks_local() {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            body.push_str(&format!("{x:016x}"));
+            {
+                let _ = std::fmt::Write::write_fmt(&mut body, format_args!("{x:016x}"));
+            };
         }
         std::fs::create_dir_all(work.path().join(format!("d{i}/sub"))).unwrap();
         std::fs::write(work.path().join(format!("d{i}/sub/big.bin")), &body).unwrap();
@@ -1930,7 +1949,7 @@ async fn test_history_pack_keeps_tree_walks_local() {
 
 /// A long-lived read guard (a clone streaming for minutes) plus a pack
 /// removal that wants the write lock must not block new refs-level syncs:
-/// a queued writer on a tokio RwLock stalls every new reader (prod: info/refs
+/// a queued writer on a tokio `RwLock` stalls every new reader (prod: info/refs
 /// waited 60–680 s behind one 24-minute clone). Removal is try-only now.
 #[tokio::test]
 async fn test_refs_sync_never_waits_behind_a_long_read_guard() {
@@ -2341,6 +2360,10 @@ async fn test_checkpoint_carries_first_state_and_as_of() {
 /// entry (every slot in between planned as "unavailable" in prod).
 #[tokio::test]
 async fn test_first_state_time_uses_the_checkpoint_when_early_entries_are_untimestamped() {
+    use walgit_store::ObjectStoreExt;
+
+    use prost::Message;
+
     let cache = tempfile::tempdir().unwrap();
     let store = MemoryStore::shared();
     let registry = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
@@ -2378,8 +2401,7 @@ async fn test_first_state_time_uses_the_checkpoint_when_early_entries_are_untime
 
     // Rewrite the bucket the way 2026-08-19 wrote it: checkpoint ref without
     // first_state_at/as_of, created on 08-02; log entry 2 without created_at.
-    use prost::Message;
-    use walgit_store::ObjectStoreExt;
+
     let mkey = format!("{}{}", id.store_prefix(), walgit_proto::keys::MANIFEST);
     let (_, bytes) = store.get_bytes(&mkey).await.unwrap().unwrap();
     let mut m = walgit_proto::v1::Manifest::decode(bytes.as_ref()).unwrap();
@@ -2446,6 +2468,10 @@ async fn test_first_state_time_uses_the_checkpoint_when_early_entries_are_untime
 /// state" and the bundler cut it from today's main (prod 2026-08-21 04:2xZ).
 #[tokio::test]
 async fn test_checkpoint_times_come_from_the_object_when_the_ref_has_none() {
+    use walgit_store::ObjectStoreExt;
+
+    use prost::Message;
+
     let cache = tempfile::tempdir().unwrap();
     let store = MemoryStore::shared();
     let registry = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
@@ -2482,8 +2508,7 @@ async fn test_checkpoint_times_come_from_the_object_when_the_ref_has_none() {
         .unwrap();
 
     // Strip the ref's times (08-19 import shape); stamp the object 08-19 21:33Z.
-    use prost::Message;
-    use walgit_store::ObjectStoreExt;
+
     let mkey = format!("{}{}", id.store_prefix(), walgit_proto::keys::MANIFEST);
     let (_, bytes) = store.get_bytes(&mkey).await.unwrap().unwrap();
     let mut m = walgit_proto::v1::Manifest::decode(bytes.as_ref()).unwrap();

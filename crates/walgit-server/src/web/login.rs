@@ -1,4 +1,4 @@
-//! Browser sign-in: the OpenID Connect authorization-code flow against
+//! Browser sign-in: the `OpenID` Connect authorization-code flow against
 //! `server.auth.issuer`, done by walgit itself. `GET /_auth/login?next=/p`
 //! redirects to the issuer's `authorization_endpoint` (from discovery),
 //! `GET /_auth/callback` exchanges the code at the `token_endpoint`, verifies the
@@ -71,7 +71,7 @@ fn loopback_origin(st: &AppState, headers: &HeaderMap) -> bool {
     let base = crate::smart::request_base_url(st, headers);
     let host = base.split("://").nth(1).unwrap_or(&base);
     let host = host.split('/').next().unwrap_or(host);
-    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
     host == "walgit.localhost" || host == "localhost" || host == "127.0.0.1" || host == "[::1]"
 }
 
@@ -116,8 +116,7 @@ fn walgit_origin(st: &AppState, headers: &HeaderMap) -> String {
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn urlencode(s: &str) -> String {
@@ -125,9 +124,11 @@ fn urlencode(s: &str) -> String {
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
+                out.push(b as char);
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("%{b:02X}"));
+            }
         }
     }
     out
@@ -147,15 +148,12 @@ async fn login(
         )
             .into_response();
     }
-    let disco = match st.auth.discovery().await {
-        Ok(d) => d,
-        Err(_) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "identity provider unavailable (OIDC discovery failed)",
-            )
-                .into_response();
-        }
+    let Ok(disco) = st.auth.discovery().await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "identity provider unavailable (OIDC discovery failed)",
+        )
+            .into_response();
     };
     let (client_id, _) = st.auth.oauth_client().unwrap();
     let next = safe_next(q.next);
@@ -179,7 +177,9 @@ async fn login(
     );
     // Google honours `hd` as a domain hint on its account chooser; other issuers ignore it.
     if let Some(hd) = st.cfg.server.auth.allowed_domains.first() {
-        url.push_str(&format!("&hd={}", urlencode(hd)));
+        {
+            let _ = std::fmt::Write::write_fmt(&mut url, format_args!("&hd={}", urlencode(hd)));
+        };
     }
     let mut r = Redirect::to(&url).into_response();
     r.headers_mut()

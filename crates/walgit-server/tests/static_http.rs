@@ -1,5 +1,5 @@
 //! HTTP contract of immutable store objects (LFS here; bundles share the same
-//! `static_object` path) and of the embedded UI assets: strong ETags, 304,
+//! `static_object` path) and of the embedded UI assets: strong `ETags`, 304,
 //! Range/If-Range, HEAD, Content-Length, precompressed encodings.
 
 mod harness;
@@ -206,7 +206,12 @@ async fn ui_assets_etag_304_and_precompressed() -> Result<()> {
     // same ETag across encodings (the encoding is negotiated, not a new entity).
     let asset = html
         .split('"')
-        .find(|p| p.starts_with("/_ui/assets/") && p.ends_with(".js"))
+        .find(|p| {
+            p.starts_with("/_ui/assets/")
+                && std::path::Path::new(p)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("js"))
+        })
         .expect("asset reference")
         .to_string();
     let url = format!("{}{}", server.base_url, asset);

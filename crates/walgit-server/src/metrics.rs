@@ -14,10 +14,12 @@ static HANDLE: OnceLock<Arc<PrometheusHandle>> = OnceLock::new();
 /// Install the Prometheus recorder once per process and return a shared handle.
 /// Safe to call repeatedly (subsequent calls return the same handle).
 pub fn install() -> anyhow::Result<Arc<PrometheusHandle>> {
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
     if let Some(h) = HANDLE.get() {
         return Ok(h.clone());
     }
-    use metrics_exporter_prometheus::PrometheusBuilder;
+
     let rec = PrometheusBuilder::new().build_recorder();
     let handle = Arc::new(rec.handle());
     // set_global_recorder fails if already set; ignore that race — the handle is

@@ -66,14 +66,16 @@ pub async fn run(action: BundleAction, cfg: &Arc<Config>) -> Result<()> {
             {
                 let m = handle.manifest();
                 let fmt = |t: Option<std::time::SystemTime>| {
-                    t.map(|t| humantime::format_rfc3339_seconds(t).to_string())
-                        .unwrap_or_else(|| "-".into())
+                    t.map_or_else(
+                        || "-".into(),
+                        |t| humantime::format_rfc3339_seconds(t).to_string(),
+                    )
                 };
                 let cp = m.checkpoint.as_ref();
                 println!(
                     "first state {}  (checkpoint seq {} created {} first_state_at {} as_of {}; head seq {})",
                     fmt(handle.first_state_time()),
-                    cp.map(|c| c.seq).unwrap_or(0),
+                    cp.map_or(0, |c| c.seq),
                     fmt(cp
                         .and_then(|c| c.created_at.as_ref())
                         .map(walgit_proto::time::to_system)),
@@ -87,8 +89,8 @@ pub async fn run(action: BundleAction, cfg: &Arc<Config>) -> Result<()> {
                 );
             }
             println!(
-                "{:<8} {:<12} {:<20} {}",
-                "strategy", "kind", "slot (UTC)", "status"
+                "{:<8} {:<12} {:<20} status",
+                "strategy", "kind", "slot (UTC)"
             );
             for r in &rows {
                 let when = if r.slot == 0 {
@@ -150,14 +152,14 @@ pub async fn run(action: BundleAction, cfg: &Arc<Config>) -> Result<()> {
                         u.strategy,
                         when,
                         u.unit,
-                        u.host
-                            .as_deref()
-                            .map(|h| if u.unit.contains(h) {
+                        u.host.as_deref().map_or_else(
+                            || "  [no live maintainer]".into(),
+                            |h| if u.unit.contains(h) {
                                 String::new()
                             } else {
                                 format!("  [{h}]")
-                            })
-                            .unwrap_or_else(|| "  [no live maintainer]".into())
+                            }
+                        )
                     );
                 }
             }
@@ -178,8 +180,7 @@ pub async fn run(action: BundleAction, cfg: &Arc<Config>) -> Result<()> {
                     let last = h.last_pass_at.as_ref().map(walgit_proto::time::to_system);
                     let age = last
                         .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(u64::MAX);
+                        .map_or(u64::MAX, |d| d.as_secs());
                     println!(
                         "  {} ({}, {} cap) — last pass {}s ago ({}), {} passes, last unit: {}",
                         h.host,
@@ -285,10 +286,10 @@ pub async fn maintainers(
     let mut keys = store.list(walgit_proto::keys::MAINTAIN_DIR, None);
     while let Some(m) = keys.next().await {
         let m = m?;
-        if let Some((_, bytes)) = store.get_bytes(&m.key).await? {
-            if let Ok(hb) = walgit_proto::v1::MaintainerHeartbeat::decode(bytes.as_ref()) {
-                out.push(hb);
-            }
+        if let Some((_, bytes)) = store.get_bytes(&m.key).await?
+            && let Ok(hb) = walgit_proto::v1::MaintainerHeartbeat::decode(bytes.as_ref())
+        {
+            out.push(hb);
         }
     }
     Ok(out)

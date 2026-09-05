@@ -1,4 +1,4 @@
-//! Persistent local state for a RepoHandle, stored in the repo dir so restarts
+//! Persistent local state for a `RepoHandle`, stored in the repo dir so restarts
 //! skip already-applied log entries.
 
 use std::path::Path;
@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::WalError;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RepoState {
     /// Opaque version string of the last manifest we applied.
     pub manifest_version: Option<String>,
@@ -36,19 +36,6 @@ impl RepoState {
     /// True when the local pack set matches the applied manifest.
     pub fn packs_ready(&self) -> bool {
         self.packs_revision == self.revision && self.pending_pack_removals.is_empty()
-    }
-}
-
-impl Default for RepoState {
-    fn default() -> Self {
-        RepoState {
-            manifest_version: None,
-            applied_seq: 0,
-            revision: 0,
-            packs_revision: 0,
-            pending_pack_removals: Vec::new(),
-            remote_served: Vec::new(),
-        }
     }
 }
 

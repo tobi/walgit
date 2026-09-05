@@ -1,3 +1,6 @@
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(clippy::indexing_slicing, clippy::string_slice, clippy::unwrap_used)]
+
 //! web/API.md §6 conformance for the read-only JSON API.
 
 mod harness;
@@ -21,7 +24,7 @@ async fn get(
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+        .map(std::string::ToString::to_string);
     let text = resp.text().await?;
     Ok((status, text, ct))
 }
@@ -112,6 +115,7 @@ fn fixture(server: &Server) -> anyhow::Result<std::path::PathBuf> {
 
 /// web/API.md §6 against one server (called for the local-packs instance and
 /// for a sibling that serves the same repo remotely).
+#[allow(clippy::many_single_char_names)]
 async fn conformance(
     server: &Server,
     src: &std::path::Path,

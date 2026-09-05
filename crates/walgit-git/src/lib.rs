@@ -1,6 +1,6 @@
 //! Local git repository engine: gix in-process for odb/refs/revwalk/pack
 //! generation; upstream git subprocess for ingest (`index-pack`), repack,
-//! bundle, and the selectable Engine::Git upload-pack fallback. See AGENTS.md
+//! bundle, and the selectable `Engine::Git` upload-pack fallback. See AGENTS.md
 //! D2 and docs/CONTRACT.md walgit-git.
 
 pub mod follow;
@@ -64,6 +64,10 @@ fn ge<E: std::error::Error + Send + Sync + 'static>(e: E) -> GitError {
 
 /// Reject ref names that would inject `git update-ref --stdin` commands or
 /// poison packed-refs (newlines, NULs, git-illegal bytes).
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "Git forbids exactly the case-sensitive .lock suffix"
+)]
 pub fn validate_ref_name(name: &str) -> Result<(), GitError> {
     if name == "HEAD" {
         return Ok(());
@@ -163,7 +167,7 @@ impl RepoId {
         &self.name
     }
 
-    /// `repos/<owner>/<repo>/` (walgit_proto::keys::repo_prefix).
+    /// `repos/<owner>/<repo>/` (`walgit_proto::keys::repo_prefix`).
     pub fn store_prefix(&self) -> String {
         walgit_proto::keys::repo_prefix(&self.owner, &self.name)
     }
@@ -259,7 +263,6 @@ impl From<walgit_config::ObjectFormat> for ObjectFormat {
 impl From<gix_hash::Kind> for ObjectFormat {
     fn from(k: gix_hash::Kind) -> Self {
         match k {
-            gix_hash::Kind::Sha1 => ObjectFormat::Sha1,
             gix_hash::Kind::Sha256 => ObjectFormat::Sha256,
             _ => ObjectFormat::Sha1,
         }
@@ -378,13 +381,17 @@ impl LsRefsLine {
     /// ` peeled:<oid>`, then a trailing newline.
     pub fn render(&self, args: &LsRefsArgs) -> String {
         let mut s = format!("{} {}", self.oid, self.name);
-        if args.symrefs || self.oid == "unborn" {
-            if let Some(t) = &self.symref_target {
-                s.push_str(&format!(" symref-target:{t}"));
-            }
+        if (args.symrefs || self.oid == "unborn")
+            && let Some(t) = &self.symref_target
+        {
+            {
+                let _ = std::fmt::Write::write_fmt(&mut s, format_args!(" symref-target:{t}"));
+            };
         }
         if args.peel && !self.peeled.is_empty() {
-            s.push_str(&format!(" peeled:{}", self.peeled));
+            {
+                let _ = std::fmt::Write::write_fmt(&mut s, format_args!(" peeled:{}", self.peeled));
+            };
         }
         s.push('\n');
         s
@@ -418,6 +425,10 @@ impl Service {
 }
 
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent Git protocol capabilities and request flags"
+)]
 pub struct UploadPackRequest {
     pub wants: Vec<gix_hash::ObjectId>,
     pub haves: Vec<gix_hash::ObjectId>,
@@ -511,7 +522,8 @@ impl RefView {
             .refs
             .binary_search_by(|r| r.name.as_str().cmp(name))
             .ok()
-            .map(|i| self.base.refs[i].oid.clone())
+            .and_then(|i| self.base.refs.get(i))
+            .map(|r| r.oid.clone())
     }
     pub fn head_target(&self) -> &str {
         self.head_target
@@ -578,7 +590,7 @@ fn refs_key(path: &Path, generation: u64) -> RefsKey {
     let head = std::fs::metadata(path.join("HEAD")).ok();
     RefsKey {
         generation,
-        packed_len: packed.as_ref().map(|m| m.len()).unwrap_or(0),
+        packed_len: packed.as_ref().map_or(0, std::fs::Metadata::len),
         packed_mtime: packed.and_then(|m| m.modified().ok()),
         head_mtime: head.and_then(|m| m.modified().ok()),
     }
@@ -593,7 +605,7 @@ impl LocalRepo {
     /// Create a bare repo at `<root>/<owner>/<name>.git`.
     pub fn init(root: &Path, id: &RepoId, format: ObjectFormat) -> Result<Self, GitError> {
         let path = id.local_dir(root);
-        std::fs::create_dir_all(path.parent().unwrap_or(root)).map_err(|e| GitError::Io(e))?;
+        std::fs::create_dir_all(path.parent().unwrap_or(root)).map_err(GitError::Io)?;
         // `git init --bare [--object-format=...] <path>`.
         let mut cmd = std::process::Command::new("git");
         cmd.arg("init").arg("--bare");
@@ -710,7 +722,7 @@ impl LocalRepo {
             let t = std::time::Instant::now();
             // `iter()` snapshots the store with all indices loaded.
             let _ = repo.objects.iter();
-            let ms = t.elapsed().as_millis() as u64;
+            let ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX);
             if ms > 200 {
                 tracing::info!(repo = %self.inner.path.display(), ms, "odb indices loaded");
             }
@@ -778,7 +790,7 @@ impl LocalRepo {
                 .open(&candidate)
             {
                 Ok(file) => break (candidate, file),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(e) => return Err(GitError::Io(e)),
             }
         };
@@ -797,22 +809,25 @@ impl LocalRepo {
             }
             empty_check = false;
             total += n as u64;
-            if let Some(max) = opts.max_bytes {
-                if total > max {
-                    drop(
-                        tokio::fs::remove_file(&tmp_path)
-                            .instrument(span.clone())
-                            .await,
-                    );
-                    return Err(GitError::InvalidInput(format!(
-                        "pack exceeds max_bytes {max}"
-                    )));
-                }
+            if let Some(max) = opts.max_bytes
+                && total > max
+            {
+                drop(
+                    tokio::fs::remove_file(&tmp_path)
+                        .instrument(span.clone())
+                        .await,
+                );
+                return Err(GitError::InvalidInput(format!(
+                    "pack exceeds max_bytes {max}"
+                )));
             }
-            tmp.write_all(&buf[..n])
-                .instrument(span.clone())
-                .await
-                .map_err(GitError::Io)?;
+            tmp.write_all(
+                buf.get(..n)
+                    .ok_or_else(|| std::io::Error::other("read exceeded buffer"))?,
+            )
+            .instrument(span.clone())
+            .await
+            .map_err(GitError::Io)?;
         }
         // tokio's File buffers writes in a background blocking task and does
         // NOT flush on drop: without this the tail of the pack may be missing
@@ -883,8 +898,8 @@ impl LocalRepo {
             let _ = std::fs::remove_file(pack_path.with_extension("rev"));
             return Ok(None);
         }
-        let pack_size = std::fs::metadata(&pack_path).map(|m| m.len()).unwrap_or(0);
-        let idx_size = std::fs::metadata(&idx_path).map(|m| m.len()).unwrap_or(0);
+        let pack_size = std::fs::metadata(&pack_path).map_or(0, |m| m.len());
+        let idx_size = std::fs::metadata(&idx_path).map_or(0, |m| m.len());
         self.refresh_async()
             .instrument(tracing::info_span!(parent: &span, "git.ingest_pack.refresh"))
             .await?;
@@ -907,12 +922,18 @@ impl LocalRepo {
     ) -> Result<(), GitError> {
         let pack_dir = self.objects_pack_dir();
         std::fs::create_dir_all(&pack_dir).map_err(GitError::Io)?;
-        let dst_pack = pack_dir.join(pack.file_name().unwrap());
-        let dst_idx = pack_dir.join(idx.file_name().unwrap());
+        let dst_pack = pack_dir.join(pack.file_name().ok_or_else(|| {
+            GitError::InvalidInput(format!("missing filename: {}", pack.display()))
+        })?);
+        let dst_idx = pack_dir.join(idx.file_name().ok_or_else(|| {
+            GitError::InvalidInput(format!("missing filename: {}", idx.display()))
+        })?);
         rename_atomic(pack, &dst_pack)?;
         rename_atomic(idx, &dst_idx)?;
         for e in extra {
-            let dst = pack_dir.join(e.file_name().unwrap());
+            let dst = pack_dir.join(e.file_name().ok_or_else(|| {
+                GitError::InvalidInput(format!("missing filename: {}", e.display()))
+            })?);
             rename_atomic(e, &dst)?;
         }
         self.refresh_async().await?;
@@ -978,15 +999,19 @@ impl LocalRepo {
             if !name.starts_with("pack-") || !name.ends_with(".pack") {
                 continue;
             }
-            let hex = &name["pack-".len()..name.len() - ".pack".len()];
-            let checksum = match gix_hash::ObjectId::from_hex(hex.as_bytes()) {
-                Ok(o) => o,
-                Err(_) => continue,
+            let Some(hex) = name
+                .strip_prefix("pack-")
+                .and_then(|n| n.strip_suffix(".pack"))
+            else {
+                continue;
+            };
+            let Ok(checksum) = gix_hash::ObjectId::from_hex(hex.as_bytes()) else {
+                continue;
             };
             let pack_path = ent.path();
             let idx_path = pack_path.with_extension("idx");
-            let pack_size = std::fs::metadata(&pack_path).map(|m| m.len()).unwrap_or(0);
-            let idx_size = std::fs::metadata(&idx_path).map(|m| m.len()).unwrap_or(0);
+            let pack_size = std::fs::metadata(&pack_path).map_or(0, |m| m.len());
+            let idx_size = std::fs::metadata(&idx_path).map_or(0, |m| m.len());
             let object_count = idx_object_count(&idx_path).unwrap_or(0);
             let has_rev = pack_path.with_extension("rev").exists();
             let has_bitmap = pack_path.with_extension("bitmap").exists();
@@ -1022,7 +1047,7 @@ impl LocalRepo {
     }
 
     /// The refs, parsed once and shared: `packed-refs` of a 500 k-ref repo is
-    /// 34 MB and read_refs also peels every tag — 1–2 s per call, which every
+    /// 34 MB and `read_refs` also peels every tag — 1–2 s per call, which every
     /// `ls-refs` (prefix or not) paid (2026-08-21, test/refs500k on a serverless host).
     /// Valid until a ref writer in this process bumps the generation or
     /// `packed-refs`/`HEAD` change on disk (two stats per call). Sorted by name.
@@ -1042,11 +1067,11 @@ impl LocalRepo {
                     // Fold the pushes applied since the last materialization: one copy of the
                     // vector for all of them, no parsing, no object reads.
                     let t = std::time::Instant::now();
-                    let patched = self.patch_snapshot(&c.data, &c.pending);
+                    let patched = self.patch_snapshot(&c.data, &c.pending)?;
                     c.data = Arc::new(patched);
                     c.pending.clear();
                     if c.data.refs.len() >= 10_000 {
-                        tracing::debug!(repo = %self.inner.id, refs = c.data.refs.len(), ms = t.elapsed().as_millis() as u64, "refs cache materialized from pending txns");
+                        tracing::debug!(repo = %self.inner.id, refs = c.data.refs.len(), ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX), "refs cache materialized from pending txns");
                     }
                 }
                 return Ok(c.data.clone());
@@ -1058,7 +1083,7 @@ impl LocalRepo {
             .refs_parses
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if data.refs.len() >= 10_000 {
-            tracing::debug!(repo = %self.inner.id, refs = data.refs.len(), ms = t.elapsed().as_millis() as u64, "refs parsed into the cache");
+            tracing::debug!(repo = %self.inner.id, refs = data.refs.len(), ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX), "refs parsed into the cache");
         }
         *self.inner.refs_cache.lock() = Some(RefsCached {
             key,
@@ -1173,14 +1198,14 @@ impl LocalRepo {
                         return Err(GitError::RefConflict {
                             name: u.name.clone(),
                             expected: u.old_oid.clone(),
-                            actual: current.to_string(),
+                            actual: current.clone(),
                         });
                     }
                 } else if old != cur {
                     return Err(GitError::RefConflict {
                         name: u.name.clone(),
                         expected: u.old_oid.clone(),
-                        actual: current.to_string(),
+                        actual: current.clone(),
                     });
                 }
             }
@@ -1205,16 +1230,41 @@ impl LocalRepo {
             if new_zero {
                 // delete
                 if check_old && !old_zero {
-                    input.push_str(&format!("delete {} {}\n", u.name, u.old_oid));
+                    {
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut input,
+                            format_args!("delete {} {}\n", u.name, u.old_oid),
+                        );
+                    };
                 } else {
-                    input.push_str(&format!("delete {}\n", u.name));
+                    {
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut input,
+                            format_args!("delete {}\n", u.name),
+                        );
+                    };
                 }
             } else if check_old && old_zero {
-                input.push_str(&format!("create {} {}\n", u.name, u.new_oid));
+                {
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut input,
+                        format_args!("create {} {}\n", u.name, u.new_oid),
+                    );
+                };
             } else if check_old && !old_zero {
-                input.push_str(&format!("update {} {} {}\n", u.name, u.new_oid, u.old_oid));
+                {
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut input,
+                        format_args!("update {} {} {}\n", u.name, u.new_oid, u.old_oid),
+                    );
+                };
             } else {
-                input.push_str(&format!("update {} {}\n", u.name, u.new_oid));
+                {
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut input,
+                        format_args!("update {} {}\n", u.name, u.new_oid),
+                    );
+                };
             }
         }
 
@@ -1230,7 +1280,10 @@ impl LocalRepo {
                 .spawn()
                 .and_then(|mut c| {
                     {
-                        let stdin = c.stdin.as_mut().unwrap();
+                        let stdin = c
+                            .stdin
+                            .as_mut()
+                            .ok_or_else(|| std::io::Error::other("git stdin unavailable"))?;
                         stdin.write_all(input.as_bytes())?;
                     }
                     c.wait_with_output()
@@ -1295,14 +1348,14 @@ impl LocalRepo {
         &self,
         base: &RefSnapshotData,
         txns: &[walgit_proto::v1::RefTransaction],
-    ) -> RefSnapshotData {
+    ) -> Result<RefSnapshotData, GitError> {
         let mut refs = base.refs.clone();
         let mut head_target = base.head_target.clone();
         let mut repo: Option<gix::Repository> = None;
         for u in txns.iter().flat_map(|t| t.updates.iter()) {
             if !u.new_symbolic_target.is_empty() {
                 if u.name == "HEAD" {
-                    head_target = u.new_symbolic_target.clone();
+                    head_target.clone_from(&u.new_symbolic_target);
                 }
                 continue;
             }
@@ -1316,12 +1369,16 @@ impl LocalRepo {
                 (pos, false) => {
                     let mut peeled = u.new_peeled.clone();
                     if peeled.is_empty() && u.name.starts_with("refs/tags/") {
-                        let r = repo.get_or_insert_with(|| {
-                            gix::Repository::from(
-                                &gix::ThreadSafeRepository::open(&self.inner.path)
-                                    .expect("repo open"),
+                        if repo.is_none() {
+                            repo = Some(gix::Repository::from(
+                                &gix::ThreadSafeRepository::open(&self.inner.path).map_err(ge)?,
+                            ));
+                        }
+                        let r = repo.as_ref().ok_or_else(|| {
+                            GitError::InvalidInput(
+                                "repository unavailable while peeling tag".into(),
                             )
-                        });
+                        })?;
                         if let Ok(oid) = gix_hash::ObjectId::from_hex(u.new_oid.as_bytes()) {
                             peeled = peel_tag(r, oid)
                                 .map(|p| p.to_hex().to_string())
@@ -1334,13 +1391,17 @@ impl LocalRepo {
                         peeled,
                     };
                     match pos {
-                        Ok(i) => refs[i] = entry,
+                        Ok(i) => {
+                            *refs.get_mut(i).ok_or_else(|| {
+                                GitError::InvalidInput("ref search index out of bounds".into())
+                            })? = entry;
+                        }
                         Err(i) => refs.insert(i, entry),
                     }
                 }
             }
         }
-        RefSnapshotData { refs, head_target }
+        Ok(RefSnapshotData { refs, head_target })
     }
 
     /// Replace ALL refs + HEAD by writing `packed-refs` directly and removing
@@ -1354,9 +1415,17 @@ impl LocalRepo {
         let mut refs = snap.refs.clone();
         refs.sort_by(|a, b| a.name.cmp(&b.name));
         for r in &refs {
-            content.push_str(&format!("{} {}\n", r.oid, r.name));
+            {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut content,
+                    format_args!("{} {}\n", r.oid, r.name),
+                );
+            };
             if !r.peeled.is_empty() {
-                content.push_str(&format!("^{}\n", r.peeled));
+                {
+                    let _ =
+                        std::fmt::Write::write_fmt(&mut content, format_args!("^{}\n", r.peeled));
+                };
             }
         }
         // Atomic write.
@@ -1412,7 +1481,7 @@ impl LocalRepo {
                 validate_ref_update(u)?;
                 if !u.new_symbolic_target.is_empty() {
                     if u.name == "HEAD" {
-                        head_target = u.new_symbolic_target.clone();
+                        head_target.clone_from(&u.new_symbolic_target);
                     }
                     continue;
                 }
@@ -1478,8 +1547,14 @@ impl LocalRepo {
             .inner
             .path
             .join("objects")
-            .join(&hex[..2])
-            .join(&hex[2..]);
+            .join(
+                hex.get(..2)
+                    .ok_or_else(|| GitError::InvalidInput("short object ID".into()))?,
+            )
+            .join(
+                hex.get(2..)
+                    .ok_or_else(|| GitError::InvalidInput("short object ID".into()))?,
+            );
         if path.exists() {
             return Ok(());
         }
@@ -1492,14 +1567,14 @@ impl LocalRepo {
         );
         store
             .write_buf_with_known_id(kind, data, oid.to_owned())
-            .map_err(|e| GitError::Gix(e))?;
+            .map_err(GitError::Gix)?;
         Ok(())
     }
 
-    /// Every object reachable from tips exists. When stop_at_existing_refs,
+    /// Every object reachable from tips exists. When `stop_at_existing_refs`,
     /// objects already reachable from current refs are assumed present and
-    /// only the new set is verified. Uses gix revwalk with .with_hidden(
-    /// existing ref tips) for commit traversal and gix_traverse::tree
+    /// only the new set is verified. Uses gix revwalk with .`with_hidden`(
+    /// existing ref tips) for commit traversal and `gix_traverse::tree`
     /// breadthfirst for tree traversal with a seen-set.
     pub fn check_connectivity(
         &self,
@@ -1580,10 +1655,10 @@ impl LocalRepo {
             let mut out = Vec::with_capacity(snap.refs.len());
             for r in &snap.refs {
                 // Prefer the pre-peeled oid for tags; otherwise peel cheaply via the odb.
-                let candidate = if !r.peeled.is_empty() {
-                    r.peeled.as_str()
-                } else {
+                let candidate = if r.peeled.is_empty() {
                     r.oid.as_str()
+                } else {
+                    r.peeled.as_str()
                 };
                 let Ok(oid) = gix_hash::ObjectId::from_hex(candidate.as_bytes()) else {
                     continue;
@@ -1622,7 +1697,7 @@ impl LocalRepo {
             if !seen.insert(cid) {
                 continue;
             }
-            if !repo.has_object(&cid) {
+            if !repo.has_object(cid) {
                 return Err(GitError::MissingObject {
                     oid: cid.to_hex().to_string(),
                 });
@@ -1632,9 +1707,9 @@ impl LocalRepo {
                 .objects
                 .find_commit_iter(&cid, &mut buf)
                 .map_err(|e| GitError::Gix(Box::new(e)))?;
-            let tree_id = commit.tree_id().map_err(|e| ge(e))?;
+            let tree_id = commit.tree_id().map_err(ge)?;
             if seen.insert(tree_id) {
-                if !repo.has_object(&tree_id) {
+                if !repo.has_object(tree_id) {
                     return Err(GitError::MissingObject {
                         oid: tree_id.to_hex().to_string(),
                     });
@@ -1686,9 +1761,9 @@ impl LocalRepo {
     /// protocol v2 fetch with in-process gix pack generation. Handles
     /// negotiation (ACK common haves that exist, NAK, ready), shallow-info
     /// (deepen by depth), wanted-refs, then generates the packfile via
-    /// gix_pack::data::output (count + entries with delta reuse from on-disk
+    /// `gix_pack::data::output` (count + entries with delta reuse from on-disk
     /// packs), framed in sideband-64k (channel 1; progress on 2 unless
-    /// no_progress) with a final flush. UploadPackStats populated with object
+    /// `no_progress`) with a final flush. `UploadPackStats` populated with object
     /// count and byte count.
     pub async fn upload_pack<W: AsyncWrite + Unpin + Send>(
         &self,
@@ -1756,7 +1831,8 @@ impl LocalRepo {
             snap.refs
                 .binary_search_by(|r| r.name.as_str().cmp(head_target.as_str()))
                 .ok()
-                .map(|i| snap.refs[i].oid.clone())
+                .and_then(|i| snap.refs.get(i))
+                .map(|r| r.oid.clone())
         };
         // Prefix selection is O(log n + k) over the name-sorted list: each
         // prefix is one range (binary search for its start, scan while it
@@ -1770,7 +1846,11 @@ impl LocalRepo {
                 .map(|p| {
                     let start = snap.refs.partition_point(|r| r.name.as_str() < p.as_str());
                     let mut end = start;
-                    while end < snap.refs.len() && snap.refs[end].name.starts_with(p.as_str()) {
+                    while snap
+                        .refs
+                        .get(end)
+                        .is_some_and(|r| r.name.starts_with(p.as_str()))
+                    {
                         end += 1;
                     }
                     (start, end)
@@ -1782,7 +1862,14 @@ impl LocalRepo {
             for (a, b) in ranges {
                 let a = a.max(cursor);
                 if a < b {
-                    out.extend(snap.refs[a..b].iter());
+                    out.extend(
+                        snap.refs
+                            .get(a..b)
+                            .ok_or_else(|| {
+                                GitError::InvalidInput("ref prefix range out of bounds".into())
+                            })?
+                            .iter(),
+                    );
                     cursor = b;
                 }
             }
@@ -1832,7 +1919,7 @@ impl LocalRepo {
     pub fn advertise_refs_v0(&self, service: Service, out: &mut Vec<u8>) -> Result<(), GitError> {
         let snap = self.refs()?;
         let caps = capabilities_for(service, self.inner.format);
-        let caps_line = format!("\0{}\n", caps);
+        let caps_line = format!("\0{caps}\n");
 
         if snap.refs.is_empty() {
             // No refs: emit the capabilities line with a zero id and
@@ -1861,16 +1948,16 @@ impl LocalRepo {
             }
             // Include HEAD if it has a resolvable target and isn't already the
             // first advertised ref (upload-pack advertises HEAD).
-            if !head_target.is_empty() && service == Service::UploadPack {
-                if let Some(oid) = snap
+            if !head_target.is_empty()
+                && service == Service::UploadPack
+                && let Some(oid) = snap
                     .refs
                     .iter()
                     .find(|r| r.name == head_target)
                     .map(|r| r.oid.clone())
-                {
-                    let head_line = format!("{oid} HEAD\n");
-                    pkt::encode_data(out, head_line.as_bytes());
-                }
+            {
+                let head_line = format!("{oid} HEAD\n");
+                pkt::encode_data(out, head_line.as_bytes());
             }
         }
         pkt::encode_flush(out);
@@ -1950,7 +2037,7 @@ impl LocalRepo {
                 }
             }
         }
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = args.iter().map(std::string::String::as_str).collect();
         let out = self.git(&arg_refs).await?;
         if !out.status.success() {
             return Err(GitError::Subprocess {
@@ -2026,7 +2113,7 @@ impl LocalRepo {
             let po_stdout: Stdio = po
                 .stdout
                 .take()
-                .expect("stdout")
+                .ok_or_else(|| std::io::Error::other("git stdout unavailable"))?
                 .try_into()
                 .map_err(GitError::Io)?;
             let ip = tokio::process::Command::new("git")
@@ -2048,7 +2135,10 @@ impl LocalRepo {
                 .map_err(GitError::Io)?;
             {
                 use tokio::io::AsyncWriteExt;
-                let mut stdin = po.stdin.take().expect("stdin");
+                let mut stdin = po
+                    .stdin
+                    .take()
+                    .ok_or_else(|| std::io::Error::other("git stdin unavailable"))?;
                 stdin
                     .write_all(revs.as_bytes())
                     .await
@@ -2173,17 +2263,20 @@ impl LocalRepo {
             .map(|p| format!("pack-{}.idx", p.checksum))
             .collect();
         for h in &history {
-            if let Some(base) = &h.history_of {
-                if let Some(b) = packs.iter().find(|p| &p.checksum.to_string() == base) {
-                    let n = format!("pack-{}.idx", b.checksum);
-                    if !names.contains(&n) {
-                        names.push(n);
-                    }
+            if let Some(base) = &h.history_of
+                && let Some(b) = packs.iter().find(|p| &p.checksum.to_string() == base)
+            {
+                let n = format!("pack-{}.idx", b.checksum);
+                if !names.contains(&n) {
+                    names.push(n);
                 }
             }
         }
-        let preferred = names[0].clone();
-        let input = names.iter().map(|n| format!("{n}\n")).collect::<String>();
+        let preferred = names
+            .first()
+            .ok_or_else(|| GitError::InvalidInput("no pack names".into()))?
+            .clone();
+        let input = format!("{}\n", names.join("\n"));
         let out = std::process::Command::new("git")
             .current_dir(&self.inner.path)
             .env("GIT_DIR", &self.inner.path)
@@ -2198,7 +2291,10 @@ impl LocalRepo {
             .stderr(Stdio::piped())
             .spawn()
             .and_then(|mut c| {
-                c.stdin.take().unwrap().write_all(input.as_bytes())?;
+                c.stdin
+                    .take()
+                    .ok_or_else(|| std::io::Error::other("git stdin unavailable"))?
+                    .write_all(input.as_bytes())?;
                 c.wait_with_output()
             })
             .map_err(GitError::Io)?;
@@ -2255,7 +2351,7 @@ impl LocalRepo {
         let tmp = dst.with_extension("commit-graph.tmp");
         std::fs::copy(&src, &tmp).map_err(GitError::Io)?;
         rename_atomic(&tmp, &dst)?;
-        Ok(std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0))
+        Ok(std::fs::metadata(&dst).map_or(0, |m| m.len()))
     }
 
     /// Hashes listed in `objects/info/commit-graphs/commit-graph-chain`
@@ -2285,7 +2381,7 @@ impl LocalRepo {
         }
         let hash = commit_graph_layer_hash(&side)?;
         let chain = self.commit_graph_chain()?;
-        if chain.first().map(|h| h == &hash).unwrap_or(false) {
+        if chain.first().is_some_and(|h| h == &hash) {
             return Ok(true);
         }
         let dir = self.commit_graphs_dir();
@@ -2335,7 +2431,12 @@ impl LocalRepo {
         }
         let mut input = String::new();
         for p in packs {
-            input.push_str(&format!("pack-{}.idx\n", p.to_hex()));
+            {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut input,
+                    format_args!("pack-{}.idx\n", p.to_hex()),
+                );
+            };
         }
         let mut args = vec!["write", "--split", "--stdin-packs"];
         if changed_paths {
@@ -2387,7 +2488,7 @@ impl LocalRepo {
                 stderr: String::from_utf8_lossy(&bundle_out.stderr).into_owned(),
             });
         }
-        let size = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+        let size = std::fs::metadata(out).map_or(0, |m| m.len());
         let pack_offset = locate_pack_offset(out).unwrap_or(size);
         Ok(BundleInfo { size, pack_offset })
     }
@@ -2477,7 +2578,7 @@ impl LocalRepo {
 
     /// In-process gix upload-pack for protocol v2 fetch. Builds the response
     /// sections (acknowledgments, shallow-info, wanted-refs, packfile) and
-    /// generates the pack using gix_pack::data::output.
+    /// generates the pack using `gix_pack::data::output`.
     async fn upload_pack_gix<W: AsyncWrite + Unpin + Send>(
         &self,
         req: UploadPackRequest,
@@ -2503,7 +2604,7 @@ impl LocalRepo {
         stdin_bytes: &[u8],
     ) -> Result<std::process::Output, GitError> {
         let path = self.inner.path.clone();
-        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let args: Vec<String> = args.iter().map(std::string::ToString::to_string).collect();
         let stdin_bytes: Vec<u8> = stdin_bytes.to_vec();
         let cmd_name = cmd_name.to_string();
         let res = tokio::task::spawn_blocking(move || {
@@ -2519,7 +2620,10 @@ impl LocalRepo {
                 .stderr(Stdio::piped());
             let mut child = cmd.spawn().map_err(GitError::Io)?;
             {
-                let stdin = child.stdin.as_mut().unwrap();
+                let stdin = child
+                    .stdin
+                    .as_mut()
+                    .ok_or_else(|| std::io::Error::other("git stdin unavailable"))?;
                 stdin.write_all(&stdin_bytes).map_err(GitError::Io)?;
             }
             child.wait_with_output().map_err(GitError::Io)
@@ -2559,8 +2663,14 @@ impl LocalRepo {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = cmd.spawn().map_err(GitError::Io)?;
-        let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = child.stdout.take().unwrap();
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("git stdin unavailable"))?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("git stdout unavailable"))?;
         // Copy the request body into stdin first, then close stdin so the
         // subprocess sees EOF and can finish + exit. Only then drain stdout:
         // `copy_out` blocks on stdout EOF (subprocess exit), and the subprocess
@@ -2630,8 +2740,7 @@ fn unique_suffix() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     format!("{}-{}", std::process::id(), nanos)
 }
 
@@ -2654,12 +2763,12 @@ fn idx_object_count(idx_path: &Path) -> Result<u64, GitError> {
     let mut head = [0u8; 8];
     f.read_exact(&mut head).map_err(GitError::Io)?;
     let is_v2 = &head[..4] == b"\xfftOc";
-    let fanout_off = if is_v2 { 8 + 255 * 4 } else { 255 * 4 };
-    f.seek(std::io::SeekFrom::Start(fanout_off as u64))
+    let fanout_off: u64 = if is_v2 { 8 + 255 * 4 } else { 255 * 4 };
+    f.seek(std::io::SeekFrom::Start(fanout_off))
         .map_err(GitError::Io)?;
     let mut buf = [0u8; 4];
     f.read_exact(&mut buf).map_err(GitError::Io)?;
-    Ok(u32::from_be_bytes(buf) as u64)
+    Ok(u64::from(u32::from_be_bytes(buf)))
 }
 struct IndexPackOutcome {
     checksum: gix_hash::ObjectId,
@@ -2668,8 +2777,8 @@ struct IndexPackOutcome {
     object_count: u64,
     /// Time spent copying the pack into index-pack stdin.
     feed_ms: u64,
-    /// `exit.t_abs` from GIT_TRACE2_EVENT (whole child). index-pack itself
-    /// emits no region_leave events today; any that appear (future git) are
+    /// `exit.t_abs` from `GIT_TRACE2_EVENT` (whole child). index-pack itself
+    /// emits no `region_leave` events today; any that appear (future git) are
     /// in `phases`.
     git_ms: u64,
     /// Compact `k=ms` list: always `feed` + `git`, plus every TRACE2
@@ -2740,7 +2849,7 @@ fn git_index_pack(
         let mut file = file;
         std::io::copy(&mut file, &mut stdin).map_err(GitError::Io)?;
     }
-    let feed_ms = feed_started.elapsed().as_millis() as u64;
+    let feed_ms = u64::try_from(feed_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let output = child.wait_with_output().map_err(GitError::Io)?;
     let trace = std::fs::read_to_string(&trace_path).unwrap_or_default();
     let _ = std::fs::remove_file(&trace_path);
@@ -2797,6 +2906,11 @@ struct Trace2Phases {
     regions: Vec<(String, u64)>,
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "Trace display milliseconds intentionally round up and saturate float-to-int conversion"
+)]
 fn secs_to_ms(t: f64) -> u64 {
     let ms = (t * 1000.0).ceil() as u64;
     if t > 0.0 && ms == 0 { 1 } else { ms }
@@ -2807,7 +2921,7 @@ fn json_str_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let pat = format!("\"{key}\":\"");
     let rest = line.split_once(&pat)?.1;
     let end = rest.find('"')?;
-    Some(&rest[..end])
+    rest.get(..end)
 }
 
 fn json_f64_field(line: &str, key: &str) -> Option<f64> {
@@ -2888,10 +3002,10 @@ fn find_conflict(stderr: &str) -> Option<String> {
     // git update-ref prints: "cannot lock ref '<name>' ... : ..." or similar.
     // Best-effort: extract a ref name appearing in a quoted context.
     for line in stderr.lines() {
-        if let Some((_, rest)) = line.split_once("cannot lock ref '") {
-            if let Some((name, _)) = rest.split_once('\'') {
-                return Some(name.to_string());
-            }
+        if let Some((_, rest)) = line.split_once("cannot lock ref '")
+            && let Some((name, _)) = rest.split_once('\'')
+        {
+            return Some(name.to_string());
         }
         if let Some((_, rest)) = line.split_once("ref ") {
             // "ref refs/heads/main: expected ..."
@@ -2916,7 +3030,8 @@ pub(crate) fn read_refs(repo_path: &Path) -> Result<RefSnapshotData, GitError> {
                 String::new()
             }
         }
-        Err(_) => String::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
     };
 
     let mut map: BTreeMap<String, (String, String)> = BTreeMap::new();
@@ -2930,10 +3045,10 @@ pub(crate) fn read_refs(repo_path: &Path) -> Result<RefSnapshotData, GitError> {
                 continue;
             }
             if let Some(rest) = line.strip_prefix('^') {
-                if let Some(name) = &last {
-                    if let Some((_, peeled)) = map.get_mut(name) {
-                        *peeled = rest.trim().to_string();
-                    }
+                if let Some(name) = &last
+                    && let Some((_, peeled)) = map.get_mut(name)
+                {
+                    *peeled = rest.trim().to_string();
                 }
                 continue;
             }
@@ -2985,34 +3100,33 @@ pub(crate) fn read_refs(repo_path: &Path) -> Result<RefSnapshotData, GitError> {
 }
 
 fn walk_loose_refs(dir: &Path, prefix: &str, map: &mut BTreeMap<String, (String, String)>) {
-    let rd = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(_) => return,
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
     };
     for ent in rd.flatten() {
         let path = ent.path();
         let name = format!("{prefix}/{}", ent.file_name().to_string_lossy());
         if path.is_dir() {
             walk_loose_refs(&path, &name, map);
-        } else if path.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                let s = content.trim();
-                if let Some(t) = s.strip_prefix("ref: ") {
-                    // Symbolic loose ref: resolve target oid later if present.
-                    // We record the target name in the oid slot is wrong;
-                    // instead skip (packed-refs usually has the real value, or
-                    // the symref target is resolved at read time elsewhere).
-                    // For HEAD-only symref we handle separately; loose symrefs
-                    // under refs/ are rare. Record empty oid if unresolved.
-                    let target = t.trim();
-                    if let Some((o, _)) = map.get(target).cloned() {
-                        map.insert(name, (o, String::new()));
-                    }
-                    continue;
+        } else if path.is_file()
+            && let Ok(content) = std::fs::read_to_string(&path)
+        {
+            let s = content.trim();
+            if let Some(t) = s.strip_prefix("ref: ") {
+                // Symbolic loose ref: resolve target oid later if present.
+                // We record the target name in the oid slot is wrong;
+                // instead skip (packed-refs usually has the real value, or
+                // the symref target is resolved at read time elsewhere).
+                // For HEAD-only symref we handle separately; loose symrefs
+                // under refs/ are rare. Record empty oid if unresolved.
+                let target = t.trim();
+                if let Some((o, _)) = map.get(target).cloned() {
+                    map.insert(name, (o, String::new()));
                 }
-                if !s.is_empty() {
-                    map.insert(name, (s.to_string(), String::new()));
-                }
+                continue;
+            }
+            if !s.is_empty() {
+                map.insert(name, (s.to_string(), String::new()));
             }
         }
     }
@@ -3032,12 +3146,11 @@ impl LocalRepo {
             if u.new_oid.bytes().all(|b| b == b'0') {
                 continue;
             }
-            if let Ok(oid) = gix_hash::ObjectId::from_hex(u.new_oid.as_bytes()) {
-                if let Some(p) = peel_tag(&repo, oid) {
-                    if p != oid {
-                        u.new_peeled = p.to_hex().to_string();
-                    }
-                }
+            if let Ok(oid) = gix_hash::ObjectId::from_hex(u.new_oid.as_bytes())
+                && let Some(p) = peel_tag(&repo, oid)
+                && p != oid
+            {
+                u.new_peeled = p.to_hex().to_string();
             }
         }
     }
@@ -3047,9 +3160,8 @@ fn peel_tag(repo: &gix::Repository, oid: gix_hash::ObjectId) -> Option<gix_hash:
     let kind = repo.object_hash();
     let mut cur = oid;
     for _ in 0..16 {
-        let obj = match repo.find_object(cur) {
-            Ok(o) => o,
-            Err(_) => return None,
+        let Ok(obj) = repo.find_object(cur) else {
+            return None;
         };
         if obj.kind == gix_object::Kind::Tag {
             let tag = gix_object::TagRef::from_bytes(&obj.data, kind).ok()?;
@@ -3137,7 +3249,7 @@ fn locate_pack_offset(path: &Path) -> Option<u64> {
         if n == 0 {
             return None;
         }
-        if let Some(i) = find_subsequence(&buf[..n], b"PACK") {
+        if let Some(i) = find_subsequence(buf.get(..n)?, b"PACK") {
             return Some(pos + i as u64);
         }
         // Seek back a little to handle boundary splits.
@@ -3193,7 +3305,7 @@ struct ConnectivityVisitor<'a> {
     missing: Option<gix_hash::ObjectId>,
 }
 
-impl<'a> TreeVisit for ConnectivityVisitor<'a> {
+impl TreeVisit for ConnectivityVisitor<'_> {
     fn pop_front_tracked_path_and_set_current(&mut self) {}
     fn pop_back_tracked_path_and_set_current(&mut self) {}
     fn push_back_tracked_path_component(&mut self, _c: &gix_object::bstr::BStr) {}
@@ -3225,17 +3337,15 @@ impl<'a> TreeVisit for ConnectivityVisitor<'a> {
         if entry.mode.is_commit() {
             return std::ops::ControlFlow::Continue(true);
         }
-        if self.seen.insert(entry.oid.to_owned()) {
-            if !self.repo.has_object(entry.oid) {
-                self.missing = Some(entry.oid.to_owned());
-                return std::ops::ControlFlow::Break(());
-            }
+        if self.seen.insert(entry.oid.to_owned()) && !self.repo.has_object(entry.oid) {
+            self.missing = Some(entry.oid.to_owned());
+            return std::ops::ControlFlow::Break(());
         }
         std::ops::ControlFlow::Continue(true)
     }
 }
 
-/// Parse a filter spec string into a PackFilter.
+/// Parse a filter spec string into a `PackFilter`.
 #[derive(Debug, Clone)]
 pub(crate) enum PackFilter {
     None,
@@ -3248,21 +3358,21 @@ pub(crate) fn parse_filter(spec: &str) -> PackFilter {
     if spec == "blob:none" {
         return PackFilter::BlobNone;
     }
-    if let Some(rest) = spec.strip_prefix("blob:limit=") {
-        if let Ok(n) = rest.parse::<u64>() {
-            return PackFilter::BlobLimit(n);
-        }
+    if let Some(rest) = spec.strip_prefix("blob:limit=")
+        && let Ok(n) = rest.parse::<u64>()
+    {
+        return PackFilter::BlobLimit(n);
     }
-    if let Some(rest) = spec.strip_prefix("tree:") {
-        if let Ok(n) = rest.parse::<usize>() {
-            return PackFilter::Tree(n);
-        }
+    if let Some(rest) = spec.strip_prefix("tree:")
+        && let Ok(n) = rest.parse::<usize>()
+    {
+        return PackFilter::Tree(n);
     }
     PackFilter::None
 }
 
 /// Compute the object set for a pack: reachable(wants) - reachable(common
-/// haves), honoring filters and include_tag.
+/// haves), honoring filters and `include_tag`.
 ///
 /// Handles non-commit wants (blobs, trees, tags) for partial-clone lazy fetch
 /// where the client sends `want <blob-oid>` directly.
@@ -3274,7 +3384,7 @@ pub(crate) fn compute_object_set(
     include_tag: bool,
     deepen: Option<u32>,
 ) -> Result<HashSet<gix_hash::ObjectId>, GitError> {
-    let pack_filter = filter.map(parse_filter).unwrap_or(PackFilter::None);
+    let pack_filter = filter.map_or(PackFilter::None, parse_filter);
     let mut set: HashSet<gix_hash::ObjectId> = HashSet::new();
     let mut buf = Vec::new();
     let kind = repo.object_hash();
@@ -3292,21 +3402,20 @@ pub(crate) fn compute_object_set(
                     // Follow tag chain to final target.
                     let mut cur = *w;
                     loop {
-                        let obj = repo.find_object(cur).map_err(|e| ge(e))?;
+                        let obj = repo.find_object(cur).map_err(ge)?;
                         if obj.kind != ObjKind::Tag {
                             break;
                         }
-                        let tag =
-                            gix_object::TagRef::from_bytes(&obj.data, kind).map_err(|e| ge(e))?;
+                        let tag = gix_object::TagRef::from_bytes(&obj.data, kind).map_err(ge)?;
                         let target = tag.target();
                         set.insert(target);
                         cur = target;
                     }
                     // If the final target is a commit, rev-walk from it.
-                    if let Ok(Some(h)) = repo.objects.try_header(&cur) {
-                        if h.kind == ObjKind::Commit {
-                            commit_wants.push(cur);
-                        }
+                    if let Ok(Some(h)) = repo.objects.try_header(&cur)
+                        && h.kind == ObjKind::Commit
+                    {
+                        commit_wants.push(cur);
                     }
                 }
                 ObjKind::Tree => {
@@ -3339,10 +3448,10 @@ pub(crate) fn compute_object_set(
             .rev_walk(commit_wants.iter().copied())
             .with_hidden(hidden.iter().copied())
             .all()
-            .map_err(|e| ge(e))?;
+            .map_err(ge)?;
 
         for item in walk {
-            let info = item.map_err(|e| ge(e))?;
+            let info = item.map_err(ge)?;
             let cid = info.id;
             if !set.insert(cid) {
                 continue;
@@ -3353,11 +3462,8 @@ pub(crate) fn compute_object_set(
                 // commit and walking its tree here as well.
                 continue;
             }
-            let mut commit = repo
-                .objects
-                .find_commit_iter(&cid, &mut buf)
-                .map_err(|e| ge(e))?;
-            let tree_id = commit.tree_id().map_err(|e| ge(e))?;
+            let mut commit = repo.objects.find_commit_iter(&cid, &mut buf).map_err(ge)?;
+            let tree_id = commit.tree_id().map_err(ge)?;
 
             // `tree:0` sends no trees at all, the root included.
             if matches!(pack_filter, PackFilter::Tree(0)) {
@@ -3378,14 +3484,13 @@ pub(crate) fn compute_object_set(
                     if set.contains(&tag_oid) {
                         continue;
                     }
-                    if let Ok(obj) = repo.find_object(tag_oid) {
-                        if obj.kind == ObjKind::Tag {
-                            if let Ok(tag) = gix_object::TagRef::from_bytes(&obj.data, kind) {
-                                let target = tag.target();
-                                if set.contains(&target) {
-                                    set.insert(tag_oid);
-                                }
-                            }
+                    if let Ok(obj) = repo.find_object(tag_oid)
+                        && obj.kind == ObjKind::Tag
+                        && let Ok(tag) = gix_object::TagRef::from_bytes(&obj.data, kind)
+                    {
+                        let target = tag.target();
+                        if set.contains(&target) {
+                            set.insert(tag_oid);
                         }
                     }
                 }
@@ -3408,23 +3513,20 @@ pub(crate) fn walk_tree_with_filter(
     buf: &mut Vec<u8>,
 ) -> Result<(), GitError> {
     // Collect entries first to end the mutable borrow of buf before recursing.
-    let tree_iter = repo
-        .objects
-        .find_tree_iter(&tree_id, buf)
-        .map_err(|e| ge(e))?;
+    let tree_iter = repo.objects.find_tree_iter(&tree_id, buf).map_err(ge)?;
     let entries: Vec<(gix_object::tree::EntryMode, gix_hash::ObjectId)> = tree_iter
         .map(|res| {
-            let e = res.map_err(|e| ge(e))?;
+            let e = res.map_err(ge)?;
             Ok((e.mode, e.oid.to_owned()))
         })
         .collect::<Result<_, GitError>>()?;
     for (mode, oid) in entries {
         if mode.is_tree() {
-            if let PackFilter::Tree(max_depth) = filter {
-                if depth + 1 > *max_depth {
-                    set.insert(oid);
-                    continue;
-                }
+            if let PackFilter::Tree(max_depth) = filter
+                && depth + 1 > *max_depth
+            {
+                set.insert(oid);
+                continue;
             }
             if set.insert(oid) {
                 walk_tree_with_filter(repo, oid, set, filter, depth + 1, buf)?;
@@ -3437,12 +3539,11 @@ pub(crate) fn walk_tree_with_filter(
             if matches!(filter, PackFilter::BlobNone) {
                 continue;
             }
-            if let PackFilter::BlobLimit(limit) = filter {
-                if let Ok(Some(hdr)) = repo.objects.try_header(&oid) {
-                    if hdr.size > *limit {
-                        continue;
-                    }
-                }
+            if let PackFilter::BlobLimit(limit) = filter
+                && let Ok(Some(hdr)) = repo.objects.try_header(&oid)
+                && hdr.size > *limit
+            {
+                continue;
             }
             set.insert(oid);
         }
@@ -3479,12 +3580,8 @@ pub(crate) fn compute_shallow(
             if !seen.insert(*cid) {
                 continue;
             }
-            let commit = repo
-                .objects
-                .find_commit_iter(cid, &mut buf)
-                .map_err(|e| ge(e))?;
-            let parents: Vec<gix_hash::ObjectId> =
-                commit.parent_ids().map(|p| p.to_owned()).collect();
+            let commit = repo.objects.find_commit_iter(cid, &mut buf).map_err(ge)?;
+            let parents: Vec<gix_hash::ObjectId> = commit.parent_ids().collect();
             if d == depth.max(1) {
                 if !parents.is_empty() {
                     shallow.push(*cid);
@@ -3504,12 +3601,14 @@ pub(crate) fn compute_shallow(
 }
 
 /// Compute the SHA checksum trailer for a pack header (used for empty packs).
-pub(crate) fn compute_pack_trailer(data: &[u8], kind: gix_hash::Kind) -> gix_hash::ObjectId {
+pub(crate) fn compute_pack_trailer(
+    data: &[u8],
+    kind: gix_hash::Kind,
+) -> Result<gix_hash::ObjectId, GitError> {
     use gix_hash::hasher;
     let mut h = hasher(kind);
     h.update(data);
-    // try_finalize always succeeds when the hasher has been fed data.
-    h.try_finalize().expect("hash finalization must succeed")
+    h.try_finalize().map_err(ge)
 }
 
 /// The hash git names a split commit-graph layer by: the file's trailing
@@ -3517,20 +3616,22 @@ pub(crate) fn compute_pack_trailer(data: &[u8], kind: gix_hash::Kind) -> gix_has
 fn commit_graph_layer_hash(path: &Path) -> Result<String, GitError> {
     let data = std::fs::read(path).map_err(GitError::Io)?;
     // Header: "CGPH" version(1) hash-version(1) chunks(1) base-graphs(1)
-    if data.len() < 8 || &data[..4] != b"CGPH" {
+    if data.len() < 8 || !data.starts_with(b"CGPH") {
         return Err(GitError::InvalidInput(format!(
             "{} is not a commit-graph",
             path.display()
         )));
     }
-    let len = if data[5] == 2 { 32 } else { 20 };
+    let len = if data.get(5) == Some(&2) { 32 } else { 20 };
     if data.len() < 8 + len {
         return Err(GitError::InvalidInput(format!(
             "{} is truncated",
             path.display()
         )));
     }
-    Ok(hex::encode(&data[data.len() - len..]))
+    Ok(hex::encode(data.get(data.len() - len..).ok_or_else(
+        || GitError::InvalidInput("truncated graph checksum".into()),
+    )?))
 }
 
 /// Derive a pack's reverse index (`.rev`, RIDX v1) from its `.idx`: header
@@ -3550,8 +3651,8 @@ pub fn write_rev_from_idx(
     let n = index.num_objects();
     let mut by_offset: Vec<(u64, u32)> = index
         .iter()
-        .enumerate()
-        .map(|(i, e)| (e.pack_offset, i as u32))
+        .zip(0..n)
+        .map(|(e, i)| (e.pack_offset, i))
         .collect();
     by_offset.sort_unstable();
     let mut out = Vec::with_capacity(12 + 4 * n as usize + 2 * kind.len_in_bytes());
@@ -3644,8 +3745,8 @@ mod index_pack_trace_tests {
                 .spawn()
                 .unwrap();
             {
-                let mut stdin = child.stdin.take().unwrap();
                 use std::io::Write;
+                let mut stdin = child.stdin.take().expect("piped stdin");
                 stdin.write_all(b"HEAD\n").unwrap();
             }
             let out = child.wait_with_output().unwrap();

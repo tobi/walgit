@@ -201,8 +201,7 @@ pub async fn read_fsck(
 fn flag(params: &HashMap<String, String>, key: &str) -> bool {
     params
         .get(key)
-        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
 }
 
 async fn run(
@@ -276,7 +275,7 @@ async fn run(
                 .map_err(|e| format!("writing fsck.pb: {e}"))?;
             metrics::gauge!("walgit_repo_missing_objects", "repo" => id.to_string())
                 .set(missing.len() as f64);
-            tracing::info!(repo = %id, seq, missing = missing.len(), problems = report.problems, elapsed_ms = t0.elapsed().as_millis() as u64, "fsck recorded");
+            tracing::info!(repo = %id, seq, missing = missing.len(), problems = report.problems, elapsed_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX), "fsck recorded");
             let summary = if report.ok {
                 format!(
                     "fsck clean ({lines} lines, {:.0}s)",
@@ -378,7 +377,7 @@ async fn run(
                 .map_err(|e| format!("writing fsck.pb: {e}"))?;
             metrics::counter!("walgit_repair_objects_total", "repo" => id.to_string())
                 .increment(pack.objects);
-            tracing::info!(repo = %id, seq, objects = pack.objects, bytes = pack.bytes, %upstream, elapsed_ms = t0.elapsed().as_millis() as u64, "repair published");
+            tracing::info!(repo = %id, seq, objects = pack.objects, bytes = pack.bytes, %upstream, elapsed_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX), "repair published");
             Ok((
                 format!(
                     "repaired {} object(s) ({} bytes) from upstream at seq {seq}",
@@ -402,7 +401,7 @@ async fn run(
                 .write_rev_index(&oid)
                 .await
                 .map_err(|e| format!("rev-index: {e}"))?;
-            let bytes = std::fs::metadata(&rev).map(|m| m.len()).unwrap_or(0);
+            let bytes = std::fs::metadata(&rev).map_or(0, |m| m.len());
             log(format!(
                 "pack-{checksum}.rev: {bytes} bytes in {:.1}s; publishing",
                 t0.elapsed().as_secs_f64()
@@ -411,7 +410,7 @@ async fn run(
                 .annotate_pack(&checksum, Some(rev), None, None)
                 .await
                 .map_err(|e| format!("rev-index publish: {e}"))?;
-            tracing::info!(repo = %id, pack = %checksum, bytes, elapsed_ms = t0.elapsed().as_millis() as u64, "rev index published");
+            tracing::info!(repo = %id, pack = %checksum, bytes, elapsed_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX), "rev index published");
             Ok((
                 format!("pack-{checksum}.rev ({bytes} bytes) published"),
                 serde_json::json!({"pack": checksum, "bytes": bytes}),
@@ -445,8 +444,7 @@ async fn run(
                     "building {strategy} slot {slot} ({})",
                     walgit_bundle::slots::from_epoch(slot)
                         .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0)
+                        .map_or(0, |d| d.as_secs())
                 ));
                 // A FULL slot of a repository that has a tier-2 base is a compose
                 // of that base (header = refs at the base's seq) — never a

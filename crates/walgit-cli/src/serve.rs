@@ -106,7 +106,7 @@ async fn compact_loop(registry: Arc<walgit_wal::Registry>, cfg: Arc<Config>) {
         info!("compaction disabled by config, loop exiting");
         return;
     }
-    let interval = std::time::Duration::from_secs(60);
+    let interval = std::time::Duration::from_mins(1);
     loop {
         tokio::time::sleep(interval).await;
         if let Err(e) = run_compaction_pass(&registry, &cfg).await {
@@ -152,7 +152,7 @@ async fn bundle_loop(bundler: Arc<walgit_bundle::Bundler>, cfg: Arc<Config>) {
         info!("bundles disabled by config, loop exiting");
         return;
     }
-    let interval = std::time::Duration::from_secs(60);
+    let interval = std::time::Duration::from_mins(1);
     loop {
         tokio::time::sleep(interval).await;
         let now = std::time::SystemTime::now();

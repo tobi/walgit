@@ -28,7 +28,7 @@ fn to_chrono(t: SystemTime) -> DateTime<Utc> {
 
 /// Convert a chrono UTC datetime back to [`SystemTime`].
 fn to_system(dt: DateTime<Utc>) -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(dt.timestamp().max(0) as u64)
+    UNIX_EPOCH + Duration::from_secs(dt.timestamp().max(0).unsigned_abs())
 }
 
 /// Next fire time of `schedule` strictly after `after`, or `None` if the
@@ -57,11 +57,9 @@ pub fn is_due(schedule: &Schedule, last_built: Option<SystemTime>, now: SystemTi
     }
 }
 
-/// Current Unix timestamp in seconds (for creation_token computation).
+/// Current Unix timestamp in seconds (for `creation_token` computation).
 pub fn unix_now(now: SystemTime) -> u64 {
-    now.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 #[cfg(test)]
@@ -108,7 +106,7 @@ mod tests {
         let s = parse_schedule("@hourly").unwrap();
         let now = SystemTime::now();
         // Last built 2 hours ago → next fire was 1 hour ago → due.
-        let last = now - Duration::from_secs(2 * 3600);
+        let last = now - Duration::from_hours(2);
         assert!(is_due(&s, Some(last), now));
     }
 
@@ -129,6 +127,6 @@ mod tests {
         // Next fire should be after t.
         assert!(next > t);
         // And within 1 hour (hourly schedule).
-        assert!(next <= t + Duration::from_secs(3600));
+        assert!(next <= t + Duration::from_hours(1));
     }
 }

@@ -86,11 +86,11 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
                 }
                 match outcome.pushed.len() {
                     0 => debug!(
-                        elapsed_ms = t0.elapsed().as_millis() as u64,
+                        elapsed_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
                         "mirror: nothing to do"
                     ),
                     n => info!(
-                        elapsed_ms = t0.elapsed().as_millis() as u64,
+                        elapsed_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
                         refs = n,
                         "mirror: tick done"
                     ),
@@ -99,7 +99,7 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
             Err(e) => {
                 error!(
                     error = format!("{e:#}"),
-                    elapsed_ms = t0.elapsed().as_millis() as u64,
+                    elapsed_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
                     "mirror: tick failed"
                 );
                 if args.once {
@@ -160,7 +160,7 @@ impl Mirror {
             };
             if before.get(name) != Some(sha) {
                 out.fetched_anything = true;
-                info!(r#ref = %name, old = before.get(name).map(String::as_str).unwrap_or("-"), new = %sha, "mirror: source moved");
+                info!(r#ref = %name, old = before.get(name).map_or("-", String::as_str), new = %sha, "mirror: source moved");
             }
             if self.pushed.get(name) != Some(sha) {
                 candidates.push((name.clone(), sha.clone()));
@@ -197,8 +197,7 @@ impl Mirror {
                 Some(old) => self
                     .rev_list_count(old, sha)
                     .await
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|_| "?".into()),
+                    .map_or_else(|_| "?".into(), |n| n.to_string()),
                 None => "all".into(),
             };
             info!(r#ref = %name, old = old.as_deref().unwrap_or("-"), new = %sha, commits = %commits, to = %self.to, "mirror: pushing");
@@ -209,7 +208,7 @@ impl Mirror {
         for (name, sha, _) in to_push {
             match results.get(&name) {
                 Some(Ok(())) => {
-                    info!(r#ref = %name, sha = %sha, elapsed_ms = t0.elapsed().as_millis() as u64, "mirror: pushed");
+                    info!(r#ref = %name, sha = %sha, elapsed_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX), "mirror: pushed");
                     self.pushed.insert(name.clone(), sha);
                     out.pushed.push(name);
                 }
@@ -344,7 +343,7 @@ impl Mirror {
             };
             results.insert(name.to_string(), outcome);
         }
-        if !out.status.success() && results.values().all(|r| r.is_ok()) {
+        if !out.status.success() && results.values().all(std::result::Result::is_ok) {
             // Failed before any ref status (auth, connection, pack-objects): git said why on stderr.
             self.token.invalidate();
             bail!(
@@ -380,7 +379,7 @@ impl Mirror {
             String::from_utf8_lossy(&out.stderr).trim()
         );
         info!(
-            elapsed_ms = t0.elapsed().as_millis() as u64,
+            elapsed_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
             "mirror: repacked"
         );
         Ok(())
@@ -416,7 +415,7 @@ struct Token {
     value: Option<(String, Instant)>,
 }
 
-const TOKEN_MAX_AGE: Duration = Duration::from_secs(50 * 60);
+const TOKEN_MAX_AGE: Duration = Duration::from_mins(50);
 const METADATA_IDENTITY_URL: &str =
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity";
 
@@ -619,7 +618,7 @@ mod tests {
         }
     }
 
-    /// Source → buffer → destination over file://: first tick publishes everything, a moved
+    /// Source → buffer → destination over <file://>: first tick publishes everything, a moved
     /// source is pushed on the next tick, an unchanged source is a no-op (no push), a rewound
     /// source is rejected without `--force` and followed with it.
     #[tokio::test]

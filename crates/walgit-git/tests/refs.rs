@@ -255,7 +255,7 @@ fn ref_view_lookups_are_logarithmic_and_overlay_aware() {
     let mut view = RefView::new(snap.clone());
     assert_eq!(
         view.get("refs/heads/ref-123456").as_deref(),
-        Some(format!("{:040x}", 123456).as_str())
+        Some(format!("{:040x}", 123_456).as_str())
     );
     assert_eq!(
         view.get("HEAD").as_deref(),

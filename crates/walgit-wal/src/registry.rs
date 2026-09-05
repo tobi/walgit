@@ -1,4 +1,5 @@
-//! Registry: process-wide map of RepoId -> Arc<RepoHandle>.
+//! Registry: process-wide map of `RepoId` -> Arc<RepoHandle>.
+#![allow(clippy::unnecessary_wraps)]
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -95,18 +96,17 @@ impl Registry {
         let prefixed = Prefixed::new(self.store.clone(), prefix);
 
         // Read manifest (NotFound if absent)
-        let (meta, manifest) = match get_message::<Manifest>(&prefixed, keys::MANIFEST).await? {
-            Some(v) => v,
-            None => return Err(WalError::NotFound),
+        let Some((meta, manifest)) = get_message::<Manifest>(&prefixed, keys::MANIFEST).await?
+        else {
+            return Err(WalError::NotFound);
         };
 
         // Open or init local repo (LocalRepo joins owner/name.git onto the root).
-        let local = match LocalRepo::open(&self.cache_root, id)? {
-            Some(l) => l,
-            None => {
-                let format = parse_object_format(&manifest.object_format);
-                LocalRepo::init(&self.cache_root, id, format)?
-            }
+        let local = if let Some(l) = LocalRepo::open(&self.cache_root, id)? {
+            l
+        } else {
+            let format = parse_object_format(&manifest.object_format);
+            LocalRepo::init(&self.cache_root, id, format)?
         };
 
         // Load state
@@ -183,7 +183,7 @@ impl Registry {
         Ok(())
     }
 
-    /// CAS-create manifest.pb (PutMode::Create). Err(AlreadyExists) on 412.
+    /// CAS-create manifest.pb (`PutMode::Create`). Err(AlreadyExists) on 412.
     pub async fn create(
         &self,
         id: &RepoId,
@@ -341,8 +341,21 @@ impl Registry {
         Ok(repos)
     }
 
-    /// Disk cache maintenance: evict idle repos beyond cache.max_bytes / evict_idle_after.
-    pub async fn evict_idle(&self) -> Result<EvictReport, WalError> {
+    /// Disk cache maintenance: evict idle repos beyond `cache.max_bytes` / `evict_idle_after`.
+    pub async fn evict_idle(self: &Arc<Self>) -> Result<EvictReport, WalError> {
+        let registry = Arc::clone(self);
+        tokio::task::spawn_blocking(move || registry.evict_idle_blocking())
+            .await
+            .map_err(|e| WalError::Corrupt(format!("cache eviction task: {e}")))?
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "Disk watermarks are approximate nonnegative fractions, with truncation to whole bytes"
+    )]
+    fn evict_idle_blocking(&self) -> Result<EvictReport, WalError> {
         let evict_after = self.cfg.cache.evict_idle_after;
         // D25: budget mode evicts past `cache.max_bytes`; disk mode only under
         // disk pressure (filesystem of `cache.dir` above `disk_high_watermark`)
@@ -385,7 +398,7 @@ impl Registry {
 
         // Collect idle repos. In-use checks happen again while evicting: a
         // request may acquire a ReadGuard after this snapshot.
-        for entry in self.repos.iter() {
+        for entry in &self.repos {
             let handle = entry.value();
             let last_access = handle.last_access();
             if now.duration_since(last_access) > evict_after {
@@ -469,8 +482,13 @@ fn disk_usage(path: &std::path::Path) -> Option<(u64, u64)> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs is a C integer struct; all-zero is a valid initialized value.
+    #[allow(unsafe_code)]
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+    // SAFETY: c is NUL-terminated and live; st is aligned writable storage for statvfs.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::statvfs(c.as_ptr(), &raw mut st) };
+    if result != 0 {
         return None;
     }
     let total = st.f_blocks as u64 * st.f_frsize as u64;

@@ -5,6 +5,7 @@
 //! (discoverable at `…/tasks`); `/readyz` can be gated on completion
 //! (`cache.prewarm_ready_timeout`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -67,8 +68,8 @@ pub fn spawn(state: Arc<AppState>) {
                 let _p = sem.acquire().await;
                 let t = Instant::now();
                 match warm(&st, &r).await {
-                    Ok(summary) => tracing::info!(repo = %r, elapsed_ms = t.elapsed().as_millis() as u64, "prewarm: {summary}"),
-                    Err(e) => tracing::warn!(repo = %r, elapsed_ms = t.elapsed().as_millis() as u64, "prewarm failed: {e}"),
+                    Ok(summary) => tracing::info!(repo = %r, elapsed_ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX), "prewarm: {summary}"),
+                    Err(e) => tracing::warn!(repo = %r, elapsed_ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX), "prewarm failed: {e}"),
                 }
                 st.readiness.pending.fetch_sub(1, Ordering::AcqRel);
             }));
@@ -86,7 +87,7 @@ async fn warm(st: &Arc<AppState>, repo: &str) -> Result<String, String> {
         .parse()
         .map_err(|e: walgit_git::GitError| e.to_string())?;
     let handle = st.registry.open(&id).await.map_err(|e| e.to_string())?;
-    let task = match handle.begin_task("prewarm", Default::default()) {
+    let task = match handle.begin_task("prewarm", HashMap::default()) {
         walgit_wal::Begin::Started(t) => t,
         walgit_wal::Begin::AlreadyRunning(_) => return Ok("already warming".into()),
     };
@@ -142,20 +143,19 @@ async fn warm(st: &Arc<AppState>, repo: &str) -> Result<String, String> {
             .find(|r| r.name == head.head_target)
             .map(|r| r.oid.clone());
         if let (Some(sha), walgit_wal::ObjectAccess::Remote(packs)) = (head_sha.as_deref(), &access)
+            && let Ok(oid) = gix_hash::ObjectId::from_hex(sha.as_bytes())
         {
-            if let Ok(oid) = gix_hash::ObjectId::from_hex(sha.as_bytes()) {
-                reporter.notice(format!(
-                    "Reading the root tree of {} from the pack set",
-                    &sha[..12]
-                ));
-                let remote = crate::web::objects::Remote::new(
-                    packs.clone(),
-                    handle.local().clone(),
-                    reporter.clone(),
-                );
-                let (_c, tree, _m) = remote.fault_path(&oid, "").await.map_err(|e| e.message())?;
-                let _ = remote.tree_entries(&tree).await;
-            }
+            reporter.notice(format!(
+                "Reading the root tree of {} from the pack set",
+                &sha[..12]
+            ));
+            let remote = crate::web::objects::Remote::new(
+                packs.clone(),
+                handle.local().clone(),
+                reporter.clone(),
+            );
+            let (_c, tree, _m) = remote.fault_path(&oid, "").await.map_err(|e| e.message())?;
+            let _ = remote.tree_entries(&tree).await;
         }
         Ok(format!("warm: {mode}"))
     }

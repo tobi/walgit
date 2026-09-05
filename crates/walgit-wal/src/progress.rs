@@ -44,9 +44,10 @@ impl Progress {
         total: Option<u64>,
         unit: &'static str,
     ) -> Self {
-        let percent = total
-            .filter(|t| *t > 0)
-            .map(|t| ((done as f64 / t as f64) * 1000.0).round() / 10.0);
+        let percent = total.filter(|t| *t > 0).map(|t| {
+            let tenths = done.min(t).saturating_mul(1_000) / t;
+            f64::from(u32::try_from(tenths).unwrap_or(1_000)) / 10.0
+        });
         Progress::Progress {
             label: label.into(),
             done,
@@ -140,7 +141,10 @@ impl Throttle {
     }
     /// True when an update should be emitted now.
     pub fn tick(&self, force: bool) -> bool {
-        let mut last = self.last.lock().unwrap();
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = std::time::Instant::now();
         if force
             || last

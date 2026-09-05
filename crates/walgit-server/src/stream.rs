@@ -12,11 +12,11 @@ use futures::stream::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::io::{ReaderStream, StreamReader};
 
-/// Convert an axum request body into an `AsyncRead`. Map errors to io::Error.
+/// Convert an axum request body into an `AsyncRead`. Map errors to `io::Error`.
 pub fn body_to_async_read(body: Body) -> impl AsyncRead + Unpin + Send {
     let stream = body
         .into_data_stream()
-        .map(|res| res.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string())));
+        .map(|res| res.map_err(|e| io::Error::other(e.to_string())));
     StreamReader::new(stream)
 }
 
@@ -55,6 +55,12 @@ pub fn write_body_pipe(buf: usize) -> (tokio::io::DuplexStream, Body) {
 /// A simple `AsyncWrite` that collects bytes into a `Vec<u8>`. Used to render
 /// small pkt-line responses (report-status, ls-refs) into a buffer.
 pub struct VecWriter(pub Vec<u8>);
+
+impl Default for VecWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl VecWriter {
     pub fn new() -> Self {

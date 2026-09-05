@@ -4,11 +4,11 @@
 //! Each cache exposes hit/miss counters via the `metrics` crate.
 //!
 //! **Justification for `moka`:** these caches need bounded, concurrent,
-//! size-based LRU eviction. Implementing LRU eviction on DashMap requires a
+//! size-based LRU eviction. Implementing LRU eviction on `DashMap` requires a
 //! secondary ordering structure and manual locking — error-prone and slower.
 //! `moka::sync::Cache` provides thread-safe, size-bounded LRU out of the box
 //! with excellent throughput (bucket-level locking, no global lock on hot
-//! path). DashMap remains the right choice for unbounded lookup tables
+//! path). `DashMap` remains the right choice for unbounded lookup tables
 //! (e.g. `RepoSemaphores`); bounded LRU is moka's domain.
 
 use moka::sync::Cache;
@@ -61,7 +61,7 @@ fn v2_key(repo: &str, version: Option<&Version>, args: &walgit_git::LsRefsArgs) 
 }
 
 /// Cache for rendered v0 ref advertisements.
-/// Keyed by (repo, manifest_version, service).
+/// Keyed by (repo, `manifest_version`, service).
 #[derive(Clone)]
 pub struct RefAdvertCache {
     v0: Cache<RefAdvertKey, Vec<u8>>,
@@ -83,15 +83,12 @@ impl RefAdvertCache {
         service: walgit_git::Service,
     ) -> Option<Vec<u8>> {
         let key = v0_key(repo, version, service);
-        match self.v0.get(&key) {
-            Some(val) => {
-                metrics::counter!("walgit_cache_ref_advert_hit").increment(1);
-                Some(val)
-            }
-            None => {
-                metrics::counter!("walgit_cache_ref_advert_miss").increment(1);
-                None
-            }
+        if let Some(val) = self.v0.get(&key) {
+            metrics::counter!("walgit_cache_ref_advert_hit").increment(1);
+            Some(val)
+        } else {
+            metrics::counter!("walgit_cache_ref_advert_miss").increment(1);
+            None
         }
     }
 
@@ -114,15 +111,12 @@ impl RefAdvertCache {
         args: &walgit_git::LsRefsArgs,
     ) -> Option<Vec<LsRefsLine>> {
         let key = v2_key(repo, version, args);
-        match self.v2_ls_refs.get(&key) {
-            Some(val) => {
-                metrics::counter!("walgit_cache_ls_refs_hit").increment(1);
-                Some(val)
-            }
-            None => {
-                metrics::counter!("walgit_cache_ls_refs_miss").increment(1);
-                None
-            }
+        if let Some(val) = self.v2_ls_refs.get(&key) {
+            metrics::counter!("walgit_cache_ls_refs_hit").increment(1);
+            Some(val)
+        } else {
+            metrics::counter!("walgit_cache_ls_refs_miss").increment(1);
+            None
         }
     }
 
@@ -163,7 +157,7 @@ pub struct BundleListCache {
 }
 
 /// Idle lifetime of a rendered list (freshness comes from the version key).
-pub const BUNDLE_LIST_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+pub const BUNDLE_LIST_TTL: std::time::Duration = std::time::Duration::from_mins(10);
 
 impl BundleListCache {
     pub fn new(max_entries: usize) -> Self {
@@ -185,15 +179,12 @@ impl BundleListCache {
             repo: repo.to_string(),
             list_version: list_version.to_string(),
         };
-        match self.inner.get(&key) {
-            Some(val) => {
-                metrics::counter!("walgit_cache_bundle_list_hit").increment(1);
-                Some(val)
-            }
-            None => {
-                metrics::counter!("walgit_cache_bundle_list_miss").increment(1);
-                None
-            }
+        if let Some(val) = self.inner.get(&key) {
+            metrics::counter!("walgit_cache_bundle_list_hit").increment(1);
+            Some(val)
+        } else {
+            metrics::counter!("walgit_cache_bundle_list_miss").increment(1);
+            None
         }
     }
 
@@ -298,7 +289,7 @@ struct RefIndexKey {
     version: String,
 }
 
-/// Keyed by (repo, manifest_version).
+/// Keyed by (repo, `manifest_version`).
 #[derive(Clone)]
 pub struct RefIndexCache {
     inner: Cache<RefIndexKey, std::sync::Arc<RefIndex>>,
@@ -366,7 +357,7 @@ impl ServerCaches {
                 .build(),
             bundle_attempts: Cache::builder()
                 .max_capacity(100_000)
-                .time_to_live(std::time::Duration::from_secs(6 * 3600))
+                .time_to_live(std::time::Duration::from_hours(6))
                 .build(),
         }
     }
@@ -383,7 +374,10 @@ mod tests {
 
     fn make_args(prefixes: &[&str]) -> walgit_git::LsRefsArgs {
         walgit_git::LsRefsArgs {
-            ref_prefixes: prefixes.iter().map(|s| s.to_string()).collect(),
+            ref_prefixes: prefixes
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             symrefs: false,
             peel: true,
             unborn: false,
@@ -552,7 +546,7 @@ mod tests {
     }
 
     /// Benchmark: measure ref advertisement render time with and without cache
-    /// for a 50k-ref repo. Run with: cargo test -p walgit-server bench_ref_advert -- --nocapture --ignored
+    /// for a 50k-ref repo. Run with: cargo test -p walgit-server `bench_ref_advert` -- --nocapture --ignored
     #[test]
     #[ignore = "requires git binary and takes ~10s"]
     fn bench_ref_advert_50k_refs() {

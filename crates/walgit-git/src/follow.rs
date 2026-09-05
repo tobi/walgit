@@ -42,11 +42,11 @@ impl FetchedDelta {
 
 /// Fetch `refs` from `upstream` into the scratch for `(owner, name)` under `dir`,
 /// negotiating from `have` (`ref → oid` we hold; missing = fetch its history).
-pub async fn fetch_refs(
+pub async fn fetch_refs<S: std::hash::BuildHasher + Sync>(
     upstream: &str,
     token: Option<&str>,
     serving_objects: &Path,
-    have: &HashMap<String, String>,
+    have: &HashMap<String, String, S>,
     refs: &[String],
     scratch: &Path,
 ) -> Result<FetchedDelta, GitError> {
@@ -121,8 +121,18 @@ pub async fn fetch_refs(
         let mut input = String::new();
         for r in refs {
             match have.get(r) {
-                Some(oid) => input.push_str(&format!("update {} {oid}\n", follow_ref(r))),
-                None => input.push_str(&format!("delete {}\n", follow_ref(r))),
+                Some(oid) => {
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut input,
+                        format_args!("update {} {oid}\n", follow_ref(r)),
+                    );
+                }
+                None => {
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut input,
+                        format_args!("delete {}\n", follow_ref(r)),
+                    );
+                }
             }
         }
         let mut child = git(&["update-ref", "--stdin"])
@@ -131,7 +141,10 @@ pub async fn fetch_refs(
             .map_err(GitError::Io)?;
         {
             use tokio::io::AsyncWriteExt;
-            let mut stdin = child.stdin.take().expect("stdin");
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| std::io::Error::other("git stdin unavailable"))?;
             stdin
                 .write_all(input.as_bytes())
                 .await

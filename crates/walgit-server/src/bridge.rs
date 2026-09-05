@@ -161,7 +161,7 @@ impl Bridge {
                 // Another bridge instance advanced it: our emission was a
                 // duplicate (dedup key), theirs stands.
                 Err(StoreError::PreconditionFailed { .. }) => {
-                    tracing::warn!(repo = %id, "events bridge: cursor CAS lost (two bridges?)")
+                    tracing::warn!(repo = %id, "events bridge: cursor CAS lost (two bridges?)");
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -195,7 +195,7 @@ impl Bridge {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    tracing::warn!(repo = %id, error = %e, "events bridge: sweep catch-up failed")
+                    tracing::warn!(repo = %id, error = %e, "events bridge: sweep catch-up failed");
                 }
             }
         }

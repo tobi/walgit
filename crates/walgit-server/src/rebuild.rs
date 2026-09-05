@@ -129,8 +129,13 @@ fn disk_avail(path: &Path) -> Option<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs is a C integer struct; all-zero is a valid initialized value.
+    #[allow(unsafe_code)]
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+    // SAFETY: c is NUL-terminated and live; st is aligned writable storage for statvfs.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::statvfs(c.as_ptr(), &raw mut st) };
+    if result != 0 {
         return None;
     }
     Some(st.f_bavail as u64 * st.f_frsize as u64)
@@ -348,7 +353,7 @@ pub async fn rebuild_base(
         if let Some(p) = already
             && p.tier == 2
             && (p.has_bitmap || info.history_of.is_some())
-            && supersedes_left.as_ref().is_none_or(|s| s.is_empty())
+            && supersedes_left.as_ref().is_none_or(std::vec::Vec::is_empty)
         {
             log(format!(
                 "pack {hex} is already live as tier 2: not re-published"

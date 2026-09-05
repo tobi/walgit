@@ -1,3 +1,6 @@
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(clippy::unwrap_used)]
+
 mod common;
 
 use walgit_git::{LocalRepo, LsRefsArgs, ObjectFormat, RepoId, gix_hash};

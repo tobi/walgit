@@ -9,7 +9,7 @@ use harness::{Server, git, git_in};
 
 macro_rules! step {
     ($name:literal, $e:expr) => {
-        tokio::time::timeout(std::time::Duration::from_secs(60), $e)
+        tokio::time::timeout(std::time::Duration::from_mins(1), $e)
             .await
             .unwrap_or_else(|_| panic!("step timed out: {}", $name))
     };
@@ -206,8 +206,7 @@ async fn start_op(
     )
     .await
     {
-        Ok(t) => Ok(t),
-        Err(walgit_server::ops::StartError::AlreadyRunning(t)) => Ok(t),
+        Ok(t) | Err(walgit_server::ops::StartError::AlreadyRunning(t)) => Ok(t),
         Err(walgit_server::ops::StartError::UnknownOp) => Err("unknown op".into()),
     }
 }

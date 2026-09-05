@@ -1,3 +1,12 @@
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::cast_possible_truncation,
+    clippy::format_push_string
+)]
+
 //! Reproducer for AGENTS §6 "gix large-fetch object-id corruption and 178 GB OOM" (2026-08-21
 //! 05:4xZ: a remainder pack carried an entry under another object's id; 07:0xZ: the same shape
 //! replayed over a large repository was OOM-killed at 178 GB anon RSS after `Enumerating objects: 113683`).
@@ -8,7 +17,7 @@
 //!   A. remainder: want tip, have base tip, `thin_pack = true` (prod's failing shape),
 //!   B. remainder, `thin_pack = false` (every delta whose base is outside the set re-encoded),
 //!   C. bounded zero-have: `--depth=1 --filter=blob:none` (CI's shape),
-//!   D. full zero-have (TreeContents expansion).
+//!   D. full zero-have (`TreeContents` expansion).
 //! Every output is indexed by stock git with `--strict` (ids recomputed from content), its object
 //! set compared to `git rev-list --objects` of the source, and the process's max RSS delta is
 //! bounded by a small multiple of the pack bytes.
@@ -29,15 +38,25 @@ mod cm {
 }
 
 fn max_rss_kb() -> u64 {
+    // SAFETY: rusage contains C numeric fields whose all-zero values are valid.
+    #[allow(unsafe_code)]
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+    // SAFETY: ru is aligned writable storage; RUSAGE_SELF is a supported selector.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut ru) };
+    assert_eq!(
+        result,
+        0,
+        "getrusage failed: {}",
+        std::io::Error::last_os_error()
+    );
     // getrusage reports ru_maxrss in KB on Linux but in BYTES on macOS/BSD.
     // Without this, the memory-bound assertion reads 1024x high on macOS and
     // fails a passing result (a 16 MB delta shown as "16832 MB").
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    let kb = (ru.ru_maxrss as u64) / 1024;
+    let kb = (u64::try_from(ru.ru_maxrss).expect("nonnegative peak RSS")) / 1024;
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-    let kb = ru.ru_maxrss as u64;
+    let kb = u64::try_from(ru.ru_maxrss).expect("nonnegative peak RSS");
     kb
 }
 
@@ -59,7 +78,7 @@ fn synth(commits: usize, files: usize, files_per_commit: usize, dirs: usize) -> 
     {
         let stdin = child.stdin.as_mut().unwrap();
         let mut w = std::io::BufWriter::with_capacity(1 << 20, stdin);
-        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
         let mut next = || {
             seed ^= seed << 13;
             seed ^= seed >> 7;
@@ -73,7 +92,12 @@ fn synth(commits: usize, files: usize, files_per_commit: usize, dirs: usize) -> 
                 let mut c = format!("file {f}\n");
                 let words = 200 + (next() % 6000) as usize;
                 for _ in 0..words {
-                    c.push_str(&format!("{:06x} ", next() & 0xffffff));
+                    {
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut c,
+                            format_args!("{:06x} ", next() & 0x00ff_ffff),
+                        );
+                    };
                 }
                 c.push('\n');
                 c
@@ -214,7 +238,7 @@ fn req(
     }
 }
 
-/// Entries of type REF_DELTA (7) in a v2 pack: walk the headers, skipping compressed data with a
+/// Entries of type `REF_DELTA` (7) in a v2 pack: walk the headers, skipping compressed data with a
 /// throwaway inflater. A self-contained pack written by pack-copy has none.
 fn count_ref_deltas(pack: &[u8]) -> usize {
     use std::io::Read;
@@ -508,7 +532,7 @@ async fn gix_engine_packs_are_strict_valid_and_bounded_in_memory_30k() {
 
 /// ~300 k objects with long delta chains across two packs: `just test-slow`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
+#[ignore = "large stress test; run in test-slow tier"]
 async fn gix_engine_packs_are_strict_valid_and_bounded_in_memory_300k() {
     run_shapes(12_000, 1_500, 10, 40, 10_000).await;
 }

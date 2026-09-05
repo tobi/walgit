@@ -5,6 +5,26 @@
 //! The only flag is the global `--config PATH` (D8); no subcommand = `serve`. Every command loads
 //! `walgit.toml`, applies `WALGIT__` env overrides, and initialises tracing
 //! from `[telemetry]` before dispatching.
+#![allow(
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::doc_lazy_continuation,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names,
+    clippy::needless_continue,
+    clippy::needless_pass_by_value,
+    clippy::redundant_locals,
+    clippy::string_slice,
+    clippy::unnecessary_sort_by,
+    clippy::unused_async,
+    clippy::unwrap_used,
+    clippy::unreadable_literal
+)]
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -200,7 +220,7 @@ enum Command {
         /// How often to fold the buffer's small packs (`git repack --geometric=2 --write-midx`).
         #[arg(long, default_value = "1h", value_parser = humantime::parse_duration)]
         repack_every: std::time::Duration,
-        /// Where the destination's bearer token comes from: `token` ($WALGIT_TOKEN), `gcloud` (a Google
+        /// Where the destination's bearer token comes from: `token` ($`WALGIT_TOKEN`), `gcloud` (a Google
         /// ID token for you) or `gce` (this VM's service account via the metadata server).
         #[arg(long, value_enum, default_value_t = mirror::Identity::Token)]
         identity: mirror::Identity,

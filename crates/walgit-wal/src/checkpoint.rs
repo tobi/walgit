@@ -1,4 +1,5 @@
 //! Checkpoint writing and store GC.
+#![allow(clippy::needless_continue)]
 
 use std::sync::Arc;
 
@@ -43,7 +44,7 @@ pub fn checkpoint_due(
     if head == 0 {
         return None;
     }
-    let cp_seq = manifest.checkpoint.as_ref().map(|c| c.seq).unwrap_or(0);
+    let cp_seq = manifest.checkpoint.as_ref().map_or(0, |c| c.seq);
     if cp_seq >= head {
         return None;
     }
@@ -73,43 +74,38 @@ pub fn checkpoint_due(
             Some(c) => c.created_at.as_ref().map(time::to_system),
             None => manifest.updated_at.as_ref().map(time::to_system),
         };
-        if let Some(t) = since {
-            if std::time::SystemTime::now()
+        if let Some(t) = since
+            && std::time::SystemTime::now()
                 .duration_since(t)
                 .unwrap_or_default()
                 >= cfg.checkpoint_interval
-            {
-                return Some(CheckpointTrigger::Age);
-            }
+        {
+            return Some(CheckpointTrigger::Age);
         }
     }
     None
 }
 
 /// Write a checkpoint at the current head: refs snapshot + pack set, then
-/// CAS manifest (checkpoint=, min_seq=, log_segments trimmed). Idempotent.
+/// CAS manifest (checkpoint=, `min_seq`=, `log_segments` trimmed). Idempotent.
 /// Needs only a **refs-level** sync (manifest + ref state): it works on an
 /// instance that could never hold the repo's packs.
 pub(crate) async fn write_checkpoint_impl(handle: &RepoHandle) -> Result<CheckpointRef, WalError> {
     let trigger = checkpoint_due(&handle.manifest(), &handle.cfg.wal)
-        .map(|t| t.to_string())
-        .unwrap_or_else(|| "manual".into());
+        .map_or_else(|| "manual".into(), |t| t.to_string());
     let span = tracing::info_span!("wal.checkpoint", repo = %handle.id, trigger = %trigger, seq = tracing::field::Empty, refs = tracing::field::Empty, folded = tracing::field::Empty, outcome = tracing::field::Empty);
     let t0 = std::time::Instant::now();
     let r = write_checkpoint_inner(handle)
         .instrument(span.clone())
         .await;
-    match &r {
-        Ok(cp) => {
-            span.record("seq", cp.seq);
-            span.record("outcome", "ok");
-            metrics::histogram!("walgit_checkpoint_seconds").record(t0.elapsed().as_secs_f64());
-            metrics::counter!("walgit_checkpoints_total", "outcome" => "ok").increment(1);
-        }
-        Err(_) => {
-            span.record("outcome", "error");
-            metrics::counter!("walgit_checkpoints_total", "outcome" => "error").increment(1);
-        }
+    if let Ok(cp) = &r {
+        span.record("seq", cp.seq);
+        span.record("outcome", "ok");
+        metrics::histogram!("walgit_checkpoint_seconds").record(t0.elapsed().as_secs_f64());
+        metrics::counter!("walgit_checkpoints_total", "outcome" => "ok").increment(1);
+    } else {
+        span.record("outcome", "error");
+        metrics::counter!("walgit_checkpoints_total", "outcome" => "error").increment(1);
     }
     r
 }
@@ -123,17 +119,17 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
     let manifest = handle.manifest.read().clone();
 
     // If checkpoint already at head, return it (idempotent)
-    if let Some(ref cp) = manifest.checkpoint {
-        if cp.seq == manifest.head_seq {
-            tracing::Span::current().record("folded", 0u64);
-            return Ok(cp.clone());
-        }
+    if let Some(ref cp) = manifest.checkpoint
+        && cp.seq == manifest.head_seq
+    {
+        tracing::Span::current().record("folded", 0u64);
+        return Ok(cp.clone());
     }
 
     let seq = manifest.head_seq;
     tracing::Span::current().record(
         "folded",
-        seq - manifest.checkpoint.as_ref().map(|c| c.seq).unwrap_or(0),
+        seq - manifest.checkpoint.as_ref().map_or(0, |c| c.seq),
     );
     if seq == 0 {
         return Err(WalError::Corrupt(
@@ -155,15 +151,15 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
     let prev = manifest.checkpoint.as_ref();
     let created_at = time::now();
     let first_state_at = prev
-        .and_then(|c| c.first_state_at.clone())
+        .and_then(|c| c.first_state_at)
         .or_else(|| handle.first_entry_time.lock().map(time::from_system))
         .or_else(|| handle.first_seq_published_at.lock().map(time::from_system))
-        .or_else(|| prev.and_then(|c| c.created_at.clone()));
+        .or_else(|| prev.and_then(|c| c.created_at));
     let as_of = handle
         .last_entry_time
         .lock()
         .map(time::from_system)
-        .or_else(|| prev.and_then(|c| c.as_of.clone()))
+        .or_else(|| prev.and_then(|c| c.as_of))
         .or(Some(created_at));
 
     // The checkpoint: the pack set with its side-file inventory (idx/rev/bitmap/commit-graph
@@ -180,7 +176,7 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
         },
         bundle_key: String::new(),
         created_at: Some(created_at),
-        writer: writer.to_string(),
+        writer: writer.clone(),
     };
     let cp_key = keys::checkpoint_key(seq);
     let cp_bytes = checkpoint.encode_to_vec();
@@ -222,10 +218,10 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
         let known_version = handle.manifest_version.lock().clone();
 
         // If checkpoint already at or past head, done
-        if let Some(ref cp) = current_manifest.checkpoint {
-            if cp.seq >= current_manifest.head_seq {
-                return Ok(cp.clone());
-            }
+        if let Some(ref cp) = current_manifest.checkpoint
+            && cp.seq >= current_manifest.head_seq
+        {
+            return Ok(cp.clone());
         }
 
         let mut updated: Manifest = (*current_manifest).clone();
@@ -234,7 +230,7 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
         // Trim log_segments: keep only those with last_seq > seq
         updated.log_segments.retain(|s| s.last_seq > seq);
         updated.updated_at = Some(time::now());
-        updated.writer = writer.to_string();
+        updated.writer = writer.clone();
         updated.revision += 1;
 
         let buf = updated.encode_to_vec();

@@ -1,8 +1,12 @@
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(clippy::indexing_slicing, clippy::unwrap_used)]
+
 //! Events (docs/EVENTS.md): the bridge publishes exactly what the WAL
 //! committed, from a durable cursor; the GCS-notification wake-up; the sweep;
 //! a sink failure keeps the cursor.
 mod harness;
 
+use std::sync::Arc;
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 
 type TestResult = anyhow::Result<()>;
@@ -14,7 +18,7 @@ type Captured = std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
 /// The webhook sink's target: records every event it receives (the bus as
 /// the test sees it).
 async fn webhook() -> (String, Captured) {
-    let captured: Captured = Default::default();
+    let captured: Captured = Arc::default();
     let app = axum::Router::new().route(
         "/events",
         axum::routing::post({

@@ -1,3 +1,6 @@
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(clippy::unwrap_used)]
+
 //! The gix upload-pack engine over a repository whose base pack is *not*
 //! local: history from the commit-graph chain, `have`s from the faulter's
 //! index, object enumeration by tree diff against parents, base objects

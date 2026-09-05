@@ -227,7 +227,7 @@ async fn setup_json(
 
 /// `GET|HEAD /repos.js` | `/repos.mjs` — the browser SDK (`web/sdk/`, built
 /// into `web/dist/` by `pnpm run build`). Permanent URL, so `no-cache` +
-/// strong ETag (revalidated per deploy), precompressed like every asset.
+/// strong `ETag` (revalidated per deploy), precompressed like every asset.
 pub async fn sdk_asset(req: Request<Body>) -> Response {
     let name = req.uri().path().trim_start_matches('/');
     match embedded(name) {
@@ -326,21 +326,21 @@ fn negotiate_encoding(
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
-        .map(|t| t.trim())
+        .map(str::trim)
         .filter(|t| !t.is_empty())
         .collect::<Vec<_>>();
     let accepts = |name: &str| {
         accept.iter().any(|t| {
             let (coding, q) = t.split_once(';').map_or((*t, None), |(c, q)| (c, Some(q)));
             coding.trim().eq_ignore_ascii_case(name)
-                && !q.is_some_and(|q| q.trim().trim_start_matches("q=").trim() == "0")
+                && q.is_none_or(|q| q.trim().trim_start_matches("q=").trim() != "0")
         })
     };
     for (name, ext) in [("br", ".br"), ("gzip", ".gz")] {
-        if accepts(name) {
-            if let Some(f) = embedded(&format!("{path}{ext}")) {
-                return Some((Some(name), f.data));
-            }
+        if accepts(name)
+            && let Some(f) = embedded(&format!("{path}{ext}"))
+        {
+            return Some((Some(name), f.data));
         }
     }
     None
@@ -349,12 +349,12 @@ fn negotiate_encoding(
 fn content_type(path: &str) -> &'static str {
     match Path::new(path).extension().and_then(|e| e.to_str()) {
         Some("css") => "text/css; charset=utf-8",
-        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
-        Some("json") | Some("map") => "application/json; charset=utf-8",
+        Some("js" | "mjs") => "text/javascript; charset=utf-8",
+        Some("json" | "map") => "application/json; charset=utf-8",
         Some("html") => "text/html; charset=utf-8",
         Some("svg") => "image/svg+xml",
         Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("jpg" | "jpeg") => "image/jpeg",
         Some("gif") => "image/gif",
         Some("webp") => "image/webp",
         Some("ico") => "image/x-icon",
@@ -592,7 +592,7 @@ async fn overview(
         .map(|version| version.to_string())
         .unwrap_or_default();
     let base_url = crate::smart::request_base_url(&state, &headers);
-    let clone_url = format!("{}/{}.git", base_url, id);
+    let clone_url = format!("{base_url}/{id}.git");
     let recipes = crate::setup::recipes(&state.cfg, &base_url, Some(&id.to_string()));
     let setup = recipes.setup_text.clone();
 
@@ -618,7 +618,7 @@ async fn overview(
         .iter()
         .filter(|entry| entry.kind() == EntryKind::Push)
         .filter_map(|entry| entry.created_at.as_ref().map(timestamp))
-        .last();
+        .next_back();
     let mut push_count = 0;
     let mut compactions = Vec::new();
     let mut pack_by_checksum = std::collections::HashMap::new();
@@ -738,9 +738,8 @@ async fn overview(
                     "at the next `{w}` slot, on a maintainer whose capacity holds the pack set ({})",
                     walgit_wal::remote::human_bytes(live_bytes)
                 )),
-                (Some(_), false) => None,
-                (None, _) => None,
-            },
+                (Some(_), false) | (None, _) => None,
+                },
         });
     } else if fresh >= ecfg.compaction.trigger_packs.max(2) {
         suggestions.push(Suggestion {
@@ -756,7 +755,7 @@ async fn overview(
         });
     }
     if manifest.head_seq > 0 {
-        let cp_seq = manifest.checkpoint.as_ref().map(|c| c.seq).unwrap_or(0);
+        let cp_seq = manifest.checkpoint.as_ref().map_or(0, |c| c.seq);
         let behind = manifest.head_seq.saturating_sub(cp_seq);
         if behind >= state.cfg.wal.snapshot_every_entries.max(1) || (cp_seq == 0 && behind > 0) {
             suggestions.push(Suggestion {
@@ -952,7 +951,7 @@ async fn overview(
                         disk: h.disk,
                         max_pack_bytes: h.max_pack_bytes,
                         last_pass_age_secs: age,
-                        alive: age.map(|a| a < 600).unwrap_or(false),
+                        alive: age.is_some_and(|a| a < 600),
                         passes: h.passes,
                         last_unit: h.last_unit,
                     }
@@ -1183,8 +1182,9 @@ async fn checkpoint_info(
                 checkpoint.writer,
             )
         }
-        Ok(GetResult::NotModified { .. }) => (0, String::new(), String::new()),
-        Err(walgit_store::StoreError::NotFound { .. }) => (0, String::new(), String::new()),
+        Ok(GetResult::NotModified { .. }) | Err(walgit_store::StoreError::NotFound { .. }) => {
+            (0, String::new(), String::new())
+        }
         Err(error) => return Err(ApiError::Internal(error.to_string())),
     };
     Ok(Some(BundleInfo {

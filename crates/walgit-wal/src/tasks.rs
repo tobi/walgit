@@ -30,6 +30,13 @@ const KEEP_RECORDS: usize = 30;
 const KEEP_LOG: usize = 60;
 const REPLAY: usize = 200;
 
+/// Replayed packets, future packets, and the terminal outcome if already finished.
+pub type TaskAttachment = (
+    Vec<Progress>,
+    tokio::sync::broadcast::Receiver<Progress>,
+    Option<Result<TaskOutcome, (u16, String)>>,
+);
+
 #[derive(Serialize, Clone, Debug)]
 pub struct TaskRecord {
     pub id: String,
@@ -106,13 +113,7 @@ impl TaskState {
         self.record.lock().clone()
     }
     /// Subscribe + snapshot of everything so far (no gap, no duplicates).
-    pub fn attach(
-        &self,
-    ) -> (
-        Vec<Progress>,
-        tokio::sync::broadcast::Receiver<Progress>,
-        Option<Result<TaskOutcome, (u16, String)>>,
-    ) {
+    pub fn attach(&self) -> TaskAttachment {
         let replay = self.replay.lock();
         let rx = self.tx.subscribe();
         let outcome = self.outcome.lock().clone();
@@ -157,7 +158,8 @@ impl TaskState {
                 Progress::Progress { .. } => rec.progress = Some(p.clone()),
                 Progress::Task { .. } => {}
             }
-            rec.elapsed_ms = self.started_at.elapsed().as_millis() as u64;
+            rec.elapsed_ms =
+                u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         }
         {
             let mut replay = self.replay.lock();
@@ -389,15 +391,16 @@ impl Tasks {
         let record = {
             let mut rec = state.record.lock();
             rec.finished = Some(now_rfc3339());
-            rec.elapsed_ms = state.started_at.elapsed().as_millis() as u64;
+            rec.elapsed_ms =
+                u64::try_from(state.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
             match &outcome {
                 Ok((summary, _)) => {
                     rec.ok = Some(true);
-                    rec.summary = summary.clone();
+                    rec.summary.clone_from(summary);
                 }
                 Err((_, msg)) => {
                     rec.ok = Some(false);
-                    rec.summary = msg.clone();
+                    rec.summary.clone_from(msg);
                 }
             }
             rec.clone()
@@ -431,7 +434,7 @@ impl Tasks {
             pick_from
                 .as_ref()
                 .and_then(|v| v.get(k))
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
         };
         let (bytes, objects) = (pick("bytes").or_else(|| pick("size")), pick("objects"));
         let ok = record.ok.unwrap_or(false);
@@ -444,7 +447,7 @@ impl Tasks {
         };
         tracing::info!(repo = %record.repo, kind = %record.kind, id = %record.id, ok, outcome, elapsed_ms = record.elapsed_ms, bytes, objects, "task finished: {}", record.summary);
         metrics::counter!("walgit_tasks_finished_total", "kind" => record.kind.clone(), "ok" => ok.to_string()).increment(1);
-        metrics::histogram!("walgit_task_duration_seconds", "kind" => record.kind.clone(), "ok" => ok.to_string()).record(record.elapsed_ms as f64 / 1000.0);
+        metrics::histogram!("walgit_task_duration_seconds", "kind" => record.kind.clone(), "ok" => ok.to_string()).record(std::time::Duration::from_millis(record.elapsed_ms).as_secs_f64());
         record
     }
 

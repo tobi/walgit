@@ -1,3 +1,14 @@
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::match_wildcard_for_single_variants
+)]
+
 //! Backend-agnostic contract suite for `ObjectStore`.
 //!
 //! `run_contract(store, prefix)` exercises every observable guarantee of the
@@ -8,7 +19,7 @@
 //!
 //! The suite is executed against `MemoryStore` always, and against `S3Store`
 //! when `WALGIT_TEST_S3_ENDPOINT` is set. `GcsStore` is tested when
-//! `WALGIT_TEST_GCS_BUCKET` is set (StoreGcs adds that wrapper).
+//! `WALGIT_TEST_GCS_BUCKET` is set (`StoreGcs` adds that wrapper).
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -117,7 +128,7 @@ async fn test_compose(store: &DynStore, key: &str) {
 
 // ---- helpers -----------------------------------------------------------
 
-/// Collect a GetResult body into Bytes, asserting it's an Object.
+/// Collect a `GetResult` body into Bytes, asserting it's an Object.
 async fn collect_body(r: GetResult) -> (walgit_store::ObjectMeta, Bytes) {
     match r {
         GetResult::Object { meta, body } => {
@@ -189,7 +200,7 @@ async fn test_put_create_wins_once(store: &DynStore, key: &str) {
     let _ = store.delete(key, None).await;
 }
 
-/// Update CAS: winner updates, loser gets PreconditionFailed.
+/// Update CAS: winner updates, loser gets `PreconditionFailed`.
 async fn test_update_cas(store: &DynStore, key: &str) {
     let _ = store.delete(key, None).await;
 
@@ -266,7 +277,7 @@ async fn test_update_cas(store: &DynStore, key: &str) {
     let _ = store.delete(key, None).await;
 }
 
-/// if_none_match: NotModified when unchanged, Object when changed.
+/// `if_none_match`: `NotModified` when unchanged, Object when changed.
 async fn test_get_if_none_match(store: &DynStore, key: &str) {
     let _ = store.delete(key, None).await;
 
@@ -306,7 +317,7 @@ async fn test_get_if_none_match(store: &DynStore, key: &str) {
     let _ = store.delete(key, None).await;
 }
 
-/// if_match mismatch → PreconditionFailed.
+/// `if_match` mismatch → `PreconditionFailed`.
 async fn test_get_if_match_mismatch(store: &DynStore, key: &str) {
     let _ = store.delete(key, None).await;
 
@@ -463,7 +474,7 @@ async fn test_delete(store: &DynStore, key: &str) {
     );
 }
 
-/// list: ordering, start_after, prefix isolation.
+/// list: ordering, `start_after`, prefix isolation.
 async fn test_list(store: &DynStore, base: &str) {
     // Clean up any previous data under base.
     let existing: Vec<_> = store.list(base, None).collect::<Vec<_>>().await;
@@ -555,6 +566,8 @@ async fn test_list(store: &DynStore, base: &str) {
 
 /// 8 MiB streamed put/get roundtrip with checksum.
 async fn test_large_streamed_roundtrip(store: &DynStore, key: &str) {
+    use sha1::{Digest, Sha1};
+
     let _ = store.delete(key, None).await;
 
     // 8 MiB of pseudo-random but deterministic data.
@@ -571,7 +584,6 @@ async fn test_large_streamed_roundtrip(store: &DynStore, key: &str) {
     let data = Bytes::from(data);
 
     // Checksum (SHA-1).
-    use sha1::{Digest, Sha1};
     let mut hasher = Sha1::new();
     hasher.update(&data);
     let expected_checksum = hasher.finalize();
@@ -614,8 +626,8 @@ async fn test_large_streamed_roundtrip(store: &DynStore, key: &str) {
 }
 
 /// Multipart path: put an object above the threshold, verify roundtrip.
-/// For MemoryStore this exercises the same code path (no multipart).
-/// For S3Store with a small threshold, this triggers multipart upload.
+/// For `MemoryStore` this exercises the same code path (no multipart).
+/// For `S3Store` with a small threshold, this triggers multipart upload.
 async fn test_multipart_path(store: &DynStore, key: &str) {
     let _ = store.delete(key, None).await;
 
@@ -667,12 +679,9 @@ async fn memory_contract() {
 #[cfg(feature = "s3")]
 #[tokio::test]
 async fn s3_contract() {
-    let endpoint = match std::env::var("WALGIT_TEST_S3_ENDPOINT") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("skipping s3_contract: WALGIT_TEST_S3_ENDPOINT not set");
-            return;
-        }
+    let Ok(endpoint) = std::env::var("WALGIT_TEST_S3_ENDPOINT") else {
+        eprintln!("skipping s3_contract: WALGIT_TEST_S3_ENDPOINT not set");
+        return;
     };
     let bucket = std::env::var("WALGIT_TEST_BUCKET").unwrap_or_else(|_| "walgit-test".into());
     let _access_key =
@@ -699,9 +708,7 @@ async fn s3_contract() {
         ..Default::default()
     };
 
-    let store = walgit_store::s3::S3Store::new(&cfg)
-        .await
-        .expect("S3Store::new");
+    let store = walgit_store::s3::S3Store::new(&cfg).expect("S3Store::new");
     let store: DynStore = Arc::new(store);
 
     run_contract(store.clone(), &prefix).await;
@@ -723,12 +730,9 @@ async fn s3_contract() {
 #[cfg(feature = "gcs")]
 #[tokio::test]
 async fn gcs_contract() {
-    let bucket = match std::env::var("WALGIT_TEST_GCS_BUCKET") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("skipping gcs_contract: WALGIT_TEST_GCS_BUCKET not set");
-            return;
-        }
+    let Ok(bucket) = std::env::var("WALGIT_TEST_GCS_BUCKET") else {
+        eprintln!("skipping gcs_contract: WALGIT_TEST_GCS_BUCKET not set");
+        return;
     };
 
     // Install the rustls crypto provider (required for TLS with google-cloud-storage).
@@ -776,6 +780,8 @@ async fn gcs_contract() {
 /// stay under 2 s. `WALGIT_TEST_GCS_BUCKET=walgit-store WALGIT_TEST_GCS_BIG_KEY=<key under prefix>`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gcs_control_plane_not_starved_by_bulk() {
+    const CHUNK: u64 = 32 * 1024 * 1024;
+
     let (Ok(bucket), Ok(big_key)) = (
         std::env::var("WALGIT_TEST_GCS_BUCKET"),
         std::env::var("WALGIT_TEST_GCS_BIG_KEY"),
@@ -820,7 +826,7 @@ async fn gcs_control_plane_not_starved_by_bulk() {
         .await;
     eprintln!("baseline probe {:?}", t.elapsed());
     let total = (1u64 << 30).min(size);
-    const CHUNK: u64 = 32 * 1024 * 1024;
+
     let bulk = {
         let store = store.clone();
         let big_key = big_key.clone();

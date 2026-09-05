@@ -1,4 +1,4 @@
-//! RepoHandle: per-repository state, sync, publish, checkpoint.
+//! `RepoHandle`: per-repository state, sync, publish, checkpoint.
 
 use std::collections::HashMap;
 use std::sync::{
@@ -128,6 +128,10 @@ impl ObjectAccess {
 }
 
 impl RepoHandle {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Repository construction combines the shared services and loaded WAL state"
+    )]
     pub(crate) fn new(
         id: RepoId,
         local: LocalRepo,
@@ -266,10 +270,10 @@ impl RepoHandle {
             return Ok((guard, ObjectAccess::Local));
         }
         // Remote: reuse the reader for this manifest revision, else (re)open.
-        if let Some(r) = self.remote.lock().clone() {
-            if r.revision == manifest.revision {
-                return Ok((guard, ObjectAccess::Remote(r)));
-            }
+        if let Some(r) = self.remote.lock().clone()
+            && r.revision == manifest.revision
+        {
+            return Ok((guard, ObjectAccess::Remote(r)));
         }
         let remote = self.open_remote(&manifest).await?;
         Ok((guard, ObjectAccess::Remote(remote)))
@@ -322,7 +326,7 @@ impl RepoHandle {
             }
             Begin::AlreadyRunning(state) => {
                 // Another request is opening it: wait for that task, then reuse.
-                let _ = state.wait_done(std::time::Duration::from_secs(600)).await;
+                let _ = state.wait_done(std::time::Duration::from_mins(10)).await;
                 match state.outcome() {
                     Some(Ok(_)) => {}
                     Some(Err((_, m))) => {
@@ -644,33 +648,30 @@ impl RepoHandle {
         // The whole materialization runs on the bulk runtime (own threads):
         // nothing in it can stall this runtime's request workers.
         let arc = self.self_arc.get().cloned();
-        let res = match arc {
-            Some(arc) => {
-                let m = manifest.clone();
-                let task_span = task.as_ref().map(|t| t.span());
-                crate::sync::on_bulk_runtime(async move {
-                    let work = async {
-                        crate::sync::reconcile_packs(&arc, &m, level).await?;
-                        arc.local.refresh_async().await?;
-                        Ok::<(), WalError>(())
-                    };
-                    match task_span {
-                        Some(sp) => work.instrument(sp).await,
-                        None => work.await,
-                    }
-                })
-                .await
-            }
-            None => {
-                let res = async {
-                    crate::sync::reconcile_packs(self, &manifest, level).await?;
-                    self.local.refresh_async().await?;
+        let res = if let Some(arc) = arc {
+            let m = manifest.clone();
+            let task_span = task.as_ref().map(super::tasks::TaskHandle::span);
+            crate::sync::on_bulk_runtime(async move {
+                let work = async {
+                    crate::sync::reconcile_packs(&arc, &m, level).await?;
+                    arc.local.refresh_async().await?;
                     Ok::<(), WalError>(())
                 };
-                match &task {
-                    Some(t) => res.instrument(t.span()).await,
-                    None => res.await,
+                match task_span {
+                    Some(sp) => work.instrument(sp).await,
+                    None => work.await,
                 }
+            })
+            .await
+        } else {
+            let res = async {
+                crate::sync::reconcile_packs(self, &manifest, level).await?;
+                self.local.refresh_async().await?;
+                Ok::<(), WalError>(())
+            };
+            match &task {
+                Some(t) => res.instrument(t.span()).await,
+                None => res.await,
             }
         };
         *self.active_reporter.lock() = None;
@@ -734,8 +735,10 @@ impl RepoHandle {
                 .collect();
         }
         let mount = self.mount_dir();
-        if mount.is_none() && self.cfg.cache.store_mount.is_some() {
-            tracing::warn!(repo = %self.id, mount = %self.cfg.cache.store_mount.as_ref().unwrap().display(), "store mount configured but the repository directory is not visible in it (gcsfuse not up yet?): base packs served remotely until it is");
+        if mount.is_none()
+            && let Some(store_mount) = &self.cfg.cache.store_mount
+        {
+            tracing::warn!(repo = %self.id, mount = %store_mount.display(), "store mount configured but the repository directory is not visible in it (gcsfuse not up yet?): base packs served remotely until it is");
         }
         manifest
             .packs
@@ -775,10 +778,10 @@ impl RepoHandle {
     /// `remote-index` task while opening.
     pub async fn remote_reader(&self) -> Result<Arc<RemotePacks>, WalError> {
         let manifest = self.manifest();
-        if let Some(r) = self.remote.lock().clone() {
-            if r.revision == manifest.revision {
-                return Ok(r);
-            }
+        if let Some(r) = self.remote.lock().clone()
+            && r.revision == manifest.revision
+        {
+            return Ok(r);
         }
         self.open_remote(&manifest).await
     }
@@ -787,7 +790,7 @@ impl RepoHandle {
     /// by the caller. Packs are never touched here (see `sync_packs_phase`).
     async fn sync_locked_inner(&self, span: &tracing::Span) -> Result<(), WalError> {
         let known = self.manifest_version.lock().clone();
-        let outcome = crate::sync::freshness_check(&self.store, &known).await?;
+        let outcome = crate::sync::freshness_check(&self.store, known.as_ref()).await?;
         match outcome {
             crate::sync::SyncOutcome::Unchanged => self.update_freshness(),
             crate::sync::SyncOutcome::Changed {
@@ -819,7 +822,7 @@ impl RepoHandle {
                 let before = self.state.lock().applied_seq;
                 crate::sync::apply_delta(self, &manifest, &meta_version).await?;
                 span.record("entries_applied", manifest.head_seq.saturating_sub(before));
-                *self.manifest.write() = Arc::new(manifest);
+                *self.manifest.write() = manifest;
                 *self.manifest_version.lock() = Some(meta_version);
                 self.update_freshness();
             }
@@ -854,16 +857,13 @@ impl RepoHandle {
 
     /// Any local pack that is a symlink into the store mount.
     fn has_linked_packs(&self) -> bool {
-        self.local
-            .packs()
-            .map(|ps| {
-                ps.iter()
-                    .any(|p| self.local.pack_path(&p.checksum).is_symlink())
-            })
-            .unwrap_or(false)
+        self.local.packs().is_ok_and(|ps| {
+            ps.iter()
+                .any(|p| self.local.pack_path(&p.checksum).is_symlink())
+        })
     }
 
-    /// Internal serving sync (no read guard). Used by publish/checkpoint/read_log.
+    /// Internal serving sync (no read guard). Used by `publish/checkpoint/read_log`.
     pub(crate) async fn sync_impl(&self) -> Result<(), WalError> {
         self.sync_impl_level(SyncLevel::Serve).await
     }
@@ -899,14 +899,11 @@ impl RepoHandle {
         .await;
 
         // Read manifest fresh
-        let (meta, manifest) = match crate::store_proto::get_message::<Manifest>(
-            &self.store,
-            walgit_proto::keys::MANIFEST,
-        )
-        .await?
-        {
-            Some((m, manifest)) => (m, manifest),
-            None => return Err(WalError::NotFound),
+        let Some((meta, manifest)) =
+            crate::store_proto::get_message::<Manifest>(&self.store, walgit_proto::keys::MANIFEST)
+                .await?
+        else {
+            return Err(WalError::NotFound);
         };
 
         // Reset state and re-materialize
@@ -986,6 +983,7 @@ impl RepoHandle {
         synced: bool,
         created_at: Option<prost_types::Timestamp>,
     ) -> Result<PublishResult, WalError> {
+        let sender = self.get_or_init_publisher()?;
         self.publish_waiters.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let request = PublishRequest {
@@ -997,7 +995,6 @@ impl RepoHandle {
             response: tx,
         };
 
-        let sender = self.get_or_init_publisher().await;
         if sender.send(request).is_err() {
             self.publish_waiters.fetch_sub(1, Ordering::Relaxed);
             return Err(WalError::Corrupt("publisher channel closed".into()));
@@ -1039,16 +1036,16 @@ impl RepoHandle {
     /// (never a failure on a read path).
     pub fn effective_config(&self) -> Arc<walgit_config::Config> {
         let settings = self.settings();
-        let rev = settings.as_ref().map(|s| s.revision).unwrap_or(0);
+        let rev = settings.as_ref().map_or(0, |s| s.revision);
         if rev == 0 {
             return self.cfg.clone();
         }
-        if let Some((r, c)) = self.effective.lock().as_ref() {
-            if *r == rev {
-                return c.clone();
-            }
+        if let Some((r, c)) = self.effective.lock().as_ref()
+            && *r == rev
+        {
+            return c.clone();
         }
-        let toml = settings.as_ref().map(|s| s.toml.as_str()).unwrap_or("");
+        let toml = settings.as_ref().map_or("", |s| s.toml.as_str());
         let cfg = match self.cfg.with_settings(toml) {
             Ok(c) => Arc::new(c),
             Err(e) => {
@@ -1223,6 +1220,10 @@ impl RepoHandle {
     /// Read the checkpoint object's times when the manifest ref has none
     /// (one 240-byte GET per checkpoint per process; no-op otherwise).
     pub(crate) async fn learn_checkpoint_times(&self) -> Result<(), WalError> {
+        use walgit_store::ObjectStoreExt;
+
+        use prost::Message;
+
         let m = self.manifest();
         let Some(cp) = m.checkpoint.as_ref() else {
             return Ok(());
@@ -1232,8 +1233,7 @@ impl RepoHandle {
         {
             return Ok(());
         }
-        use prost::Message;
-        use walgit_store::ObjectStoreExt;
+
         if let Some((_, bytes)) = self.store.get_bytes(&cp.key).await? {
             let cpo = walgit_proto::v1::Checkpoint::decode(bytes.as_ref())
                 .map_err(|e| WalError::Corrupt(format!("checkpoint decode: {e}")))?;
@@ -1261,7 +1261,7 @@ impl RepoHandle {
         crate::log_reader::refs_at_seq(self, seq).await
     }
 
-    /// Read log entries [from_seq, to_seq].
+    /// Read log entries [`from_seq`, `to_seq`].
     pub async fn read_log(
         &self,
         from_seq: u64,
@@ -1288,14 +1288,14 @@ impl RepoHandle {
         *self.last_freshness.lock() = Some(Instant::now());
     }
 
-    async fn get_or_init_publisher(&self) -> mpsc::UnboundedSender<PublishRequest> {
+    fn get_or_init_publisher(&self) -> Result<mpsc::UnboundedSender<PublishRequest>, WalError> {
         let mut guard = self.publish_tx.lock();
         if let Some(tx) = &*guard {
             // A publisher task that died (panic mid-batch) leaves a sender to
             // a dropped receiver; respawn instead of failing every push on
             // this instance forever.
             if !tx.is_closed() {
-                return tx.clone();
+                return Ok(tx.clone());
             }
             tracing::warn!(repo = %self.id, "publisher task is gone; respawning");
         }
@@ -1303,10 +1303,12 @@ impl RepoHandle {
         let arc = self
             .self_arc
             .get()
-            .expect("self_arc must be set before publish")
+            .ok_or_else(|| {
+                WalError::Corrupt("publisher repository reference not initialized".into())
+            })?
             .clone();
         tokio::spawn(crate::publish::publisher_task(arc, rx));
         *guard = Some(tx.clone());
-        tx
+        Ok(tx)
     }
 }

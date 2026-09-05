@@ -106,7 +106,7 @@ fn self_signed(dir: &Path, hostnames: &[String]) -> anyhow::Result<(String, Stri
         rcgen::CertificateParams::new(hostnames.to_vec()).context("certificate params")?;
     params.distinguished_name.push(
         rcgen::DnType::CommonName,
-        hostnames.first().map(String::as_str).unwrap_or("walgit"),
+        hostnames.first().map_or("walgit", String::as_str),
     );
     params.not_before = rcgen::date_time_ymd(2024, 1, 1);
     params.not_after = rcgen::date_time_ymd(2124, 1, 1);
@@ -137,7 +137,7 @@ fn write_private(path: &Path, body: &str) -> anyhow::Result<()> {
 }
 
 /// `axum::serve::Listener` that wraps every accepted TCP connection in a
-/// lazily-handshaking TLS stream (TCP_NODELAY set, like the plain listener).
+/// lazily-handshaking TLS stream (`TCP_NODELAY` set, like the plain listener).
 pub struct TlsListener {
     pub(crate) tcp: TcpAccept,
     pub acceptor: TlsAcceptor,

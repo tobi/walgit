@@ -1,5 +1,7 @@
 //! Git LFS batch API + basic transfer (download/upload/verify). Objects live at
 //! `lfs/objects/<oid[0:2]>/<oid[2:4]>/<oid>` in the repo-scoped store.
+use std::collections::HashMap;
+
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -109,7 +111,7 @@ pub async fn batch(
                 .batch(upstream, cfg.upstream.token_env.as_deref(), &missing)
                 .await
         }
-        _ => Default::default(),
+        _ => HashMap::default(),
     };
 
     let mut objs = Vec::with_capacity(body.objects.len());
@@ -209,7 +211,7 @@ pub async fn batch(
 }
 
 /// `GET|HEAD /{repo}/info/lfs/objects/{oid}` — stream the object with the full
-/// immutable-object contract (strong ETag, 304, Range/If-Range, HEAD,
+/// immutable-object contract (strong `ETag`, 304, Range/If-Range, HEAD,
 /// Content-Length); see `static_object`. LFS objects are sha256-addressed.
 pub async fn get_object(
     st: &AppState,
@@ -387,6 +389,10 @@ pub async fn put_object(
     headers: &HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use sha2::{Digest, Sha256};
+
     if !st.cfg.lfs.enabled {
         return Err(ApiError::NotFound("lfs disabled".into()));
     }
@@ -405,8 +411,6 @@ pub async fn put_object(
             .map_err(|e| ApiError::Internal(e.to_string()))?,
     );
     let mut reader = body_to_async_read(body);
-    use sha2::{Digest, Sha256};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut hasher = Sha256::new();
     let mut n = 0u64;
     let mut buf = vec![0u8; 64 * 1024];

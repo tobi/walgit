@@ -1,8 +1,8 @@
 //! Git smart HTTP protocol (v0/v2): info/refs, upload-pack, receive-pack.
 //!
 //! References:
-//! * https://git-scm.com/docs/http-protocol
-//! * https://git-scm.com/docs/protocol-v2
+//! * <https://git-scm.com/docs/http-protocol>
+//! * <https://git-scm.com/docs/protocol-v2>
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,10 +66,8 @@ pub async fn info_refs(
         }
         return Err(auth_err(e));
     }
-    if is_receive {
-        if let Some(msg) = push_url_must_be_git(st, route, headers) {
-            return Ok(git_err_response("git-receive-pack", &msg));
-        }
+    if is_receive && let Some(msg) = push_url_must_be_git(st, route, headers) {
+        return Ok(git_err_response("git-receive-pack", &msg));
     }
 
     let service = match service_param.as_str() {
@@ -92,31 +90,28 @@ pub async fn info_refs(
     pktline::encode_text(&mut buf, &svc_line);
     pktline::encode_flush(&mut buf);
 
-    match (protocol, service) {
-        (walgit_git::pkt::Protocol::V2, walgit_git::Service::UploadPack) => {
-            v2_capability_advert(st, &route.id, &handle, &mut buf).await?;
-        }
-        _ => {
-            // v0 (and receive-pack always).
-            let repo_key = route.id.to_string();
-            let ver = handle.manifest_version();
-            if let Some(cached) = st
-                .caches
+    if let (walgit_git::pkt::Protocol::V2, walgit_git::Service::UploadPack) = (protocol, service) {
+        v2_capability_advert(st, &route.id, &handle, &mut buf).await?;
+    } else {
+        // v0 (and receive-pack always).
+        let repo_key = route.id.to_string();
+        let ver = handle.manifest_version();
+        if let Some(cached) = st
+            .caches
+            .ref_advert
+            .get_v0(&repo_key, ver.as_ref(), service)
+        {
+            buf.extend_from_slice(&cached);
+        } else {
+            let start = buf.len();
+            handle
+                .local()
+                .advertise_refs_v0(service, &mut buf)
+                .map_err(git_err)?;
+            let advert_bytes = buf[start..].to_vec();
+            st.caches
                 .ref_advert
-                .get_v0(&repo_key, ver.as_ref(), service)
-            {
-                buf.extend_from_slice(&cached);
-            } else {
-                let start = buf.len();
-                handle
-                    .local()
-                    .advertise_refs_v0(service, &mut buf)
-                    .map_err(git_err)?;
-                let advert_bytes = buf[start..].to_vec();
-                st.caches
-                    .ref_advert
-                    .insert_v0(&repo_key, ver.as_ref(), service, advert_bytes);
-            }
+                .insert_v0(&repo_key, ver.as_ref(), service, advert_bytes);
         }
     }
 
@@ -126,10 +121,10 @@ pub async fn info_refs(
 
 fn parse_query(query: &str, key: &str) -> Option<String> {
     for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == key {
-                return Some(v.to_string());
-            }
+        if let Some((k, v)) = pair.split_once('=')
+            && k == key
+        {
+            return Some(v.to_string());
         }
     }
     None
@@ -162,10 +157,10 @@ async fn v2_capability_advert(
         walgit_git::ObjectFormat::Sha256 => "sha256",
     };
     pktline::encode_text(buf, &format!("object-format={fmt}\n"));
-    if st.cfg.bundles.advertise {
-        if let Ok(Some(_list)) = st.bundles.list(id).await {
-            pktline::encode_text(buf, "bundle-uri\n");
-        }
+    if st.cfg.bundles.advertise
+        && let Ok(Some(_list)) = st.bundles.list(id).await
+    {
+        pktline::encode_text(buf, "bundle-uri\n");
     }
     pktline::encode_flush(buf);
     Ok(())
@@ -224,24 +219,22 @@ async fn upload_pack_v2(
             };
             let repo_key = route.id.to_string();
             let version = handle.manifest_version();
-            let lines =
-                match st
-                    .caches
+            let lines = if let Some(lines) =
+                st.caches
                     .ref_advert
                     .get_v2_ls_refs(&repo_key, version.as_ref(), &args)
-                {
-                    Some(lines) => lines,
-                    None => {
-                        let lines = handle.local().ls_refs(&args).map_err(git_err)?;
-                        st.caches.ref_advert.insert_v2_ls_refs(
-                            &repo_key,
-                            version.as_ref(),
-                            &args,
-                            lines.clone(),
-                        );
-                        lines
-                    }
-                };
+            {
+                lines
+            } else {
+                let lines = handle.local().ls_refs(&args).map_err(git_err)?;
+                st.caches.ref_advert.insert_v2_ls_refs(
+                    &repo_key,
+                    version.as_ref(),
+                    &args,
+                    lines.clone(),
+                );
+                lines
+            };
             let mut buf = Vec::with_capacity(1024);
             for line in &lines {
                 pktline::encode_text(&mut buf, &line.render(&args));
@@ -297,35 +290,32 @@ async fn upload_pack_v2(
                 // list within the hour TRIED bundle-uri — its zero-have fetch is a
                 // bundle download that failed (git never retries one). Let that
                 // clone succeed through upload-pack, once per 6 h, loudly.
-                match bundle_fallback_allowed(st, headers, route).await {
-                    Some(who) => {
-                        tracing::warn!(repo = %route.id, principal = %who, "bundles.require: one-shot upload-pack fallback for a client whose bundle download failed");
-                        metrics::counter!("walgit_bundle_fallback_total", "repo" => route.id.to_string()).increment(1);
-                        fallback_warning = Some(format!(
-                            "walgit: WARNING — your git fetched the bundle list but could not apply the bundles \
-                             (a bundle download failed or was cut; see the warnings above). Serving this clone's \
-                             full history through upload-pack ONCE (≈ 32 GB for acme/monorepo, minutes of server \
-                             time); the next such clone within 6 h is refused. Faster next time: retry the clone \
-                             (bundle downloads are cached at the edge), or the blobless form: \
-                             git clone --filter=blob:none --bundle-uri={base}/{repo}.git/bundles/list?filter=blob:none {base}/{repo}.git",
-                            base = request_base_url(st, headers),
-                            repo = route.id
-                        ));
-                    }
-                    None => {
-                        let msg = bundles_required_message(st, headers, route);
-                        return Ok(if req.sideband_all {
-                            let mut buf = sideband_pkt(3, &msg);
-                            pktline::encode_flush(&mut buf);
-                            text_response(
-                                "application/x-git-upload-pack-result",
-                                no_cache_headers(),
-                                buf,
-                            )
-                        } else {
-                            git_err_response("git-upload-pack", &msg)
-                        });
-                    }
+                if let Some(who) = bundle_fallback_allowed(st, headers, route).await {
+                    tracing::warn!(repo = %route.id, principal = %who, "bundles.require: one-shot upload-pack fallback for a client whose bundle download failed");
+                    metrics::counter!("walgit_bundle_fallback_total", "repo" => route.id.to_string()).increment(1);
+                    fallback_warning = Some(format!(
+                        "walgit: WARNING — your git fetched the bundle list but could not apply the bundles \
+                         (a bundle download failed or was cut; see the warnings above). Serving this clone's \
+                         full history through upload-pack ONCE (≈ 32 GB for acme/monorepo, minutes of server \
+                         time); the next such clone within 6 h is refused. Faster next time: retry the clone \
+                         (bundle downloads are cached at the edge), or the blobless form: \
+                         git clone --filter=blob:none --bundle-uri={base}/{repo}.git/bundles/list?filter=blob:none {base}/{repo}.git",
+                        base = request_base_url(st, headers),
+                        repo = route.id
+                    ));
+                } else {
+                    let msg = bundles_required_message(st, headers, route);
+                    return Ok(if req.sideband_all {
+                        let mut buf = sideband_pkt(3, &msg);
+                        pktline::encode_flush(&mut buf);
+                        text_response(
+                            "application/x-git-upload-pack-result",
+                            no_cache_headers(),
+                            buf,
+                        )
+                    } else {
+                        git_err_response("git-upload-pack", &msg)
+                    });
                 }
             }
             // Narrated fetch: the client accepted sideband-all and wants
@@ -381,8 +371,7 @@ async fn upload_pack_v2(
                 let size = gix_hash::ObjectId::from_hex(hex.as_bytes())
                     .ok()
                     .and_then(|oid| repo.find_object(oid).ok())
-                    .map(|o| o.data.len() as i64)
-                    .unwrap_or(-1);
+                    .map_or(-1, |o| o.data.len() as i64);
                 pktline::encode_text(&mut sizes_buf, &format!("size {size}\n"));
             }
             pktline::encode_flush(&mut sizes_buf);
@@ -394,7 +383,7 @@ async fn upload_pack_v2(
         }
         "bundle-uri" => {
             let _guard = handle.sync_refs().await.map_err(wal_err)?;
-            let _ = walgit_git::pkt::parse_bundle_uri(&cmd);
+            let () = walgit_git::pkt::parse_bundle_uri(&cmd);
             let base = request_base_url(st, headers);
             let lines = st
                 .bundles
@@ -478,7 +467,7 @@ fn bundle_narration(
         out.push("bundle-uri: none of your haves is a bundle tip — your git did not use the bundles (clone with the recipe from the Clone menu, or check transfer.bundleURI)".into());
     } else {
         let bytes: u64 = applied.iter().map(|b| b.size).sum();
-        let newest = applied.last().map(|b| b.creation_token).unwrap_or(0);
+        let newest = applied.last().map_or(0, |b| b.creation_token);
         let when = chrono::DateTime::from_timestamp(newest as i64, 0)
             .map(|d| d.format("%Y-%m-%d %H:%MZ").to_string())
             .unwrap_or_default();
@@ -527,7 +516,7 @@ async fn run_fetch<W: tokio::io::AsyncWrite + Unpin + Send>(
             bytes = stats.bytes,
             faulted,
             rounds,
-            ms = t0.elapsed().as_millis() as u64,
+            ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
             "gix fetch over remote-served base"
         );
         return Ok(());
@@ -583,7 +572,9 @@ async fn sync_narrated<'h, W: tokio::io::AsyncWrite + Unpin>(
     }
     let sync = handle.sync();
     tokio::pin!(sync);
-    let mut last_bar = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let mut last_bar = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .unwrap();
     loop {
         tokio::select! {
             biased;
@@ -591,7 +582,7 @@ async fn sync_narrated<'h, W: tokio::io::AsyncWrite + Unpin>(
             p = rx.recv() => match p {
                 Ok(walgit_wal::Progress::Notice { text }) => { let _ = say(writer, &text).await; }
                 Ok(walgit_wal::Progress::Progress { label, done, total, unit, percent }) => {
-                    if last_bar.elapsed() >= std::time::Duration::from_secs(1) || total.map(|t| done >= t).unwrap_or(false) {
+                    if last_bar.elapsed() >= std::time::Duration::from_secs(1) || total.is_some_and(|t| done >= t) {
                         last_bar = std::time::Instant::now();
                         let line = match (total, percent) {
                             (Some(t), Some(pc)) if unit == "bytes" => format!("{label}: {pc:.0}% ({} / {})", human(done), human(t)),
@@ -613,7 +604,7 @@ async fn sync_narrated<'h, W: tokio::io::AsyncWrite + Unpin>(
                     break (&mut sync).await;
                 }
             },
-            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
                 let _ = say(writer, &format!("still syncing ({}s)…", t0.elapsed().as_secs())).await;
             }
         }
@@ -640,8 +631,7 @@ async fn narrated_fetch(
         .require_read(headers)
         .await
         .ok()
-        .map(|p| p.name)
-        .unwrap_or_else(|| "anonymous".into());
+        .map_or_else(|| "anonymous".into(), |p| p.name);
     // Nothing that can wait (store reads, syncs) happens before the stream
     // is open and the first band-2 line is out: the bundle facts are read
     // inside the task, after the greeting.
@@ -742,7 +732,7 @@ async fn narrated_fetch(
             }
         };
         let local = guard.local().clone();
-        let packs = local.packs().map(|p| p.len()).unwrap_or(0);
+        let packs = local.packs().map_or(0, |p| p.len());
         let remote = handle.remote_served();
         let _ = say(
             &mut writer,
@@ -1070,7 +1060,7 @@ pub async fn receive_pack(
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
         .filter(|v| !v.is_empty())
-        .map(|v| v.to_string());
+        .map(std::string::ToString::to_string);
 
     if !caps.side_band_64k {
         // No sideband: the response is the report alone, after the work.
@@ -1189,31 +1179,30 @@ async fn receive_pack_process(
     };
 
     // Connectivity check for pushed tips (before we publish anything).
-    if unpack_err.is_none() && st.cfg.wal.check_connectivity {
-        if let Ok(Some(_)) = &ingest {
-            let tips: Vec<gix_hash::ObjectId> = txn
-                .updates
-                .iter()
-                .filter(|u| !u.new_oid.is_empty() && !is_zero_oid(&u.new_oid))
-                .filter_map(|u| gix_hash::ObjectId::from_hex(u.new_oid.as_bytes()).ok())
-                .collect();
-            if !tips.is_empty() {
-                if let Err(e) = local
-                    .check_connectivity_async(&tips, true)
-                    .instrument(tracing::info_span!(
-                        "receive.connectivity",
-                        tips = tips.len()
-                    ))
-                    .await
-                {
-                    // Every refusal names the reason on each ref: `unpack ng`
-                    // alone makes git print "remote failed to report status".
-                    tracing::warn!(repo = %route_id, error = %e, "receive-pack: connectivity check failed");
-                    metrics::counter!("walgit_push_refused_total", "reason" => "connectivity")
-                        .increment(1);
-                    return Ok(refusal_report(&caps, &txn, &format!("connectivity: {e}")).await);
-                }
-            }
+    if unpack_err.is_none()
+        && st.cfg.wal.check_connectivity
+        && let Ok(Some(_)) = &ingest
+    {
+        let tips: Vec<gix_hash::ObjectId> = txn
+            .updates
+            .iter()
+            .filter(|u| !u.new_oid.is_empty() && !is_zero_oid(&u.new_oid))
+            .filter_map(|u| gix_hash::ObjectId::from_hex(u.new_oid.as_bytes()).ok())
+            .collect();
+        if !tips.is_empty()
+            && let Err(e) = local
+                .check_connectivity_async(&tips, true)
+                .instrument(tracing::info_span!(
+                    "receive.connectivity",
+                    tips = tips.len()
+                ))
+                .await
+        {
+            // Every refusal names the reason on each ref: `unpack ng`
+            // alone makes git print "remote failed to report status".
+            tracing::warn!(repo = %route_id, error = %e, "receive-pack: connectivity check failed");
+            metrics::counter!("walgit_push_refused_total", "reason" => "connectivity").increment(1);
+            return Ok(refusal_report(&caps, &txn, &format!("connectivity: {e}")).await);
         }
     }
 
@@ -1416,9 +1405,8 @@ async fn parse_fetch_request(
             .map_err(git_err)?;
         match line {
             None
-            | Some(walgit_git::pkt::PktLine::Flush)
-            | Some(walgit_git::pkt::PktLine::Delim) => break,
-            Some(walgit_git::pkt::PktLine::ResponseEnd) => break,
+            | Some(walgit_git::pkt::PktLine::Flush | walgit_git::pkt::PktLine::Delim)
+            | Some(walgit_git::pkt::PktLine::ResponseEnd) => break,
             Some(walgit_git::pkt::PktLine::Data(b)) => {
                 let s = String::from_utf8_lossy(&b);
                 let s = s.trim_end_matches('\n');
@@ -1621,9 +1609,9 @@ fn too_large_message(
 
 /// How often one principal may fall back to an upload-pack full clone of a
 /// `bundles.require` repository.
-const FALLBACK_EVERY: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+const FALLBACK_EVERY: std::time::Duration = std::time::Duration::from_hours(6);
 /// How recent the principal's `bundles/list` fetch must be to count as "tried".
-const ATTEMPT_WINDOW: std::time::Duration = std::time::Duration::from_secs(3600);
+const ATTEMPT_WINDOW: std::time::Duration = std::time::Duration::from_hours(1);
 
 /// D17 amendment: `Some(principal)` when this zero-have full fetch may go to
 /// upload-pack — the principal fetched the repo's bundle list within the hour

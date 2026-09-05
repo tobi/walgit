@@ -403,7 +403,7 @@ pub async fn http_validate(
         Ok(eff) => {
             let preview = walgit_proto::v1::RepoSettings {
                 toml: text.to_string(),
-                revision: h.settings().map(|s| s.revision + 1).unwrap_or(1),
+                revision: h.settings().map_or(1, |s| s.revision + 1),
                 author: "(preview)".into(),
                 updated_at: None,
                 message: String::new(),
@@ -467,7 +467,7 @@ pub async fn http_policy_dry_run(
         .unwrap_or(20)
         .clamp(1, 200);
     let bytes = crate::collect_body(body).await?;
-    let policy = if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+    let policy = if bytes.iter().all(u8::is_ascii_whitespace) {
         crate::policy::load(&st.store, &route.id)
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?

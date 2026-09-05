@@ -1,3 +1,7 @@
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::many_single_char_names, unsafe_code)]
+
 //! End-to-end tests: real upstream `git` against a live walgit-server backed
 //! by the in-memory store. Covers clone/push/fetch (v2 and v0), non-ff reject,
 //! ref delete, tags, partial clone + lazy fetch, ls-remote, and the two-instance
@@ -712,7 +716,7 @@ async fn many_refs_impl(n: usize) -> TestResult {
     let push_start = Instant::now();
     git_in(&src, &["push", "--mirror", "origin"])?;
     println!("{n}-ref mirror push took {:?}", push_start.elapsed());
-    assert!(push_start.elapsed() < std::time::Duration::from_secs(240));
+    assert!(push_start.elapsed() < std::time::Duration::from_mins(4));
     let start = Instant::now();
     let output = Command::new("git")
         .args(["ls-remote", &server.repo_url("t", "many-refs")])
@@ -981,8 +985,7 @@ fn git_lfs_present() -> bool {
     Command::new("git")
         .args(["lfs", "version"])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 fn git_supports_sha256() -> bool {
@@ -997,8 +1000,7 @@ fn git_supports_sha256() -> bool {
             dir.path().to_str().unwrap(),
         ])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 /// A front whose `cache.max_bytes` cannot hold a repository's pack set must
@@ -1815,29 +1817,42 @@ async fn partial_clone_tree_zero_and_depth_with_filter() -> TestResult {
 /// the instance stalled for minutes, timers included).
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn history_pack_install_does_not_stall_the_runtime() -> TestResult {
-    // git shim: slow only for multi-pack-index.
-    let shim = tempfile::tempdir()?;
-    let real_git = String::from_utf8(
-        std::process::Command::new("sh")
-            .args(["-c", "command -v git"])
-            .output()?
-            .stdout,
-    )?
-    .trim()
-    .to_string();
-    std::fs::write(
-        shim.path().join("git"),
-        format!(
-            "#!/bin/sh\nif [ \"$1\" = multi-pack-index ]; then sleep 3; fi\nexec {real_git} \"$@\"\n"
-        ),
-    )?;
-    std::fs::set_permissions(
-        shim.path().join("git"),
-        std::os::unix::fs::PermissionsExt::from_mode(0o755),
-    )?;
-    let old_path = std::env::var("PATH").unwrap_or_default();
-    // SAFETY: test process, single-threaded runtime, set before any git spawn below.
-    unsafe { std::env::set_var("PATH", format!("{}:{old_path}", shim.path().display())) };
+    const CHILD: &str = "WALGIT_TEST_HISTORY_INSTALL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // git shim: slow only for multi-pack-index.
+        let shim = tempfile::tempdir()?;
+        let real_git = String::from_utf8(
+            std::process::Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()?
+                .stdout,
+        )?
+        .trim()
+        .to_string();
+        std::fs::write(
+            shim.path().join("git"),
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = multi-pack-index ]; then sleep 3; fi\nexec {real_git} \"$@\"\n"
+            ),
+        )?;
+        std::fs::set_permissions(
+            shim.path().join("git"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )?;
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        let status = tokio::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "history_pack_install_does_not_stall_the_runtime",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PATH", format!("{}:{old_path}", shim.path().display()))
+            .status()
+            .await?;
+        assert!(status.success(), "isolated history install test failed");
+        return Ok(());
+    }
 
     let big = Server::start().await?;
     big.put_repo("t", "hist").await?;
@@ -1883,7 +1898,7 @@ async fn history_pack_install_does_not_stall_the_runtime() -> TestResult {
     let small = big
         .start_sibling_with(|c| {
             c.cache.prewarm = vec!["t/hist".into()];
-            c.cache.prewarm_ready_timeout = std::time::Duration::from_secs(600);
+            c.cache.prewarm_ready_timeout = std::time::Duration::from_mins(10);
         })
         .await?;
     walgit_server::prewarm::spawn(small.state.clone());
@@ -1963,18 +1978,30 @@ async fn history_pack_install_does_not_stall_the_runtime() -> TestResult {
         took.as_secs_f64() >= 3.0,
         "the shim should have slowed the install: {took:?}"
     );
-    unsafe { std::env::set_var("PATH", old_path) };
     Ok(())
 }
 
 /// Materialization runs on its own runtime: even an unknown *blocking* call
 /// inside the install path (simulated by `WALGIT_TEST_BLOCK_INSTALL_MS`, a
-/// synchronous sleep in reconcile_packs) must not stall request workers —
+/// synchronous sleep in `reconcile_packs`) must not stall request workers —
 /// refs answer in milliseconds on a single-worker server meanwhile.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn blocking_work_in_the_install_path_does_not_stall_requests() -> TestResult {
-    // SAFETY: test process; read by the sibling's sync below.
-    unsafe { std::env::set_var("WALGIT_TEST_BLOCK_INSTALL_MS", "2500") };
+    const CHILD: &str = "WALGIT_TEST_BLOCK_INSTALL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = tokio::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "blocking_work_in_the_install_path_does_not_stall_requests",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("WALGIT_TEST_BLOCK_INSTALL_MS", "2500")
+            .status()
+            .await?;
+        assert!(status.success(), "isolated blocking install test failed");
+        return Ok(());
+    }
     let big = Server::start().await?;
     big.put_repo("t", "blk").await?;
     big.put_repo("t", "other2").await?;
@@ -2015,7 +2042,6 @@ async fn blocking_work_in_the_install_path_does_not_stall_requests() -> TestResu
         worst = worst.max(t.elapsed().as_millis());
         probes += 1;
     }
-    unsafe { std::env::remove_var("WALGIT_TEST_BLOCK_INSTALL_MS") };
     let took = install.await?;
     assert!(took.as_millis() >= 2500, "{took:?}");
     assert!(probes >= 5, "runtime stalled: {probes} probes in {took:?}");

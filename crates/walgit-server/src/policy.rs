@@ -183,9 +183,9 @@ impl RepoPolicy {
             if !rule_names.insert(&r.name) {
                 return Err(format!("rules: duplicate name {:?}", r.name));
             }
-            let n = r.effect.protect.is_some() as u8
-                + r.effect.history.is_some() as u8
-                + r.effect.size.is_some() as u8;
+            let n = u8::from(r.effect.protect.is_some())
+                + u8::from(r.effect.history.is_some())
+                + u8::from(r.effect.size.is_some());
             if n != 1 {
                 return Err(format!(
                     "rule {:?}: effect must have exactly one of protect, history, size",
@@ -246,8 +246,8 @@ fn check_overlap_bypass(p: &RepoPolicy) -> Result<(), String> {
             if ba.is_empty() || bb.is_empty() {
                 continue;
             }
-            let set_a: HashSet<&str> = ba.iter().map(|s| s.as_str()).collect();
-            let set_b: HashSet<&str> = bb.iter().map(|s| s.as_str()).collect();
+            let set_a: HashSet<&str> = ba.iter().map(std::string::String::as_str).collect();
+            let set_b: HashSet<&str> = bb.iter().map(std::string::String::as_str).collect();
             if set_a.is_disjoint(&set_b) {
                 return Err(format!(
                     "protect rules {:?} and {:?} overlap with disjoint bypass lists",
