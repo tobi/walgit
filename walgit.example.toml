@@ -3,7 +3,7 @@
 # Start from walgit.standalone.toml for a first run; come here when you need a key.
 # Normative bundle-slot semantics: docs/BUNDLE_URI_DESIGN.md §4.
 # Every key can also be set from the environment: WALGIT__SECTION__KEY=value (TOML value syntax).
-# Validate with: walgit config check walgit.toml
+# Validate with: walgit --config walgit.toml config check
 
 [server]
 listen = "127.0.0.1:8080"        # default; `mode = none` is refused unless this is loopback. Public bind: 0.0.0.0 with token/oidc.
