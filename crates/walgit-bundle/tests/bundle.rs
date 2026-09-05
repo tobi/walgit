@@ -390,20 +390,22 @@ async fn incremental_has_prerequisites() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Check that the bundle header has prerequisites (lines starting with -).
+    // Bundle header ends at the first blank line; the pack is binary after that.
     let header = String::from_utf8_lossy(&data);
-    let header_lines: Vec<&str> = header.lines().take(20).collect();
-    let has_prereq = header_lines.iter().any(|l| l.starts_with('-'));
+    let header_lines: Vec<&str> = header.lines().take_while(|l| !l.is_empty()).collect();
+    let prereqs: Vec<&str> = header_lines
+        .iter()
+        .filter_map(|l| l.strip_prefix('-'))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .collect();
     assert!(
-        has_prereq,
+        !prereqs.is_empty(),
         "incremental bundle should have prerequisites in header"
     );
 
     // The prerequisites should match the base bundle's tips.
     let base_tips: Vec<&str> = base_entry.tips.iter().map(|t| t.oid.as_str()).collect();
-    for prereq_line in header_lines.iter().filter(|l| l.starts_with('-')) {
-        // Format: "-<oid> <comment>"
-        let oid = prereq_line[1..].split_whitespace().next().unwrap_or("");
+    for oid in prereqs {
         assert!(
             base_tips.contains(&oid),
             "prerequisite {oid} should be in base tips {base_tips:?}"
