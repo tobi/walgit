@@ -3,6 +3,22 @@ use futures::StreamExt;
 
 use crate::{ByteStream, Result, StoreError};
 
+/// Pack data and side-files, bundle files, and LFS objects use the bulk
+/// transport. Metadata such as manifests, logs, and bundle lists stays on the
+/// control transport even when its path contains a bulk directory.
+pub fn is_bulk_key(key: &str) -> bool {
+    let name = key.rsplit('/').next().unwrap_or(key);
+    if name.ends_with(".pb") || name.ends_with(".json") {
+        return false;
+    }
+    key.contains("/wal/")
+        || key.starts_with("wal/")
+        || key.contains("/bundles/")
+        || key.starts_with("bundles/")
+        || key.contains("/lfs/")
+        || key.starts_with("lfs/")
+}
+
 /// Collect a byte stream. `size_hint` pre-allocates.
 pub async fn collect(mut body: ByteStream, size_hint: usize) -> Result<Bytes> {
     let mut first: Option<Bytes> = None;

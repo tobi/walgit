@@ -122,6 +122,8 @@ google-cloud-auth = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
 aws-smithy-types = "1"
+azure_core = "1"
+azure_identity = "1"
 clap = { version = "4", features = ["derive", "env"] }
 rand = "0.9"
 sha1 = "0.10"
