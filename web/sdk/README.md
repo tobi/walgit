@@ -60,6 +60,7 @@ r.raw(rev, path)                             → string
 r.commits({ ref, path, skip, n })            → { ref, sha, commits, more }
 r.commit(sha)                                → { commit, stats, patch }
 r.overview()                                 → WAL overview (walgit-specific)
+r.snapshot(seq)                              → a WAL rewind the answering instance materialized (404 until it has)
 r.tasks()  /  r.task(id, onEvent?)           → what the answering instance is doing; attach to a task stream
 r.ops.list()  /  r.ops.run(op, params, onEvent)
 r.policy.get() / .put(doc) / .delete()       → push policy (docs/POLICY.md)
