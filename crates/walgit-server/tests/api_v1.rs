@@ -631,3 +631,79 @@ async fn policy_and_settings_writes_require_admin() -> TestResult {
     assert_eq!(st, 200, "{text}");
     Ok(())
 }
+
+#[tokio::test]
+async fn popup_identity_only_targets_an_allowed_opener_and_is_script_safe() -> TestResult {
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = false;
+        c.server.cors_origins = vec!["https://review.example".into()];
+        c.server.auth.tokens = vec![walgit_config::StaticToken {
+            principal: "</script><script>untrusted()</script>".into(),
+            token: "test-token".into(),
+            token_env: None,
+            write: false,
+            admin: false,
+        }];
+    })
+    .await?;
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/authenticate", server.base_url);
+    for origin in ["https://untrusted.example", "https://review.example/path"] {
+        let r = client
+            .get(&url)
+            .query(&[("origin", origin)])
+            .bearer_auth("test-token")
+            .send()
+            .await?;
+        assert_eq!(r.status(), 403);
+    }
+    let body = client
+        .get(&url)
+        .query(&[("origin", "https://review.example")])
+        .bearer_auth("test-token")
+        .send()
+        .await?
+        .text()
+        .await?;
+    assert!(!body.contains("</script><script>"));
+    assert!(body.contains("postMessage(msg, \"https://review.example\")"));
+    assert!(!body.contains("postMessage(msg, \"*\")"));
+    let body = client
+        .get(&url)
+        .bearer_auth("test-token")
+        .send()
+        .await?
+        .text()
+        .await?;
+    assert!(body.contains("postMessage(msg, window.location.origin)"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn lfs_upload_batch_requires_write_and_rejects_unknown_operations() -> TestResult {
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = false;
+        c.server.auth.tokens = vec![walgit_config::StaticToken {
+            principal: "reader".into(),
+            token: "read-only".into(),
+            token_env: None,
+            write: false,
+            admin: false,
+        }];
+    })
+    .await?;
+    let url = format!("{}/o/r.git/info/lfs/objects/batch", server.base_url);
+    let client = reqwest::Client::new();
+    for (op, status) in [("upload", 403), ("unknown", 400)] {
+        let r = client
+            .post(&url)
+            .bearer_auth("read-only")
+            .json(&serde_json::json!({"operation": op, "objects": []}))
+            .send()
+            .await?;
+        assert_eq!(r.status(), status);
+    }
+    Ok(())
+}

@@ -147,7 +147,16 @@ async fn batch_inner(
     if !st.cfg.lfs.enabled {
         return Err(ApiError::NotFound("lfs disabled".into()));
     }
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    match body.operation.as_str() {
+        "upload" => {
+            st.auth.require_write(headers).await.map_err(auth_err)?;
+        }
+        "download" => {
+            st.auth.require_read(headers).await.map_err(auth_err)?;
+        }
+        _ => return Err(ApiError::BadRequest("unsupported LFS operation".into())),
+    }
+
     not_served_here(st, &route.id)?;
     let handle = open_repo(st, &route.id, false).await?;
     let store = handle.store().clone();

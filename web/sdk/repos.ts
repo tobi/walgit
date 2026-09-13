@@ -353,7 +353,9 @@ export class ReposClient {
 
   private async openAuthPopup(): Promise<boolean> {
     if (typeof window === "undefined") return false;
-    const url = `${this.base}/api-browser/v1/authenticate`;
+    const serverOrigin = new URL(this.base, window.location.href).origin;
+    const caller = serverOrigin === window.location.origin ? "" : `?origin=${encodeURIComponent(window.location.origin)}`;
+    const url = `${this.base}/api-browser/v1/authenticate${caller}`;
     const w = 520;
     const h = 640;
     const left = Math.max(0, (window.screen?.width ?? w) / 2 - w / 2);
@@ -370,7 +372,7 @@ export class ReposClient {
         resolve(ok);
       };
       const onMsg = (ev: MessageEvent) => {
-        if (ev.origin !== this.base) return;
+        if (ev.origin !== serverOrigin || ev.source !== popup) return;
         const d = ev.data as { type?: string } | null;
         if (d && d.type === "repos:authenticated") finish(true);
       };

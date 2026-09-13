@@ -538,3 +538,8 @@ GET /o/r/api/commit/deadbeef                    → 404 text/plain
 GET /o/r/tree/main/anything                              → 200 index.html
 GET /o/r/settings                                        → 200 index.html  (JSON is /o/r/api/settings)
 ```
+
+The authentication popup accepts `?origin=<opener-origin>` only for a configured
+CORS origin. Without it, notification targets the popup's own origin. The SDK
+supplies its origin for cross-origin use and checks both the sending origin and
+the opened window. Identity notifications never use a wildcard target.
