@@ -125,3 +125,8 @@ AWS documents the native conditions for [DELETE](https://docs.aws.amazon.com/Ama
 and [multipart completion](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html).
 The SDK-transport tests assert headers, stale-token rejection, surviving rival data and
 multipart aborts. Model/negative controls and witnesses: `StoreConditions`.
+
+LFS batch presence checks run in ordered groups of at most 16 concurrent HEADs:
+critical-path depth changes from N to ceil(N/16), with N requests unchanged.
+`local_presence_checks_are_parallel_and_preserve_batch_order` covers response
+ordering and presence results across 100 objects with artificial store latency.
