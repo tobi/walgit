@@ -52,6 +52,20 @@ impl fmt::Display for Version {
     }
 }
 
+/// A presigned upload of exactly one object, as handed to an untrusted client
+/// (see [`ObjectStore::signed_put_url`]).
+#[derive(Debug, Clone)]
+pub struct SignedPut {
+    /// Absolute URL the client `PUT`s the bytes to.
+    pub url: String,
+    /// Headers the client must send with the `PUT`. They are covered by the
+    /// signature, so dropping or editing one fails authentication instead of
+    /// writing; the checksum header is among them.
+    pub headers: Vec<(String, String)>,
+    /// Validity of the URL, as signed.
+    pub expires_in: std::time::Duration,
+}
+
 /// What an edge needs to fetch one object itself (see [`ObjectStore::accel_target`]).
 #[derive(Debug, Clone)]
 pub struct AccelTarget {
@@ -236,6 +250,26 @@ pub trait ObjectStore: Send + Sync + 'static {
         _key: &str,
         _ttl: std::time::Duration,
     ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Presigned URL for a client to upload one object directly (LFS), **bound
+    /// to `checksum_sha256`**: the backend rejects a body whose SHA-256 differs,
+    /// and the header carrying that checksum is inside the signature so a client
+    /// cannot drop it. A backend that cannot promise both returns `Ok(None)` and
+    /// the caller keeps its own proxying href.
+    ///
+    /// There is deliberately no unbound variant. The only keys walgit hands a
+    /// client a `PUT` for are content addresses (`lfs/objects/<aa>/<bb>/<oid>`,
+    /// `oid` = the SHA-256), so a `PUT` that accepts any bytes is a write
+    /// primitive for every oid a client can name — and those objects are served
+    /// back to everyone as immutable.
+    async fn signed_put_url(
+        &self,
+        _key: &str,
+        _ttl: std::time::Duration,
+        _checksum_sha256: &[u8; 32],
+    ) -> Result<Option<SignedPut>> {
         Ok(None)
     }
 
@@ -603,6 +637,16 @@ impl ObjectStore for Prefixed {
     }
     async fn signed_get_url(&self, key: &str, ttl: std::time::Duration) -> Result<Option<String>> {
         self.inner.signed_get_url(&self.full(key), ttl).await
+    }
+    async fn signed_put_url(
+        &self,
+        key: &str,
+        ttl: std::time::Duration,
+        checksum_sha256: &[u8; 32],
+    ) -> Result<Option<SignedPut>> {
+        self.inner
+            .signed_put_url(&self.full(key), ttl, checksum_sha256)
+            .await
     }
     async fn accel_target(&self, key: &str) -> Option<AccelTarget> {
         self.inner.accel_target(&self.full(key)).await

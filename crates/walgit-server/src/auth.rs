@@ -896,7 +896,7 @@ fn edge_owns_authorization(headers: &HeaderMap) -> bool {
 
 /// The client's `Authorization` header value: the header itself when walgit is hit
 /// directly, the edge-forwarded copy when an edge announced `client-authorization`.
-fn client_authorization(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn client_authorization(headers: &HeaderMap) -> Option<String> {
     // Nothing announced the capability, so `Authorization` is the client's own and a
     // forwarded copy nobody vouched for is not read at all (D39 (2), §1.3).
     if !edge_owns_authorization(headers) {

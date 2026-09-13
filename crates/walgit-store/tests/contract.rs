@@ -54,6 +54,44 @@ pub async fn run_contract(store: DynStore, prefix: &str) {
     test_large_streamed_roundtrip(&store, &p("large")).await;
     test_multipart_path(&store, &p("multi")).await;
     test_compose(&store, &p("compose")).await;
+    test_signed_put_is_bound_or_absent(&store, &p("signed-put")).await;
+}
+
+/// `signed_put_url` is either a PUT bound to the sha256 it was asked for, or
+/// nothing. A backend that answers `Some` must make the client send a header
+/// carrying that checksum — an unbound PUT for a content-addressed key would let
+/// any client write any bytes under any oid — and a backend that cannot promise
+/// that answers `Ok(None)` so the caller keeps proxying the bytes itself.
+async fn test_signed_put_is_bound_or_absent(store: &DynStore, key: &str) {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
+    let body = Bytes::from_static(b"an lfs object's bytes");
+    let digest: [u8; 32] = Sha256::digest(&body).into();
+    let put = store
+        .signed_put_url(key, std::time::Duration::from_secs(90), &digest)
+        .await
+        .expect("signed_put_url must not fail on a healthy store");
+    let Some(put) = put else {
+        eprintln!("skipping signed put: {} signs no PUTs", store.backend());
+        return;
+    };
+    assert!(
+        put.url.starts_with("https://") || put.url.starts_with("http://"),
+        "not a URL: {}",
+        put.url
+    );
+    assert_eq!(put.expires_in, std::time::Duration::from_secs(90));
+    // The digest travels base64-encoded (S3's `x-amz-checksum-sha256` wire form);
+    // whichever header the backend names, one of them must carry exactly it.
+    let expected = base64::engine::general_purpose::STANDARD.encode(digest);
+    assert!(
+        put.headers.iter().any(|(name, value)| {
+            name.to_ascii_lowercase().contains("sha256") && *value == expected
+        }),
+        "no header binds the sha256: {:?}",
+        put.headers
+    );
 }
 
 /// `compose`: a small header object followed by a body larger than S3's 5 MiB minimum
@@ -674,6 +712,22 @@ async fn test_multipart_path(store: &DynStore, key: &str) {
 async fn memory_contract() {
     let store: DynStore = Arc::new(MemoryStore::new());
     run_contract(store, "").await;
+}
+
+/// The in-memory backend signs no PUT, so `run_contract`'s signed-put step above
+/// only skips there. Assert the answer itself: LFS uploads on this backend proxy.
+#[tokio::test]
+async fn memory_signs_no_puts() {
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let put = store
+        .signed_put_url(
+            "lfs/objects/aa/bb/aabb",
+            std::time::Duration::from_secs(90),
+            &[0u8; 32],
+        )
+        .await
+        .expect("signing");
+    assert!(put.is_none());
 }
 
 #[cfg(feature = "s3")]
