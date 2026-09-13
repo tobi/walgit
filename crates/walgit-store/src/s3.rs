@@ -45,7 +45,7 @@ use std::ops::Range;
 use std::time::Duration;
 
 use aws_sdk_s3::Client as S3Client;
-use aws_sdk_s3::config::Credentials;
+use aws_sdk_s3::config::{Credentials, ProvideCredentials};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream as S3ByteStream;
 use bytes::Bytes;
@@ -69,30 +69,53 @@ pub struct S3Store {
 impl S3Store {
     /// Build a store from `walgit-config::StoreConfig`.
     ///
-    /// Credentials are read from the env vars named in
-    /// `cfg.s3.access_key_env` / `cfg.s3.secret_key_env`
-    /// (defaults `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), plus
-    /// `AWS_SESSION_TOKEN` when present.
-    pub fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self> {
-        let access_key = std::env::var(&cfg.s3.access_key_env).map_err(|_| {
-            anyhow::anyhow!("s3: env var {} not set (access key)", cfg.s3.access_key_env)
-        })?;
-        let secret_key = std::env::var(&cfg.s3.secret_key_env).map_err(|_| {
-            anyhow::anyhow!("s3: env var {} not set (secret key)", cfg.s3.secret_key_env)
-        })?;
-
-        let creds = static_credentials(
-            &access_key,
-            &secret_key,
-            std::env::var("AWS_SESSION_TOKEN").ok(),
-        );
+    /// The env vars named in `cfg.s3.access_key_env` / `cfg.s3.secret_key_env`
+    /// (defaults `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) override, plus
+    /// `AWS_SESSION_TOKEN` when present. When both key variables are unset,
+    /// the AWS default chain resolves and refreshes credentials (including
+    /// projected service-account tokens / IRSA). A partial or empty explicit
+    /// key pair is an error, not a fallback to another identity.
+    pub async fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self> {
         let region = aws_sdk_s3::config::Region::new(cfg.s3.region.clone());
 
         let mut s3_config = aws_sdk_s3::Config::builder()
-            .region(region)
-            .credentials_provider(creds)
+            .region(region.clone())
             .force_path_style(cfg.s3.force_path_style)
             .behavior_version_latest();
+
+        s3_config = match (
+            std::env::var(&cfg.s3.access_key_env),
+            std::env::var(&cfg.s3.secret_key_env),
+        ) {
+            (Ok(access_key), Ok(secret_key))
+                if !access_key.is_empty() && !secret_key.is_empty() =>
+            {
+                s3_config.credentials_provider(static_credentials(
+                    &access_key,
+                    &secret_key,
+                    std::env::var("AWS_SESSION_TOKEN").ok(),
+                ))
+            }
+            (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => {
+                let chain =
+                    aws_config::default_provider::credentials::DefaultCredentialsChain::builder()
+                        .region(region)
+                        .build()
+                        .await;
+                // Resolve once now, so a host with no AWS identity fails at startup
+                // with the chain's own reason rather than on the first request,
+                // after the profile and IMDS lookups have timed out.
+                chain.provide_credentials().await.map_err(|e| {
+                    anyhow::anyhow!("s3: the AWS default credential chain resolved nothing: {e}")
+                })?;
+                s3_config.credentials_provider(chain)
+            }
+            _ => anyhow::bail!(
+                "set both {} and {} to non-empty credentials, or leave both unset for the AWS default credential chain",
+                cfg.s3.access_key_env,
+                cfg.s3.secret_key_env,
+            ),
+        };
 
         if !cfg.s3.endpoint.is_empty() {
             s3_config = s3_config.endpoint_url(&cfg.s3.endpoint);

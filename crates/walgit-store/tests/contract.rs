@@ -708,7 +708,9 @@ async fn s3_contract() {
         ..Default::default()
     };
 
-    let store = walgit_store::s3::S3Store::new(&cfg).expect("S3Store::new");
+    let store = walgit_store::s3::S3Store::new(&cfg)
+        .await
+        .expect("S3Store::new");
     let store: DynStore = Arc::new(store);
 
     run_contract(store.clone(), &prefix).await;

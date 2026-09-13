@@ -636,7 +636,7 @@ pub async fn open_store(cfg: &walgit_config::Config) -> anyhow::Result<DynStore>
         walgit_config::StoreBackend::S3 => {
             #[cfg(feature = "s3")]
             {
-                Arc::new(s3::S3Store::new(&cfg.store)?)
+                Arc::new(s3::S3Store::new(&cfg.store).await?)
             }
             #[cfg(not(feature = "s3"))]
             {
