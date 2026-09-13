@@ -21,12 +21,13 @@ use anyhow::{Context, Result, bail};
 use tracing::info;
 use walgit_proto::prost::Message;
 
+use crate::open_store;
 use walgit_config::Config;
 use walgit_proto::keys;
 use walgit_proto::v1::{Checkpoint, CheckpointRef, Manifest, PackRef, Ref, RefSnapshot};
 use walgit_proto::{WAL_FORMAT_VERSION, time};
 use walgit_store::{
-    ObjectStore, ObjectStoreExt, Prefixed, PutBody, PutMode, PutOptions, StoreError, open_store,
+    ObjectStore, ObjectStoreExt, Prefixed, PutBody, PutMode, PutOptions, StoreError,
 };
 
 use crate::cli::parse_repo_id;

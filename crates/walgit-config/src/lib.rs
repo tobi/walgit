@@ -229,6 +229,8 @@ pub struct StaticToken {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct StoreConfig {
+    /// Optional trusted shared-library decorator, applied to every CLI store.
+    pub plugin: Option<StorePluginConfig>,
     pub backend: StoreBackend,
     pub bucket: String,
     /// Global key prefix inside the bucket (no leading slash; trailing slash added).
@@ -239,6 +241,20 @@ pub struct StoreConfig {
     /// Objects larger than this use resumable/multipart upload.
     pub multipart_threshold: ByteSize,
     pub multipart_part_size: ByteSize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorePluginConfig {
+    /// Absolute path to an operator-installed cdylib. Never supplied by a client.
+    pub library: PathBuf,
+    /// Plugin-owned configuration; walgit only transports this JSON value.
+    #[serde(default = "empty_plugin_options")]
+    pub options: serde_json::Value,
+}
+
+fn empty_plugin_options() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -837,6 +853,7 @@ impl Default for AuthConfig {
 impl Default for StoreConfig {
     fn default() -> Self {
         StoreConfig {
+            plugin: None,
             backend: StoreBackend::Gcs,
             bucket: "walgit".into(),
             prefix: String::new(),

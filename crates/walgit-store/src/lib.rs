@@ -629,6 +629,8 @@ impl ObjectStore for Prefixed {
 }
 
 /// Open a store backend by config, wrapped in the global key prefix.
+// Keep the same async API when an external plugin needs only the memory backend.
+#[cfg_attr(not(any(feature = "s3", feature = "gcs")), allow(clippy::unused_async))]
 pub async fn open_store(cfg: &walgit_config::Config) -> anyhow::Result<DynStore> {
     let prefix = cfg.store_prefix();
     let inner: DynStore = match cfg.store.backend {

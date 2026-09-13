@@ -31,6 +31,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `docs/POLICY.md` | Anyone touching receive-pack authorization or writing a repo policy. Normative rule language. |
 | `docs/LFS.md` | Anyone touching LFS (`lfs.rs`, `lfs_upstream.rs`) or importing a repository whose LFS history lives elsewhere. |
 | `docs/INTEGRITY.md` | Anyone touching import, the maintainer's `fsck`/`repair` units, or seeing `connectivity: missing object` on a push. |
+| `docs/STORAGE_PLUGINS.md` | Anyone writing or operating an external store decorator (`[store.plugin]`), or changing `walgit-store-plugin`. The boundary, decorator obligations and compatibility contract. |
 | `docs/EVENTS.md` | Anyone changing WAL-derived ref events, the webhook bridge, consumer semantics or event cursors. |
 | `docs/CONTRACT.md` | When you touch a crate boundary. The cross-crate contract; *extend, don't rename*; code wins where they differ. |
 | `docs/reference/cursor-git-at-any-scale.md` | The source design, verbatim. Read once before touching WAL/publish/sync/placement. |
@@ -457,6 +458,11 @@ Unrelated constraints remain in force. The current design target and migration g
 
 Decision identifiers are stable; gaps in the numbering are intentional.
 
+- **D42 (2026-09-09)** Optional storage plugins use a checked `abi_stable` boundary and
+  decorate the one CLI store constructor. Core contains no encryption/provider
+  policy; the example is pass-through. All storage roles share the decorator,
+  failures are fatal, and bucket mounts cannot bypass it. See
+  `docs/STORAGE_PLUGINS.md` for the lifetime and compatibility contract.
 - **D47 (2026-09-12): Publication evidence and receipts are exact.** A no-op ref submission with no
   new pack reports success at seq 0 without creating history; an empty-ref pack-only push rejects. A
   rejected submission reports rejection for every command. Each immutable log claim carries a fresh

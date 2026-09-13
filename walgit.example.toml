@@ -64,6 +64,10 @@ anonymous_read = true             # must be false in oidc mode
 # trusted_forwarders = []                  # principals allowed to set X-Walgit-Principal (a front in front of a push broker)
 
 [store]
+# Optional trusted ObjectStore decorator, loaded by every storage-using command.
+# [store.plugin]
+# library = "/usr/local/lib/walgit/libwalgit_store_passthrough.so"
+# options = {} # plugin-owned options; never put plaintext credentials here
 backend = "s3"                    # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "memory" (tests)
 bucket = "walgit"
 prefix = ""                       # global key prefix inside the bucket

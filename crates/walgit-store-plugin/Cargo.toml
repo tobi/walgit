@@ -1,0 +1,23 @@
+[package]
+name = "walgit-store-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The host owns the backend SDKs. A decorator needs only the store contract.
+walgit-store = { path = "../walgit-store", default-features = false }
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+abi_stable = { version = "0.11.3", default-features = false }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

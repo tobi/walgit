@@ -20,6 +20,7 @@ path = "src/bin/walgit-server.rs"
 [dependencies]
 walgit-proto.workspace = true
 walgit-store.workspace = true
+walgit-store-plugin.workspace = true
 walgit-config.workspace = true
 walgit-git.workspace = true
 walgit-wal.workspace = true

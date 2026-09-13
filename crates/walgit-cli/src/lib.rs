@@ -42,6 +42,29 @@ mod repo;
 mod serve;
 mod wal_cmd;
 
+/// The single store construction path for commands and their background roles.
+/// Decorators see logical keys; `open_store` applies the global prefix underneath.
+async fn open_store(cfg: &walgit_config::Config) -> Result<walgit_store::DynStore> {
+    if let Some(plugin) = &cfg.store.plugin {
+        anyhow::ensure!(
+            plugin.library.is_absolute(),
+            "store.plugin.library must be absolute"
+        );
+        // A bucket mount bypasses ObjectStore and therefore every decorator.
+        anyhow::ensure!(
+            cfg.cache.store_mount.is_none(),
+            "storage plugins cannot use cache.store_mount"
+        );
+    }
+    let store = walgit_store::open_store(cfg).await?;
+    match &cfg.store.plugin {
+        Some(plugin) => {
+            walgit_store_plugin::load(&plugin.library, plugin.options.clone(), store).await
+        }
+        None => Ok(store),
+    }
+}
+
 use std::path::PathBuf;
 
 use anyhow::Result;

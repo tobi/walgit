@@ -10,9 +10,9 @@ use anyhow::Result;
 use tokio::signal;
 use tracing::{info, warn};
 
+use crate::open_store;
 use walgit_config::{Config, Role};
 use walgit_server::{AppState, serve};
-use walgit_store::open_store;
 
 pub async fn run(cfg: &Arc<Config>) -> Result<()> {
     info!(backend = ?cfg.store.backend, "opening store");

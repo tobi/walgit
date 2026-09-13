@@ -95,6 +95,18 @@ test:
     {{t5}} cargo test --workspace --lib --bins
     {{t10}} cargo test -p walgit-store -p walgit-git -p walgit-wal --tests
     {{t10}} cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test packfile_uri --test forward --test maintain --test routing_prefix --test lfs_upstream --test drain --test events --test follow --test policy
+    just test-plugin
+
+# Exercise the actual native boundary, including stream and store destruction.
+test-plugin:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{t10}} cargo build -p walgit-store-passthrough --lib --example incompatible
+    target="${CARGO_TARGET_DIR:-target}"
+    case "$(uname -s)" in Darwin) extension=dylib ;; *) extension=so ;; esac
+    WALGIT_TEST_PLUGIN="$(cd "$target/debug" && pwd)/libwalgit_store_passthrough.$extension" \
+    WALGIT_TEST_INCOMPATIBLE="$(cd "$target/debug" && pwd)/examples/libincompatible.$extension" \
+      {{t10}} cargo test -p walgit-store-plugin --test plugin -- --include-ignored --skip passthrough_overhead
 
 # Smart-HTTP end-to-end against real git (≈ 20 s) — run when touching smart.rs/receive/upload-pack/wal.
 e2e *ARGS:

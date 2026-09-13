@@ -3,6 +3,8 @@ resolver = "3"
 members = [
     "crates/walgit-proto",
     "crates/walgit-store",
+    "crates/walgit-store-plugin",
+    "examples/store-passthrough",
     "crates/walgit-config",
     "crates/walgit-git",
     "crates/walgit-wal",
@@ -62,6 +64,7 @@ too_many_lines = "allow"
 [workspace.dependencies]
 walgit-proto = { path = "crates/walgit-proto" }
 walgit-store = { path = "crates/walgit-store" }
+walgit-store-plugin = { path = "crates/walgit-store-plugin" }
 walgit-config = { path = "crates/walgit-config" }
 walgit-git = { path = "crates/walgit-git" }
 walgit-wal = { path = "crates/walgit-wal" }

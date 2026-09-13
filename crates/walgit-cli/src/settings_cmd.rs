@@ -1,9 +1,9 @@
 //! `walgit settings show|set|clear|history <repo>` — D24 per-repo settings.
 use std::sync::Arc;
 
+use crate::open_store;
 use anyhow::{Context, Result};
 use walgit_config::Config;
-use walgit_store::open_store;
 use walgit_wal::Registry;
 
 use crate::SettingsAction;

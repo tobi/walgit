@@ -1,0 +1,23 @@
+[package]
+name = "walgit-store-passthrough"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[[example]]
+name = "incompatible"
+crate-type = ["cdylib"]
+
+[dependencies]
+abi_stable = { version = "0.11.3", default-features = false }
+walgit-store-plugin.workspace = true
+walgit-store = { path = "../../crates/walgit-store", default-features = false }
+anyhow.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

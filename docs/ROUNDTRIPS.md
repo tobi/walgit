@@ -54,6 +54,7 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 | Lost CAS response resolution | fresh manifest GET; only if the exact segment descriptor is listed, GET and compare the claimed log bytes | normally +1 GET on this failure path compared with key/sequence-only resolution; no added successful-push requests. Missing/folded evidence remains unknown. Per-attempt nonce and actual frame sizes are computed locally. | `publish.rs::cas_landed` |
 | Settings publish (D24) | refs sync (conditional GET) → log slot PUT → manifest CAS; readers pay nothing extra (settings ride inline on the manifest) | 3 rounds; read: 0 | `publish.rs::publish_settings_impl` |
 | Lease acquire | 1 GET → 1 CAS put (or 1 Create when absent) | 2 | `coord.rs::try_acquire` |
+| Store plugin decorator (`[store.plugin]`) | none: the decorator is in-process, so every budget above is unchanged | +0 | `walgit-store-plugin/src/bridge.rs` |
 | Publish, local commit (2026-08-23) | unchanged in round trips: after the manifest CAS the ref txns are applied to the local copy **before** the new manifest version is advertised, both under `sync_mutex` (the refs phase of every sync); the reverse order let a reader cache the old refs under the new version, and without the lock a concurrent sync replayed the same entry (two `update-ref`, a lock collision). A landed CAS is answered `ok` whatever the local apply does — the next sync replays (one conditional GET that then returns 200, no extra write). | 0 extra | `publish.rs::process_batch` |
 | Repository listing (`/api/v1/owners*`, `/services/api/owners*`, maintainer/bridge passes) | 0 within `LIST_TTL` (30 s, per instance); else delimited `repos/` → (delimited `repos/<o>/` ∥ owners) → (HEAD `manifest.pb` ∥ repos): 3 rounds | 1 + owners + repos | `registry.rs::list` |
 | Bundle removal (2026-09-11) | v2 capabilities and narrated fetch: removed optional list GET (1 → 0 extra); maintenance no longer reads/CASes a bundle list; direct import no longer composes a wrapper or reads/CASes a bundle list | no new store requests; checkpoint and push budgets unchanged | `smart.rs`, `maintain.rs`, `import_direct.rs` |
@@ -69,6 +70,15 @@ only after Create/CAS failure, so the measured happy-path counts remain unchange
 Keep this table current; when you change a protocol, update the row and put the before/after depth in the
 commit message. The sim harness can enforce it: `FaultStore::stats().ops` counts exact store requests per
 link, so a scenario can assert "a push on a healthy link is ≤ N requests" as a regression test.
+
+A plugin adds no object-store round trips, but it is not free and its cost does not
+appear in this table. Each operation crosses the library boundary as one metadata frame
+plus one frame per `MAX_FRAME` of body, and each frame is a `spawn_blocking` hop — on the
+same pool the control plane uses, so a large clone and a `head` contend (see §4). A
+decorator that talks to anything itself (a KMS, a sealing service) adds round trips this
+table cannot predict: that budget belongs to the plugin and its author must count it the
+same way. Measure a decorator against `just test-plugin` and the `passthrough_overhead`
+probe before deploying it.
 
 ## 3. Rules of thumb
 - **Depth before count.** Two PUTs in parallel cost one round trip; the same two in sequence cost two.

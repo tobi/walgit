@@ -5,9 +5,9 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use tracing::info;
 
+use crate::open_store;
 use walgit_config::Config;
 use walgit_git::ObjectFormat;
-use walgit_store::open_store;
 use walgit_wal::Registry;
 
 use crate::cli::{parse_repo_id, println_kv};

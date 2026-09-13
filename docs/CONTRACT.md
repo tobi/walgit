@@ -234,6 +234,12 @@ pub async fn serve(state: Arc<AppState>, shutdown: impl Future<Output=()> + Send
 ```
 
 ## walgit-cli (owner: Cli)
+
+Optional `[store.plugin]` loads a versioned external ObjectStore decorator for
+every storage-using CLI command. See [STORAGE_PLUGINS.md](STORAGE_PLUGINS.md) for
+the checked Rust ABI, prefix ordering, ownership, failure and compatibility contract.
+`ObjectStore` and existing entry points are unchanged; only deployment-selected
+shared libraries are loaded. The upstream example is pass-through.
 `walgit --config walgit.toml <cmd>`: `serve` | `compact [owner/name|--all] [--once]` |
 `repo create|list|info` | `wal ls|show|materialize --at-seq` | `synth --out DIR --size s|m|l [--commits N --files M]`
 | `import --from GITDIR owner/name` | `config check|dump`. Also `Containerfile`, `compose.yaml` (rustfs +
