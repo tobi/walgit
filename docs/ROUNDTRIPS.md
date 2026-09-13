@@ -109,3 +109,19 @@ link, so a scenario can assert "a push on a healthy link is ≤ N requests" as a
 - What moved to the failure path, and how often that path runs (measured or reasoned).
 - Which CAS'd object's write rate changes.
 - Sim scenario(s) covering the new failure mode; `Stats::ops` budget assertion if the hot path changed.
+
+### Conditional storage operations (2026-09-13)
+
+S3 conditional DELETE is one conditional DELETE (formerly HEAD → unconditional DELETE,
+2 requests/depth). A 412 may add one failure-only HEAD to distinguish an absent key on compatible services; successful deletes never probe.
+S3 compose removes its destination existence HEAD; source HEADs/staging are unchanged and
+create/update preconditions apply at the final multipart commit. Large conditional PUTs
+now use bounded multipart staging plus conditional completion instead of a single PUT.
+There is no unconditional retry when a provider refuses the conditional operation.
+GCS invalid update tokens fail locally with zero requests, rather than dropping the
+condition. These preserve C3/C7/B5 at the actual storage commit point.
+
+AWS documents the native conditions for [DELETE](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html)
+and [multipart completion](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html).
+The SDK-transport tests assert headers, stale-token rejection, surviving rival data and
+multipart aborts. Model/negative controls and witnesses: `StoreConditions`.

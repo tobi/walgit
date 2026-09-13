@@ -120,3 +120,17 @@ The [source range](https://github.com/tlaplus/tlaplus/compare/b123b22...867aefb)
 changes and empty-set equality, enumeration and fingerprint corrections; it is not a semantics-neutral
 update. Historical state counts are not reused as new evidence. The runner does not substitute another
 checker, especially one without equivalent result, liveness and input semantics.
+
+### Conditional backend operations
+
+C3/C7/B5 → S3 native conditional delete and multipart completion; GCS rejects invalid,
+zero and negative update generations instead of silently changing the operation.
+`StoreConditions` checks the mutation point with separate capture, probe/staging, rival
+write and commit actions. Its delete-window, staging-window and invalid-token mutations
+must each violate `MutationCondition`; separate witnesses reach rejected rivals and
+successful delete/create/update. Rust twins are
+`conditional_delete_preserves_rivals_and_only_probes_on_failure`,
+`staged_put_and_compose_conditions_hold_at_completion`, and
+`update_conditions_cannot_turn_into_create_or_overwrite`.
+The model uses distinct versions; content-token ABA remains in `LogSlotClaim`.
+It does not certify a compatible service's implementation of conditional headers.

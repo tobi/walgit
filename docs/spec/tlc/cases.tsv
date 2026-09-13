@@ -165,3 +165,11 @@ witness-temp-cancel-recovery TempReclaim TempReclaim_w_cancel - - - NoCancelReco
 witness-temp-full-occupancy TempReclaim TempReclaim_w_full - - - NoFullOccupancy
 witness-temp-lane-reclaim TempReclaim TempReclaim_w_lane - - - NoLaneReclaim
 witness-temp-sweep-past-peer TempReclaim TempReclaim_w_peer - - - NoSweepPastPeer
+store-conditions StoreConditions StoreConditions - none - pass
+bug-store-delete-window StoreConditions StoreConditions - delete - MutationCondition
+bug-store-staging-window StoreConditions StoreConditions - staging - MutationCondition
+bug-store-invalid-token StoreConditions StoreConditions - invalid - MutationCondition
+witness-store-rival-rejection StoreConditions StoreConditions - none - NoRejectedRace
+witness-store-delete StoreConditions StoreConditions - none - NoSuccessfulDelete
+witness-store-create StoreConditions StoreConditions - none - NoSuccessfulCreate
+witness-store-update StoreConditions StoreConditions - none - NoSuccessfulUpdate

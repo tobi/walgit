@@ -603,12 +603,15 @@ impl GcsStore {
     }
 
     async fn put_inner(&self, key: &str, body: PutBody, opts: PutOptions) -> Result<ObjectMeta> {
+        if let PutMode::Update(version) = &opts.mode {
+            update_generation(version)?;
+        }
         let result = match body {
             PutBody::Bytes(b) => {
                 let (client, _permit) = self.data_client(key, false).await;
                 let mut builder =
                     client.write_object(self.bucket_resource.clone(), key.to_owned(), b);
-                builder = apply_put_opts(builder, &opts);
+                builder = apply_put_opts(builder, &opts)?;
                 Box::pin(builder.send_unbuffered()).await
             }
             PutBody::File(path) => {
@@ -623,7 +626,7 @@ impl GcsStore {
                         key.to_owned(),
                         Bytes::from(bytes),
                     );
-                    builder = apply_put_opts(builder, &opts);
+                    builder = apply_put_opts(builder, &opts)?;
                     Box::pin(builder.send_unbuffered()).await
                 } else {
                     let stream = crate::util::file_stream(path, None, FILE_CHUNK_SIZE);
@@ -633,7 +636,7 @@ impl GcsStore {
                     let (client, _permit) = self.data_client(key, false).await;
                     let mut builder =
                         client.write_object(self.bucket_resource.clone(), key.to_owned(), source);
-                    builder = apply_put_opts(builder, &opts);
+                    builder = apply_put_opts(builder, &opts)?;
                     Box::pin(builder.send_buffered()).await
                 }
             }
@@ -644,7 +647,7 @@ impl GcsStore {
                 let (client, _permit) = self.data_client(key, false).await;
                 let mut builder =
                     client.write_object(self.bucket_resource.clone(), key.to_owned(), bytes);
-                builder = apply_put_opts(builder, &opts);
+                builder = apply_put_opts(builder, &opts)?;
                 Box::pin(builder.send_unbuffered()).await
             }
             PutBody::Stream { stream, .. } => {
@@ -654,7 +657,7 @@ impl GcsStore {
                 let (client, _permit) = self.data_client(key, false).await;
                 let mut builder =
                     client.write_object(self.bucket_resource.clone(), key.to_owned(), source);
-                builder = apply_put_opts(builder, &opts);
+                builder = apply_put_opts(builder, &opts)?;
                 Box::pin(builder.send_buffered()).await
             }
         };
@@ -1115,12 +1118,19 @@ impl StreamingSource for StoreStreamSource {
     }
 }
 
+/// A conditional update must name an existing generation. Zero means create in
+/// GCS, so accepting it here would silently change the operation's contract.
+fn update_generation(version: &Version) -> Result<i64> {
+    parse_generation(version).filter(|g| *g > 0).ok_or_else(|| {
+        StoreError::InvalidArgument("GCS update requires a positive generation token".into())
+    })
+}
+
 /// Apply put-mode preconditions and metadata to a `WriteObject` builder.
-/// Builder methods consume `self` and return `Self`, so we chain them.
 fn apply_put_opts<T, S>(
     mut builder: google_cloud_storage::builder::storage::WriteObject<T, S>,
     opts: &PutOptions,
-) -> google_cloud_storage::builder::storage::WriteObject<T, S>
+) -> Result<google_cloud_storage::builder::storage::WriteObject<T, S>>
 where
     S: google_cloud_storage::stub::Storage + 'static,
 {
@@ -1130,9 +1140,7 @@ where
             builder = builder.set_if_generation_match(0_i64);
         }
         PutMode::Update(v) => {
-            if let Some(generation) = parse_generation(v) {
-                builder = builder.set_if_generation_match(generation);
-            }
+            builder = builder.set_if_generation_match(update_generation(v)?);
         }
     }
 
@@ -1144,7 +1152,7 @@ where
         builder = builder.set_cache_control(IMMUTABLE_CACHE_CONTROL);
     }
 
-    builder
+    Ok(builder)
 }
 
 // ---- error mapping ----
@@ -1244,6 +1252,17 @@ mod tests {
     fn parse_generation_invalid() {
         let v = Version::new("not-a-number");
         assert_eq!(parse_generation(&v), None);
+    }
+
+    #[test]
+    fn update_conditions_cannot_turn_into_create_or_overwrite() {
+        for token in ["", "invalid", "0", "-1", "9223372036854775808"] {
+            assert!(matches!(
+                update_generation(&Version::new(token)),
+                Err(StoreError::InvalidArgument(_))
+            ));
+        }
+        assert_eq!(update_generation(&Version::new("42")).unwrap(), 42);
     }
 
     #[test]
