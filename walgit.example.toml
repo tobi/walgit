@@ -74,8 +74,10 @@ multipart_part_size = "32MiB"
 [store.s3]
 endpoint = "https://s3.us-east-1.amazonaws.com"   # or http://127.0.0.1:9000 for rustfs/MinIO
 region = "us-east-1"
-access_key_env = "AWS_ACCESS_KEY_ID"     # env var names read at runtime; AWS_SESSION_TOKEN is also honored when set
+access_key_env = "AWS_ACCESS_KEY_ID"     # explicit pair overrides the default chain; AWS_SESSION_TOKEN is also honored
 secret_key_env = "AWS_SECRET_ACCESS_KEY"
+# Leave both key variables unset for AWS profiles, web identity / IRSA, container or instance roles.
+# Credentials from the default chain refresh automatically. An incomplete or empty explicit pair is an error.
 force_path_style = false          # true for most self-hosted S3 implementations
 
 [store.gcs]
