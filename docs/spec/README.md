@@ -134,3 +134,15 @@ successful delete/create/update. Rust twins are
 `update_conditions_cannot_turn_into_create_or_overwrite`.
 The model uses distinct versions; content-token ABA remains in `LogSlotClaim`.
 It does not certify a compatible service's implementation of conditional headers.
+
+C3/C5/C7 → Azure attempt-unique block names, complete-input checks and conditional
+block-list commit. `StagedPublication` explores two concurrent two-part creates;
+shared-name and early-commit mutations violate `WholeAttempt`, while unconditional
+completion violates `OneCreateWinner`. Witnesses reach overlapping staging, a
+loser's rejected commit and either writer winning. Rust twins:
+`competing_staged_creates_cannot_mix_each_others_blocks`,
+`malformed_lengths_and_source_errors_never_commit`, and
+`copy_failure_does_not_commit_a_partial_destination`; S3's completion-condition
+regression and `multipart_length_mismatch_never_reaches_completion` also apply.
+This is a safety abstraction, not a claim about byte
+budgets, cancellation cleanup or eventual staging garbage collection.

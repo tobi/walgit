@@ -105,3 +105,28 @@ jobs:
         with:
           name: spec-evidence
           path: target/test-logs/spec-*
+
+  azure:
+    name: Azure storage + Git smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install the pinned Rust toolchain
+        run: rustup show && cargo --version && git --version
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install emulator fixture SDK
+        run: python -m pip install uv==0.9.30
+      - name: Lint all Azure-enabled storage targets
+        run: cargo clippy --locked -p walgit-store --features azure --all-targets -- -D warnings
+      - name: Validate storage and real Git against isolated Azurite
+        run: just test-azure
+      - name: Verify Azure-only feature build
+        run: cargo check --locked -p walgit-store --no-default-features --features azure --lib

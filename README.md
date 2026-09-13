@@ -82,7 +82,7 @@ Read the [design](docs/PACKFILE_URI_DESIGN.md) and
 | **events** | A small bridge tails the WAL and POSTs ref events to a webhook, exactly-once per (repo, seq, ref) with a durable cursor. `docs/EVENTS.md`. |
 | **maintenance** | Checkpoints, geometric compaction, connectivity audits and repairs — one loop that computes the desired state from (config, WAL) every pass and does one bounded unit of the most important missing work. Manual `compact --base` rebuilds the base on a host with sufficient disk. |
 | **auth** | `none` (loopback), `token` (static tokens), `oidc` (any OpenID Connect issuer: browser sign-in, ID tokens, and walgit-issued access tokens for git). `/services/public/install.sh` sets a developer's machine up in one idempotent command. |
-| **stores** | S3 and S3-compatible (AWS, MinIO, rustfs, R2, Ceph, …) and GCS, first class; an in-memory store for tests. |
+| **stores** | S3 and S3-compatible (AWS, MinIO, rustfs, R2, Ceph, …) and GCS, first class; Azure Blob Storage (Entra identity or SAS, user-delegation SAS signed URLs) with the opt-in `walgit-store/azure` build feature; an in-memory store for tests. |
 
 ## How it works, briefly
 
@@ -164,6 +164,7 @@ just clippy        # the [workspace.lints] set across all targets, warnings are 
 just ci            # warnings, clippy, test, e2e: everything that must be green before a merge
 cargo test -p walgit-server --test sim     # fault-injection simulation (crashes, partitions, stale reads)
 just test-s3       # store contract against local rustfs
+just test-azure    # isolated Azurite contract + Git push/clone/pull/cold restart (Docker or Podman + uv)
 ```
 
 Code map:
@@ -171,7 +172,7 @@ Code map:
 ```
 crates/
   walgit-proto    protobuf schema (wal.proto), log framing, store keys
-  walgit-store    ObjectStore trait (CAS versions, conditional GET, range, compose); backends s3, gcs, memory; leases
+  walgit-store    ObjectStore trait (CAS versions, conditional GET, range, compose); backends s3, gcs, azure (opt-in), memory; leases
   walgit-git      bare repos on disk, receive-pack, pack ingest, refs ↔ packed-refs, advertisements, upload-pack drivers
   walgit-wal      RepoHandle: sync levels, publish (group commit + CAS), checkpoints, log reader, remote reader, tasks
   walgit-server   axum: smart HTTP, LFS, auth (none/token/oidc), the maintainer loop, upstream follow,

@@ -235,6 +235,7 @@ pub struct StoreConfig {
     pub prefix: String,
     pub gcs: GcsConfig,
     pub s3: S3Config,
+    pub azure: AzureConfig,
     pub max_retries: u32,
     /// Objects larger than this use resumable/multipart upload.
     pub multipart_threshold: ByteSize,
@@ -247,6 +248,7 @@ pub enum StoreBackend {
     #[default]
     Gcs,
     S3,
+    Azure,
     /// Tests only.
     Memory,
 }
@@ -285,6 +287,38 @@ pub struct S3Config {
     pub access_key_env: String,
     pub secret_key_env: String,
     pub force_path_style: bool,
+}
+
+/// `store.bucket` names the container.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AzureConfig {
+    pub account: String,
+    /// Overrides the derived `https://{account}.blob.core.windows.net`.
+    pub endpoint: String,
+    /// Env var holding a SAS token, for emulators and environments without
+    /// Entra ID. Leave the variable unset to use the selected identity credential.
+    pub sas_token_env: String,
+    pub credential: AzureCredential,
+    /// Blocks staged in parallel for one multipart upload.
+    pub max_concurrent_blocks: usize,
+}
+
+/// Explicit identity selection avoids falling through to a different principal
+/// when a configured workload identity cannot authenticate.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AzureCredential {
+    /// Workload identity when `AZURE_FEDERATED_TOKEN_FILE` is set, managed identity otherwise.
+    #[default]
+    Auto,
+    WorkloadIdentity,
+    ManagedIdentity,
+    /// Opt-in local development using `az login`.
+    AzureCli,
+    /// A service principal from `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and
+    /// `AZURE_CLIENT_SECRET`, for hosts with no managed or workload identity.
+    ClientSecret,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -842,6 +876,7 @@ impl Default for StoreConfig {
             prefix: String::new(),
             gcs: GcsConfig::default(),
             s3: S3Config::default(),
+            azure: AzureConfig::default(),
             max_retries: 8,
             multipart_threshold: ByteSize::mib(64),
             multipart_part_size: ByteSize::mib(32),
@@ -856,6 +891,17 @@ impl Default for GcsConfig {
             signing_service_account: None,
             bulk_clients: 4,
             bulk_concurrency: 32,
+        }
+    }
+}
+impl Default for AzureConfig {
+    fn default() -> Self {
+        AzureConfig {
+            account: String::new(),
+            endpoint: String::new(),
+            sas_token_env: "AZURE_STORAGE_SAS_TOKEN".into(),
+            credential: AzureCredential::default(),
+            max_concurrent_blocks: 8,
         }
     }
 }

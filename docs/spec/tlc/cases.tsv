@@ -173,3 +173,10 @@ witness-store-rival-rejection StoreConditions StoreConditions - none - NoRejecte
 witness-store-delete StoreConditions StoreConditions - none - NoSuccessfulDelete
 witness-store-create StoreConditions StoreConditions - none - NoSuccessfulCreate
 witness-store-update StoreConditions StoreConditions - none - NoSuccessfulUpdate
+staged-publication StagedPublication StagedPublication - none - pass
+bug-staged-shared-names StagedPublication StagedPublication - shared-names - WholeAttempt
+bug-staged-early-commit StagedPublication StagedPublication - early-commit - WholeAttempt
+bug-staged-unconditional StagedPublication StagedPublication - unconditional - OneCreateWinner
+witness-staged-overlap StagedPublication StagedPublication - none - NoOverlapWinner
+witness-staged-loser StagedPublication StagedPublication - none - NoLoserRejection
+witness-staged-second-winner StagedPublication StagedPublication - none - NoSecondWriterWinner
