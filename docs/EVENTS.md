@@ -96,9 +96,14 @@ Wake-ups (both idempotent; they only ever call `catch_up`):
 - `POST /_events/notify` with a **bucket notification** naming a finalized `…/manifest.pb` — the commit point
   itself as the notification. Accepted bodies: a GCS Pub/Sub push envelope (`message.attributes.eventType =
   OBJECT_FINALIZE`, `objectId`), an S3 event notification (`Records[].eventName = ObjectCreated:*`,
-  `s3.object.key`; MinIO, rustfs and Ceph emit the same shape), or your own glue's `{"key": "repos/o/r/manifest.pb"}`
-  / `{"repo": "o/r"}`. Everything else is acked and ignored; a webhook failure answers 503 so the notifier
+  `s3.object.key`; MinIO, rustfs and Ceph emit the same shape), an Azure Event Grid
+  `Microsoft.Storage.BlobCreated` event in the EventGrid or CloudEvents schema, or your own glue's
+  `{"key": "repos/o/r/manifest.pb"}` / `{"repo": "o/r"}`. Everything else is acked and ignored; a webhook failure answers 503 so the notifier
   redelivers. Authenticated like every route (`require_read`): give the notifier a token.
+  Azure needs an Event Grid subscription on the container, and Event Grid handshakes before it will create
+  one: it posts a `SubscriptionValidationEvent`, which this route echoes back automatically. Authenticate the
+  subscription with Microsoft Entra ID so the delivery carries a bearer token; a query-string secret will not
+  satisfy `require_read`.
 - The sweep (`events.sweep_interval`, default 5 min): `list` + one conditional manifest GET per repo. Not needed
   for correctness; it is the backstop *and the health check* — a sweep that publishes anything means
   notifications are not flowing (`events_bridge_sweep_found_total`, warn). With no notifier at all, set the

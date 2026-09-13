@@ -150,6 +150,12 @@ test-slow:
 test-gcs bucket:
     WALGIT_TEST_GCS_BUCKET={{bucket}} cargo test -p walgit-store --features gcs --test contract -- gcs_contract --nocapture
 
+# Isolated Azure contract + Git push/clone/pull/cold-restart, no cloud credentials.
+# Requires Docker (or WALGIT_TEST_CONTAINER_RUNTIME=podman) and the fixture SDK:
+#   python3 -m pip install azure-storage-blob==12.30.1
+test-azure:
+    python3 tests/azure-store.py
+
 # Run walgit-store contract tests against memory only.
 store-test:
     cargo test -p walgit-store --test contract -- memory_contract

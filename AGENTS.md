@@ -271,7 +271,7 @@ Unrelated constraints remain in force. The current design target and migration g
   is a frozen snapshot (`frozen_pack_source`). Reproducer: `walgit-git/tests/upload_gix_scale.rs`.
 - **D3** `ObjectStore` trait with CAS version tokens, conditional GET, range, compose; gcs/s3/memory backends.
   `compose` is native on GCS and a multipart `UploadPartCopy` on S3 (`compose_is_native` tells callers which);
-  `accel_target` gives an edge a URL (+ bearer on GCS, presigned on S3) to fetch an object itself.
+  `accel_target` gives an edge a URL (+ bearer on GCS, presigned on S3, a read SAS on Azure) to fetch an object itself.
 - **D4** protobuf on the wire and in the bucket; schema versioned, append-only.
 - **D5** Repo identity `<owner>/<repo>[.git]`, prefix `repos/<o>/<r>/`, creation = CAS create of the manifest.
 - **D6** Manifest CAS is the only commit point. **D7** No node identity, no elections; leases for exclusivity.

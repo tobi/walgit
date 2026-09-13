@@ -161,6 +161,11 @@ async fn bridge_publishes_from_cursor_exactly_once() -> TestResult {
         serde_json::json!({"Records": [{"eventName": "ObjectCreated:Put", "s3": {"object": {"key": "repos/t/r/manifest.pb"}}}]}),
         serde_json::json!({"repo": "t/r"}),
         serde_json::json!({"key": "repos/t/r/manifest.pb"}),
+        // Azure Event Grid, in both of its schemas.
+        serde_json::json!([{"eventType": "Microsoft.Storage.BlobCreated",
+            "subject": "/blobServices/default/containers/walgit/blobs/repos/t/r/manifest.pb"}]),
+        serde_json::json!({"type": "Microsoft.Storage.BlobCreated",
+            "subject": "/blobServices/default/containers/walgit/blobs/repos/t/r/manifest.pb"}),
     ] {
         let resp = client
             .post(format!("{}/_events/notify", server.base_url))
@@ -259,5 +264,29 @@ async fn bridge_sink_failure_keeps_the_cursor() -> TestResult {
         .send()
         .await?;
     assert_eq!(resp.status(), 503, "non-2xx so Pub/Sub redelivers");
+    Ok(())
+}
+
+/// Event Grid will not create a subscription until its validation code comes
+/// back, and the handshake must not be mistaken for a commit point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_event_grid_handshake_is_answered_without_a_bridge_wake() -> TestResult {
+    let (url, captured) = webhook().await;
+    let server = Server::start_with_tweak(bridge_cfg(&url, Duration::ZERO)).await?;
+    let resp = reqwest::Client::new()
+        .post(format!("{}/_events/notify", server.base_url))
+        .json(&serde_json::json!([{
+            "eventType": "Microsoft.EventGrid.SubscriptionValidationEvent",
+            "data": {"validationCode": "512d38b6-c7b8"}
+        }]))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["validationResponse"], "512d38b6-c7b8");
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "a handshake is not a commit point"
+    );
     Ok(())
 }
