@@ -72,8 +72,47 @@ struct LfsError {
     message: String,
 }
 
+/// Operation labels for the LFS metrics below.
+const OP_BATCH: &str = "batch";
+const OP_GET: &str = "get";
+const OP_PUT: &str = "put";
+const OP_VERIFY: &str = "verify";
+
+/// Records one LFS request. `walgit_lfs_operation_seconds` is the handler's own
+/// latency: for `get` the body streams after the handler returns, so it is time
+/// to first byte, not transfer time. Divide `walgit_lfs_bytes_total` by wall
+/// time for throughput rather than by this histogram.
+fn record_lfs(op: &'static str, t0: std::time::Instant, result: &Result<Response, ApiError>) {
+    metrics::histogram!("walgit_lfs_operation_seconds", "op" => op)
+        .record(t0.elapsed().as_secs_f64());
+    let outcome = match result {
+        Ok(_) => "ok",
+        Err(ApiError::NotFound(_)) => "not_found",
+        Err(_) => "error",
+    };
+    metrics::counter!("walgit_lfs_requests_total", "op" => op, "result" => outcome).increment(1);
+}
+
+/// Bytes moved on the wire, plus the per-object size distribution.
+fn record_lfs_bytes(op: &'static str, bytes: u64) {
+    metrics::counter!("walgit_lfs_bytes_total", "op" => op).increment(bytes);
+    metrics::histogram!("walgit_lfs_object_bytes", "op" => op).record(bytes as f64);
+}
+
 /// `POST /{repo}/info/lfs/objects/batch`
 pub async fn batch(
+    st: &AppState,
+    route: &RepoRoute,
+    headers: &HeaderMap,
+    body_bytes: Bytes,
+) -> Result<Response, ApiError> {
+    let t0 = std::time::Instant::now();
+    let r = batch_inner(st, route, headers, body_bytes).await;
+    record_lfs(OP_BATCH, t0, &r);
+    r
+}
+
+async fn batch_inner(
     st: &AppState,
     route: &RepoRoute,
     headers: &HeaderMap,
@@ -214,6 +253,29 @@ pub async fn batch(
 /// immutable-object contract (strong `ETag`, 304, Range/If-Range, HEAD,
 /// Content-Length); see `static_object`. LFS objects are sha256-addressed.
 pub async fn get_object(
+    st: &AppState,
+    route: &RepoRoute,
+    method: &axum::http::Method,
+    headers: &HeaderMap,
+    query: &str,
+    peer: Option<std::net::SocketAddr>,
+) -> Result<Response, ApiError> {
+    let t0 = std::time::Instant::now();
+    let r = get_object_inner(st, route, method, headers, query, peer).await;
+    if let Ok(resp) = &r
+        && let Some(n) = resp
+            .headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+    {
+        record_lfs_bytes(OP_GET, n);
+    }
+    record_lfs(OP_GET, t0, &r);
+    r
+}
+
+async fn get_object_inner(
     st: &AppState,
     route: &RepoRoute,
     method: &axum::http::Method,
@@ -389,6 +451,18 @@ pub async fn put_object(
     headers: &HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
+    let t0 = std::time::Instant::now();
+    let r = put_object_inner(st, route, headers, body).await;
+    record_lfs(OP_PUT, t0, &r);
+    r
+}
+
+async fn put_object_inner(
+    st: &AppState,
+    route: &RepoRoute,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<Response, ApiError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use sha2::{Digest, Sha256};
@@ -438,6 +512,7 @@ pub async fn put_object(
     if hex::encode(hasher.finalize()) != oid {
         return Err(ApiError::BadRequest("lfs object sha256 mismatch".into()));
     }
+    record_lfs_bytes(OP_PUT, n);
     store
         .put(
             &key,
@@ -451,6 +526,18 @@ pub async fn put_object(
 
 /// `POST /{repo}/info/lfs/verify`
 pub async fn verify(
+    st: &AppState,
+    route: &RepoRoute,
+    headers: &HeaderMap,
+    body_bytes: Bytes,
+) -> Result<Response, ApiError> {
+    let t0 = std::time::Instant::now();
+    let r = verify_inner(st, route, headers, body_bytes).await;
+    record_lfs(OP_VERIFY, t0, &r);
+    r
+}
+
+async fn verify_inner(
     st: &AppState,
     route: &RepoRoute,
     headers: &HeaderMap,
