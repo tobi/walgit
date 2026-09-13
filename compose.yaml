@@ -12,8 +12,8 @@ services:
   rustfs:
     image: rustfs/rustfs:latest
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:${WALGIT_DEV_STORE_PORT:-9000}:9000"
+      - "127.0.0.1:${WALGIT_DEV_CONSOLE_PORT:-9001}:9001"
     environment:
       RUSTFS_ACCESS_KEY: walgit-dev
       RUSTFS_SECRET_KEY: walgit-dev-secret

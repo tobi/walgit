@@ -26,8 +26,10 @@ dev-local config="walgit.standalone.toml":
     #!/usr/bin/env bash
     set -euo pipefail
     export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-walgit-dev}" AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-walgit-dev-secret}"
-    if ! curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then
-        echo "rustfs not running on :9000 — starting it (just dev-store)"
+    local_endpoint="http://127.0.0.1:${WALGIT_DEV_STORE_PORT:-9000}"
+    export WALGIT__STORE__S3__ENDPOINT="${WALGIT__STORE__S3__ENDPOINT:-$local_endpoint}"
+    if [ "$WALGIT__STORE__S3__ENDPOINT" = "$local_endpoint" ] && ! curl --max-time 2 -sf "$local_endpoint/minio/health/live" >/dev/null 2>&1; then
+        echo "local store not healthy at $local_endpoint — starting it (just dev-store)"
         just dev-store
     fi
     # crates/walgit-server/build.rs:19 writes a placeholder index.html on any cargo build, so only
@@ -38,7 +40,7 @@ dev-local config="walgit.standalone.toml":
     fi
     cargo build --release --bin walgit-server
     port="${PORT:-8080}"
-    echo "→ https://walgit.localhost:${port}/  (PORT=${port}, config {{config}}, store rustfs :9000, cache /tmp/walgit)"
+    echo "→ https://walgit.localhost:${port}/  (PORT=${port}, config {{config}}, store $WALGIT__STORE__S3__ENDPOINT, cache /tmp/walgit)"
     exec ./target/release/walgit-server --config {{config}}
 
 # Start rustfs (S3-compatible) for local dev via podman compose (rootless, no daemon group needed;
@@ -50,6 +52,7 @@ dev-local config="walgit.standalone.toml":
 dev-store:
     #!/usr/bin/env bash
     set -euo pipefail
+    scripts/dev-store-preflight.sh
     # The rootless socket bootstrap is Linux-only: XDG_RUNTIME_DIR and /run/user do not exist on
     # macOS or the BSDs, and setsid is util-linux. There the socket lives in the podman machine VM.
     if [ "$(uname -s)" = Linux ]; then
@@ -72,7 +75,7 @@ dev-store:
     podman compose up -d rustfs
     echo "Waiting for rustfs to be healthy..."
     podman compose run --rm create-bucket
-    echo "rustfs is running on http://127.0.0.1:9000 (console :9001)"
+    echo "rustfs is running on http://127.0.0.1:${WALGIT_DEV_STORE_PORT:-9000} (console :${WALGIT_DEV_CONSOLE_PORT:-9001})"
     echo "Credentials: walgit-dev / walgit-dev-secret"
     echo "Bucket: walgit-test"
 
@@ -92,6 +95,7 @@ dev-store-stop:
 # Never run `cargo test --workspace --no-fail-fast` interactively: a single
 # hung test blocks for the whole timeout. Use `just e2e` / `just ci` below.
 test:
+    scripts/test-dev-store-preflight.sh
     {{t5}} cargo test --workspace --lib --bins
     {{t10}} cargo test -p walgit-store -p walgit-git -p walgit-wal --tests
     {{t10}} cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test packfile_uri --test forward --test maintain --test routing_prefix --test lfs_upstream --test drain --test events --test follow --test policy
@@ -159,10 +163,10 @@ store-test:
 test-s3: store-test-s3
 
 store-test-s3:
-    WALGIT_TEST_S3_ENDPOINT=http://127.0.0.1:9000 \
-    WALGIT_TEST_BUCKET=walgit-test \
-    AWS_ACCESS_KEY_ID=walgit-dev \
-    AWS_SECRET_ACCESS_KEY=walgit-dev-secret \
+    WALGIT_TEST_S3_ENDPOINT="${WALGIT_TEST_S3_ENDPOINT:-http://127.0.0.1:${WALGIT_DEV_STORE_PORT:-9000}}" \
+    WALGIT_TEST_BUCKET="${WALGIT_TEST_BUCKET:-walgit-test}" \
+    AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-walgit-dev}" \
+    AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-walgit-dev-secret}" \
     cargo test -p walgit-store --test contract -- --nocapture
 
 # Run all walgit-store tests (memory + S3 if env set).

@@ -156,6 +156,9 @@
             just
             git
             git-lfs
+            curl
+            lsof
+            jdk_headless
             coreutils
             jq
             ripgrep

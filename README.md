@@ -117,6 +117,8 @@ with its reasoning, the invariants, and the cost model (round trips to the bucke
 
 ## Running it
 
+See [developer setup](docs/DEV_SETUP.md) for tool versions, local store ports and validation commands.
+
 ```sh
 # build (needs rust per rust-toolchain.toml, protoc, node 24 + pnpm for the web UI)
 just web-build && cargo build --release -p walgit-cli
