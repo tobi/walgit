@@ -59,3 +59,19 @@ from a machine with disk and bandwidth: bare clone/fetch of the upstream, `git l
 - `lfs.serve_via = "signed_url"` hands out presigned store URLs (S3, or GCS with a signer); the default `proxy`
   streams through walgit or the edge.
 - Size accounting of LFS bytes per repository in the overview.
+
+## 5. Metrics
+
+`walgit_lfs_handler_seconds{op}` measures batch/get/put/verify handler completion;
+a GET body streams afterward. `walgit_lfs_requests_total{op,result}` records
+handler outcomes (including HTTP error responses). These do not measure stream
+completion, client cancellation or completed downloads; per-object batch errors
+still travel in a successful HTTP response.
+
+`walgit_lfs_response_bytes_offered_total` counts Content-Length for successful
+GET/Range responses prepared by walgit, excluding HEAD, 304, errors and edge
+offload. Interrupted clients may receive less: this is offered volume, not network
+throughput. `walgit_lfs_upload_bytes_validated_total` and
+`walgit_lfs_upload_object_bytes` count consumed, SHA-256-validated upload bodies,
+including ones whose subsequent store write fails. Direct store/edge transfers
+need their own byte instrumentation.
