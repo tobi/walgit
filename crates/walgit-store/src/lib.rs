@@ -643,6 +643,16 @@ pub async fn open_store(cfg: &walgit_config::Config) -> anyhow::Result<DynStore>
                 anyhow::bail!("s3 backend requires the `s3` feature")
             }
         }
+        walgit_config::StoreBackend::Oss => {
+            #[cfg(feature = "s3")]
+            {
+                Arc::new(s3::S3Store::new_oss(&cfg.store)?)
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                anyhow::bail!("oss backend requires the `s3` feature")
+            }
+        }
         walgit_config::StoreBackend::Gcs => {
             #[cfg(feature = "gcs")]
             {

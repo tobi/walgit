@@ -727,6 +727,66 @@ async fn s3_contract() {
     }
 }
 
+#[cfg(feature = "s3")]
+#[tokio::test]
+async fn oss_contract() {
+    let Ok(endpoint) = std::env::var("WALGIT_TEST_OSS_ENDPOINT") else {
+        eprintln!("skipping oss_contract: WALGIT_TEST_OSS_ENDPOINT not set");
+        return;
+    };
+    let bucket = std::env::var("WALGIT_TEST_BUCKET").expect("WALGIT_TEST_BUCKET required");
+    let _access_key =
+        std::env::var("AWS_ACCESS_KEY_ID").expect("AWS_ACCESS_KEY_ID required for OSS tests");
+    let _secret_key = std::env::var("AWS_SECRET_ACCESS_KEY")
+        .expect("AWS_SECRET_ACCESS_KEY required for OSS tests");
+    let prefix = format!("oss-contract-test-{}", uuid::Uuid::new_v4().simple());
+
+    let cfg = walgit_config::StoreConfig {
+        backend: walgit_config::StoreBackend::Oss,
+        bucket,
+        prefix: prefix.clone(),
+        s3: walgit_config::S3Config {
+            endpoint,
+            region: "cn-beijing".into(),
+            access_key_env: "AWS_ACCESS_KEY_ID".into(),
+            secret_key_env: "AWS_SECRET_ACCESS_KEY".into(),
+            force_path_style: false,
+        },
+        multipart_threshold: bytesize::ByteSize::mib(5),
+        multipart_part_size: bytesize::ByteSize::mib(5),
+        ..Default::default()
+    };
+
+    let store: DynStore =
+        Arc::new(walgit_store::s3::S3Store::new_oss(&cfg).expect("S3Store::new_oss"));
+
+    // File bodies exercise the AWS streaming encoder used for Git pack/index
+    // uploads. OSS rejects the SDK's optional trailing checksum encoding.
+    let file = tempfile::NamedTempFile::new().expect("temporary file");
+    std::fs::write(file.path(), b"file-body").expect("write temporary file");
+    store
+        .put(
+            &format!("{prefix}/file-body"),
+            PutBody::File(file.path().to_owned()),
+            PutMode::Create.into(),
+        )
+        .await
+        .expect("OSS file-body create");
+    run_contract(store.clone(), &prefix).await;
+
+    let to_delete: Vec<_> = futures::stream::iter(
+        walgit_store::ObjectStore::list(store.as_ref(), &prefix, None)
+            .collect::<Vec<_>>()
+            .await,
+    )
+    .filter_map(|result| async move { result.ok() })
+    .collect::<Vec<_>>()
+    .await;
+    for meta in to_delete {
+        let _ = store.delete(&meta.key, None).await;
+    }
+}
+
 #[cfg(feature = "gcs")]
 #[tokio::test]
 async fn gcs_contract() {
