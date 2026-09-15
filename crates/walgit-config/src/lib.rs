@@ -1002,13 +1002,9 @@ impl Config {
             if path.is_empty() || path.iter().any(std::string::String::is_empty) {
                 continue;
             }
-            let value: toml::Value = v
-                .parse::<toml::Value>()
-                .unwrap_or(toml::Value::String(v.clone()));
             // Apply into a copy and type-check it alone: a bad/unknown key is
             // dropped (WARN) instead of failing every other override with it.
-            let mut trial = doc.clone();
-            let bad = {
+            let apply = |value: toml::Value| {
                 fn set(
                     cur: &mut toml::Table,
                     path: &[String],
@@ -1028,22 +1024,32 @@ impl Config {
                         .ok_or_else(|| format!("{key} is not a table"))?;
                     set(next, rest, value)
                 }
-                match set(&mut trial, &path, value) {
-                    Err(why) => Some(why),
-                    Ok(()) => trial.clone().try_into::<Config>().err().map(|e| {
-                        e.to_string()
-                            .lines()
-                            .next()
-                            .unwrap_or("invalid")
-                            .to_string()
-                    }),
+                let mut trial = doc.clone();
+                set(&mut trial, &path, value)?;
+                match trial.clone().try_into::<Config>() {
+                    Ok(_) => Ok(trial),
+                    Err(e) => Err(e
+                        .to_string()
+                        .lines()
+                        .next()
+                        .unwrap_or("invalid")
+                        .to_string()),
                 }
             };
-            if let Some(why) = bad {
-                ignored.push((k, why));
-            } else {
-                doc = trial;
-                touched = true;
+            // The TOML reading first, then the text itself: a key that takes text keeps a
+            // value that only looks like a number or boolean (a numeric bucket name, the
+            // `0` a duration documents as "off").
+            let literal = toml::Value::String(v.clone());
+            let applied = match v.parse::<toml::Value>() {
+                Ok(value) => apply(value).or_else(|why| apply(literal).map_err(|_| why)),
+                Err(_) => apply(literal),
+            };
+            match applied {
+                Ok(trial) => {
+                    doc = trial;
+                    touched = true;
+                }
+                Err(why) => ignored.push((k, why)),
             }
         }
         // `[placement]` is a host fact set as a GROUP: any WALGIT__PLACEMENT__* override
@@ -1512,6 +1518,47 @@ mod tests {
             vec![("WALGIT__CACHE__NOT_A_KEY_YET".to_string(), "1".to_string())].into_iter(),
         )
         .unwrap();
+    }
+
+    /// A value that reads as a TOML number or boolean is still text to a key that takes
+    /// text: a numeric bucket name, or the `0` the duration keys document as "off".
+    #[test]
+    fn env_override_text_that_looks_like_a_toml_scalar_applies() {
+        let mut c = Config::default();
+        let ignored = c
+            .apply_env_report(
+                vec![
+                    ("WALGIT__STORE__BUCKET".to_string(), "20260915".to_string()),
+                    ("WALGIT__MAINTENANCE__HOST".to_string(), "true".to_string()),
+                    (
+                        "WALGIT__MAINTENANCE__FOLLOW_INTERVAL".to_string(),
+                        "0".to_string(),
+                    ),
+                    ("WALGIT__WAL__MAX_BATCH".to_string(), "7".to_string()),
+                ]
+                .into_iter(),
+            )
+            .unwrap();
+        assert!(ignored.is_empty(), "{ignored:?}");
+        assert_eq!(c.store.bucket, "20260915");
+        assert_eq!(c.maintenance.host.as_deref(), Some("true"));
+        assert_eq!(c.maintenance.follow_interval, Duration::ZERO);
+        assert_eq!(c.wal.max_batch, 7, "a TOML value still wins where it fits");
+        // A value that fits neither reading is still ignored, with the TOML reading's reason.
+        let ignored = c
+            .apply_env_report(
+                vec![
+                    ("WALGIT__SERVER__HTTP2".to_string(), "1".to_string()),
+                    ("WALGIT__STORE__BUCKET__NAME".to_string(), "b".to_string()),
+                ]
+                .into_iter(),
+            )
+            .unwrap();
+        assert_eq!(ignored.len(), 2, "{ignored:?}");
+        assert!(ignored[0].1.contains("integer"), "{:?}", ignored[0]);
+        assert!(ignored[1].1.contains("not a table"), "{:?}", ignored[1]);
+        assert!(c.server.http2);
+        assert_eq!(c.store.bucket, "20260915");
     }
 
     #[test]
