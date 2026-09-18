@@ -260,7 +260,7 @@ fn is_transient_code(code: &str) -> bool {
 /// HTTP statuses that mean the same, for services whose error codes we do not
 /// recognise (rustfs and other S3-compatible stores do not all use AWS codes).
 fn is_transient_status(status: u16) -> bool {
-    matches!(status, 429 | 500 | 502 | 503 | 504)
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
 }
 
 /// Whether an SDK failure is worth another attempt at walgit's layer.
@@ -1172,10 +1172,10 @@ mod tests {
 
     #[test]
     fn transient_statuses_are_recognised() {
-        for status in [429, 500, 502, 503, 504] {
+        for status in [408, 429, 500, 502, 503, 504] {
             assert!(is_transient_status(status), "{status} should be transient");
         }
-        for status in [400, 403, 404, 409, 412] {
+        for status in [400, 403, 404, 409, 412, 501] {
             assert!(!is_transient_status(status), "{status} should be permanent");
         }
     }

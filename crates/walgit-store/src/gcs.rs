@@ -1201,9 +1201,13 @@ fn is_retryable(e: &google_cloud_storage::Error) -> bool {
         );
     }
     if let Some(code) = e.http_status_code() {
-        return matches!(code, 503 | 504 | 429 | 500);
+        // The statuses GCS documents as retryable. The client's own policy
+        // retries all of 5xx; 501 is left out because an unimplemented
+        // request will not start working on a second try. Same set as
+        // `s3::is_transient_status`.
+        return matches!(code, 408 | 429 | 500 | 502 | 503 | 504);
     }
-    e.is_connect() || e.is_io() || e.is_transient_and_before_rpc()
+    e.is_connect() || e.is_io() || e.is_timeout() || e.is_transient_and_before_rpc()
 }
 
 fn map_error(key: &str, e: google_cloud_storage::Error) -> StoreError {
@@ -1381,6 +1385,32 @@ mod tests {
             http::HeaderMap::new(),
             bytes::Bytes::from_static(b"unavailable"),
         );
+        assert!(is_retryable(&e));
+    }
+
+    fn http_error(status: u16) -> google_cloud_storage::Error {
+        google_cloud_gax::error::Error::http(status, http::HeaderMap::new(), bytes::Bytes::new())
+    }
+
+    #[test]
+    fn transient_http_statuses_are_retryable() {
+        for status in [408, 429, 500, 502, 503, 504] {
+            assert!(
+                is_retryable(&http_error(status)),
+                "{status} should be retryable"
+            );
+        }
+        for status in [400, 403, 404, 409, 412, 501] {
+            assert!(
+                !is_retryable(&http_error(status)),
+                "{status} should be permanent"
+            );
+        }
+    }
+
+    #[test]
+    fn is_retryable_timeout() {
+        let e = google_cloud_gax::error::Error::timeout("attempt timed out");
         assert!(is_retryable(&e));
     }
 
