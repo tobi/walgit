@@ -65,8 +65,9 @@ repository whose packs will never fit on the instance (a **remote reader** over 
 commits and trees local while blobs stay in the bucket (the **history pack**).
 
 **Packfile migration:** bundle runtime has been removed. Native Git can deliver proven reusable packs plus
-the uncovered graph for anonymous-read repositories. Protected repositories and remote/gix serving use
-dynamic upload-pack; protected URI clients and large-repository performance remain release gates.
+the uncovered graph for anonymous-read repositories, and for protected ones when the client sends its
+credential up front and asks with `server-option=uri-auth=proactive` (the installer and clone recipes do
+both). Remote/gix serving uses dynamic upload-pack; large-repository performance remains a release gate.
 Read the [design](docs/PACKFILE_URI_DESIGN.md) and
 [migration guide](docs/PACKFILE_MIGRATION.md), especially saved settings and existing client catch-up config.
 
@@ -150,7 +151,8 @@ each repository one maintainer (placement globs) and you are done.
 Developer setup is one idempotent command — `sh -c "$(curl -fsSL 'https://git.example.com/services/public/install.sh')"` —
 which stores the token in a file only the user can read, installs a tiny git credential helper (git ≥ 2.46: it
 answers `get` with `authtype=Bearer`, and on a real 401 `erase`s the token and says where a new one comes from),
-and configures HTTPS URI negotiation. `?repo=owner/name` clones right after.
+and configures HTTPS URI negotiation, sending the token up front when the host needs one so URI downloads carry
+it too. `?repo=owner/name` clones right after.
 
 ### Developing
 

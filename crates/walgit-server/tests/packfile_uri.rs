@@ -283,10 +283,11 @@ async fn stock_git_downloads_static_baseline_and_native_residual_while_gix_stays
         &["push", "-q", &server.repo_url("o", "delivery"), "main"],
     )?;
     let tip = git_in(&source, &["rev-parse", "HEAD"])?;
-    for (engine, protected) in [
-        (walgit_config::UploadPackEngine::Git, false),
-        (walgit_config::UploadPackEngine::Gix, false),
-        (walgit_config::UploadPackEngine::Git, true),
+    for (engine, protected, proactive) in [
+        (walgit_config::UploadPackEngine::Git, false, false),
+        (walgit_config::UploadPackEngine::Gix, false, false),
+        (walgit_config::UploadPackEngine::Git, true, false),
+        (walgit_config::UploadPackEngine::Git, true, true),
     ] {
         let front = server
             .start_sibling_with(|cfg| {
@@ -305,32 +306,68 @@ async fn stock_git_downloads_static_baseline_and_native_residual_while_gix_stays
                 }
             })
             .await?;
-        let clone = tempfile::tempdir()?;
-        let mut command = std::process::Command::new("git");
-        if protected {
-            command.args(["-c", "http.extraHeader=Authorization: Bearer test-reader"]);
+        let clone_with = |git_args: &[&str], clone_args: &[&str]| {
+            let clone = tempfile::tempdir()?;
+            let output = std::process::Command::new("git")
+                .env("GIT_TRACE_PACKET", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(git_args)
+                .args([
+                    "-c",
+                    "protocol.version=2",
+                    "-c",
+                    "fetch.uriProtocols=http,https",
+                    "clone",
+                    "--progress",
+                ])
+                .args(clone_args)
+                .args([
+                    front.repo_url("o", "delivery").as_str(),
+                    clone.path().to_str().unwrap(),
+                ])
+                .output()?;
+            anyhow::Ok((clone, output))
+        };
+        // The installer's shape for a protected host: its helper answers `get` with a bearer
+        // and a username/password pair, `proactiveAuth` sends the pair with every request
+        // (URI downloads included), and the clone recipe asks for URIs.
+        let helper = "credential.helper=!f() { test \"$1\" = get || return 0; printf 'capability[]=authtype\\nauthtype=Bearer\\ncredential=test-reader\\nusername=token\\npassword=test-reader\\n'; }; f";
+        let proactive_auth = format!("http.{}/.proactiveAuth=auto", front.base_url);
+        let opt_in = ["-c", "remote.origin.serverOption=uri-auth=proactive"];
+        if proactive {
+            // Asking for URIs without proactive auth: git downloads them bare, gets the 401
+            // and has no fallback, which is why the server never infers the option.
+            let (_, bare) = clone_with(&["-c", "credential.helper=", "-c", helper], &opt_in)?;
+            let stderr = String::from_utf8_lossy(&bare.stderr);
+            assert!(!bare.status.success(), "{stderr}");
+            assert!(stderr.contains("returned error: 401"), "{stderr}");
         }
-        let result = command
-            .env("GIT_TRACE_PACKET", "1")
-            .args([
-                "-c",
-                "protocol.version=2",
-                "-c",
-                "fetch.uriProtocols=http,https",
-                "clone",
-                "--progress",
-                &front.repo_url("o", "delivery"),
-                clone.path().to_str().unwrap(),
-            ])
-            .output()?;
+        let (clone, result) = match (protected, proactive) {
+            (false, _) => clone_with(&[], &[])?,
+            (true, false) => clone_with(
+                &["-c", "http.extraHeader=Authorization: Bearer test-reader"],
+                &[],
+            )?,
+            (true, true) => clone_with(
+                &[
+                    "-c",
+                    "credential.helper=",
+                    "-c",
+                    helper,
+                    "-c",
+                    &proactive_auth,
+                ],
+                &opt_in,
+            )?,
+        };
         let trace = String::from_utf8_lossy(&result.stderr);
         assert!(result.status.success(), "{engine:?}: {trace}");
         assert_eq!(
             trace.contains("< \\1packfile-uris"),
-            engine == walgit_config::UploadPackEngine::Git && !protected,
+            engine == walgit_config::UploadPackEngine::Git && (!protected || proactive),
             "{trace}"
         );
-        if protected {
+        if protected && !proactive {
             assert!(trace.contains("WARNING: reusable pack delivery is unavailable"));
         }
         assert_eq!(git_in(clone.path(), &["rev-parse", "HEAD"])?, tip);

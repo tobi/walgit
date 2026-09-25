@@ -8,8 +8,9 @@ use walgit_git::packfile_uri::{PackfileUri, Selection};
 use walgit_proto::v1::{PackAudience, PackGroupCoverage, PackKind, RefSnapshot};
 use walgit_wal::{FetchView, RepoHandle};
 
-/// Called only after native-engine dispatch. Protected stock clients remain on
-/// dynamic transfer until an authenticated distributable client is qualified.
+/// Called only after native-engine dispatch. A protected repository reaches it only
+/// for a client that sent `server-option=uri-auth=proactive` (its URI downloads carry
+/// the same credential); every other protected client stays on dynamic transfer.
 pub async fn select(
     handle: &RepoHandle,
     request: &walgit_git::UploadPackRequest,

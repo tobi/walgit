@@ -267,6 +267,7 @@ async fn upload_pack_v2(
                 return Ok(r);
             }
             let req = parse_fetch_request(reader).await?;
+            let proactive = uri_auth_proactive(&cmd);
             // A want list far beyond any honest request is a blobless clone checking out HEAD without
             // `--sparse`/`--no-checkout` (git lazily asks for every blob of the tree in one fetch, with
             // `no-progress`, so nothing we narrate there is ever seen): refuse it with the fix before
@@ -291,7 +292,7 @@ async fn upload_pack_v2(
             // progress → stream immediately and say what we are doing while
             // the local copy syncs, then hand over to upload-pack.
             if req.sideband_all && !req.no_progress {
-                return Ok(narrated_fetch(st, route, headers, handle, req).await);
+                return Ok(narrated_fetch(st, route, headers, handle, req, proactive).await);
             }
             // Objects are needed from here on. Surface "too big for this
             // instance" as a pkt-line ERR git prints verbatim (with the fix),
@@ -311,7 +312,7 @@ async fn upload_pack_v2(
             // not be removed mid-clone.
             let handle = handle.clone();
             let engine = st.cfg.git.upload_pack_engine;
-            let uri_base = anonymous_uri_base(st, route, headers);
+            let uri_base = packfile_uri_base(st, route, headers, proactive);
             tokio::spawn(async move {
                 let guard = match handle.sync().await {
                     Ok(g) => g,
@@ -490,8 +491,25 @@ async fn warn_large_dynamic_clone<W: tokio::io::AsyncWrite + Unpin>(
     }
 }
 
-fn anonymous_uri_base(st: &AppState, route: &RepoRoute, headers: &HeaderMap) -> Option<String> {
-    (st.cfg.server.auth.mode == walgit_config::AuthMode::None || st.cfg.server.auth.anonymous_read)
+/// `server-option=uri-auth=proactive`: the client sends its credential with every request,
+/// packfile URI downloads included (git ≥ 2.46 with `http.<url>.proactiveAuth` and a helper
+/// that answers with a username and password), so a protected repository can hand it URIs
+/// too. Git does not fall back when a URI download fails, so this is never inferred.
+fn uri_auth_proactive(cmd: &walgit_git::pkt::V2Command) -> bool {
+    cmd.args
+        .iter()
+        .any(|arg| arg == "server-option=uri-auth=proactive")
+}
+
+fn packfile_uri_base(
+    st: &AppState,
+    route: &RepoRoute,
+    headers: &HeaderMap,
+    proactive: bool,
+) -> Option<String> {
+    (proactive
+        || st.cfg.server.auth.mode == walgit_config::AuthMode::None
+        || st.cfg.server.auth.anonymous_read)
         .then(|| format!("{}/{}", request_base_url(st, headers), route.id))
 }
 
@@ -563,6 +581,7 @@ async fn narrated_fetch(
     headers: &HeaderMap,
     handle: &Arc<walgit_wal::RepoHandle>,
     req: walgit_git::UploadPackRequest,
+    proactive: bool,
 ) -> Response {
     let (mut writer, body) = write_body_pipe(256 * 1024);
     let handle = handle.clone();
@@ -575,7 +594,7 @@ async fn narrated_fetch(
         .map_or_else(|| "anonymous".into(), |p| p.name);
     let cache_max = st.cfg.cache_budget_bytes();
     let engine = st.cfg.git.upload_pack_engine;
-    let uri_base = anonymous_uri_base(st, route, headers);
+    let uri_base = packfile_uri_base(st, route, headers, proactive);
     let max_wants = st.cfg.git.max_wants;
     tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;

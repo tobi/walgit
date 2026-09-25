@@ -12,8 +12,9 @@ The native v2 path can deliver ordinary packs to anonymous-read clients that neg
 packfile URIs. Exact current-policy certificates, live members and complete same-generation dependencies
 select a captured baseline; native Git sends the uncovered graph with thin-pack disabled. URI and optional
 index sections precede `packfile`, and synthetic-have ACKs are suppressed. Gix/remote engines stay dynamic.
-Protected clients stay dynamic until a distributable authenticated client is independently qualified;
-an index opt-in flag alone does not satisfy that release gate.
+A protected client gets the same delivery when it sends `server-option=uri-auth=proactive`, promising that
+every URI download carries its credential (§6, D50). Other protected clients stay dynamic; an index opt-in
+flag alone makes no such promise.
 
 `GET|HEAD /{owner}/{repo}[.git]/packfiles/{checksum}.pack` and `.idx` require ordinary read authorization
 and freshly revalidated live/retired manifest membership before conditional responses or byte offload.
@@ -191,7 +192,7 @@ substitute for that guard.
 
 ## 6. HTTP, clients and operational cost
 
-Advertised URLs use the normal repository origin and paths `/{owner}/{repo}.git/wal/<checksum>.pack` and
+Advertised URLs use the normal repository origin and paths `/{owner}/{repo}/packfiles/<checksum>.pack` and
 `.idx`. Authorize before cache admission or offload. Refresh refs once on unknown membership before refusal.
 Preserve GET/HEAD, strong ETag, conditional 304, Range/206/416 and If-Range behavior. Weak/mismatched If-Range
 validators fall back to full bytes. A trusted edge must authenticate even warm cached requests; protected pack
@@ -200,13 +201,16 @@ routes never become public to accommodate a client.
 | Client/access | Release contract |
 |---|---|
 | URI-capable client, intentionally anonymous reads | Standard packfile URI lane can accelerate once implemented/tested |
+| Stock git ≥ 2.46 with `http.<url>.proactiveAuth`, protected repository, `uri-auth=proactive` sent | Standard packfile URI lane; every download carries the fetch's credential; no refresh after a 401 inside a download |
 | Stock or unsignalled client, protected repository | Dynamic fallback; narrate large full-clone cost |
 | Independently verified compatible auth/index client | Protected URI acceleration only after distribution/licensing and client validation gates |
 | v0 or no matching URI protocol | Dynamic transfer |
 
 `fetch.uriProtocols=https` enables standard URI negotiation; it does not add authenticated download behavior
-to stock clients. Authenticated transfer, credential refresh after 401, concurrency and trusted-index install
-require separately verified client support. Do not advertise an unknown config key as a stock-client feature.
+to stock clients. `http.<url>.proactiveAuth` (git ≥ 2.46) does: git's URI download sends the helper's
+username and password up front (it ignores an `authtype`-only answer), and the protected case of
+`stock_git_downloads_static_baseline_and_native_residual_while_gix_stays_dynamic` clones that way. Credential
+refresh after 401, concurrency and trusted-index install require separately verified client support. Do not advertise an unknown config key as a stock-client feature.
 A trusted-index opt-in must verify pack/index checksums, structural bounds, embedded pack mapping and object
 count before atomic install, preserve keep/promisor semantics, and respect fsck restrictions. Missing indexes
 use ordinary index-pack. `.rev` transfer is outside this design's current implementation target.

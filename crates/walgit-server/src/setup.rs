@@ -48,6 +48,12 @@ fn needs_token(cfg: &Config) -> bool {
     cfg.server.auth.mode != AuthMode::None
 }
 
+/// Whether reads need one: packfile URI downloads then do too, so a clone asks for URIs with
+/// `server-option=uri-auth=proactive` (`smart::uri_auth_proactive`).
+fn protected_reads(cfg: &Config) -> bool {
+    needs_token(cfg) && !cfg.server.auth.anonymous_read
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Recipes {
     pub base_url: String,
@@ -119,8 +125,15 @@ pub fn recipes(cfg: &Config, base_url: &str, repo: Option<&str>) -> Recipes {
     } else {
         format!("git clone {url}")
     };
-    let plain_clone = format!("git clone {url}");
-    let blobless_clone = format!("git clone --filter=blob:none --sparse {url}");
+    // Recorded in the clone's config, so later fetches ask too. Git reads it from 2.48; an
+    // older git ignores it and fetches dynamically.
+    let opt_in = if protected_reads(cfg) {
+        " -c remote.origin.serverOption=uri-auth=proactive"
+    } else {
+        ""
+    };
+    let plain_clone = format!("git clone{opt_in} {url}");
+    let blobless_clone = format!("git clone{opt_in} --filter=blob:none --sparse {url}");
     let trust_text = match &trust {
         Some(_) => format!(
             "# {host} presents a self-signed certificate: the installer pins it for git; browsers accept it once.\n"
@@ -218,7 +231,8 @@ esac
 /// git ≥ 2.46 + curl → (self-signed: pin `/services/public/ca.pem`) → the credential helper → a token
 /// (`$WALGIT_TOKEN`, an already stored one, or asked for on the terminal; no terminal: exit 2 with the
 /// two things to do) → git config for the host (`credential.<host>.helper` = exactly ours,
-/// stale `extraHeader` removed)
+/// stale `extraHeader` removed, `fetch.uriProtocols https`, and with a token
+/// `http.<host>.proactiveAuth auto`)
 /// → self-test (`/api/v1/me`, or `git ls-remote` of `repo`) → with `repo`, `git clone`.
 pub fn install_script(cfg: &Config, base_url: &str, repo: Option<&str>) -> String {
     let r = recipes(cfg, base_url, repo);
@@ -277,6 +291,14 @@ pub fn install_script(cfg: &Config, base_url: &str, repo: Option<&str>) -> Strin
         )
     } else {
         "AUTH=\"X-Walgit-Anonymous: 1\"\n".to_string()
+    };
+    // Packfile URIs: git asks for them. With a token it also sends the token up front: a URI
+    // download is a request of its own, and git gives up on its 401 instead of asking the helper.
+    let uris = if needs_token(cfg) {
+        "git config --global fetch.uriProtocols https\n\
+         git config --global \"http.https://$HOST/.proactiveAuth\" auto\n"
+    } else {
+        "git config --global fetch.uriProtocols https\n"
     };
     let self_test = match repo {
         Some(rp) => format!(
@@ -347,7 +369,7 @@ if cmp -s "$HELPER.tmp" "$HELPER" 2>/dev/null; then rm -f "$HELPER.tmp"; else mv
 git config --global --replace-all "credential.https://$HOST.helper" ""
 git config --global --add "credential.https://$HOST.helper" "$HELPER"
 git config --global --unset-all "http.https://$HOST/.extraHeader" 2>/dev/null || true
-{self_test}{tail}"#,
+{uris}{self_test}{tail}"#,
         helper_file = helper_file(host),
         token_file = token_file(host),
         helper = helper_script(cfg, &r.base_url, host),
@@ -399,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn recipes_point_at_the_token_page_and_record_the_catchup_list() {
+    fn recipes_point_at_the_token_page_and_ask_for_packfile_uris() {
         let cfg = oidc_cfg();
         let r = recipes(&cfg, "https://git.example.com/", Some("acme/monorepo"));
         assert_eq!(r.host, HOST);
@@ -422,11 +444,11 @@ mod tests {
         );
         assert_eq!(
             r.plain_clone,
-            "git clone https://git.example.com/acme/monorepo.git"
+            "git clone -c remote.origin.serverOption=uri-auth=proactive https://git.example.com/acme/monorepo.git"
         );
         assert_eq!(
             r.blobless_clone,
-            "git clone --filter=blob:none --sparse https://git.example.com/acme/monorepo.git"
+            "git clone -c remote.origin.serverOption=uri-auth=proactive --filter=blob:none --sparse https://git.example.com/acme/monorepo.git"
         );
         assert!(
             r.setup_text
@@ -445,11 +467,17 @@ mod tests {
         let r = recipes(&st, BASE, None);
         assert!(r.token_url.is_none());
         assert!(r.setup_text.contains("issued by whoever runs this server"));
+        // Anonymous reads get URIs without asking.
+        assert!(!r.plain_clone.contains("serverOption"), "{}", r.plain_clone);
 
         // No auth at all: nothing about tokens.
         let r = recipes(&Config::default(), "http://localhost:8080", None);
         assert!(!r.setup_text.contains("oken"), "{}", r.setup_text);
         assert!(!r.manual_clone.contains("Authorization"));
+        assert!(!r.plain_clone.contains("serverOption"), "{}", r.plain_clone);
+        let script = install_script(&Config::default(), "http://localhost:8080", None);
+        assert!(script.contains("fetch.uriProtocols https"));
+        assert!(!script.contains("proactiveAuth"), "no credential to send");
     }
 
     #[test]
@@ -518,9 +546,9 @@ mod tests {
                 "the installer embeds the helper verbatim"
             );
             assert_eq!(
-                script.contains("exec git clone https://git.example.com/acme/monorepo.git"),
+                script.contains("exec git clone -c remote.origin.serverOption=uri-auth=proactive https://git.example.com/acme/monorepo.git"),
                 repo.is_some(),
-                "the installer clones the requested repository"
+                "the installer clones the requested repository, asking for packfile URIs"
             );
         }
         // No auth: the installer never asks for a token.
@@ -619,7 +647,9 @@ mod tests {
         let tf = dir.path().join("xdg/git").join(token_file(HOST));
         assert_eq!(std::fs::read_to_string(&tf).unwrap(), "wgt_pasted\n");
         assert_eq!(first.matches("helper = \n").count(), 1, "{first}");
-        assert_eq!(first.matches("helper = /").count(), 1, "{first}");
+        for key in ["helper = /", "uriProtocols = https", "proactiveAuth = auto"] {
+            assert_eq!(first.matches(key).count(), 1, "{key}: {first}");
+        }
         let files: Vec<_> = std::fs::read_dir(dir.path().join("xdg/git"))
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())

@@ -1683,7 +1683,7 @@ webhook_secret = "s"
     }
 }
 
-/// Negotiated static delivery thresholds. Foundation only: no URI emission yet.
+/// Negotiated static delivery thresholds (`docs/PACKFILE_URI_DESIGN.md`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct PackfileUriConfig {

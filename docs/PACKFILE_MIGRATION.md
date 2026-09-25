@@ -129,9 +129,11 @@ in affected clones; inspect global/origin-scoped configuration too if an operato
 silently rewrite users' global Git configuration as part of a server upgrade.
 
 Standard clients retain dynamic fetch/clone. `fetch.uriProtocols=https` can negotiate standard URI delivery on
-the native engine for anonymous-read repositories. Remote/gix serving stays dynamic. Protected URI acceleration requires a distributable, license-reviewed
-client with verified authenticated downloads; version strings alone are insufficient. Until that gate passes,
-document protected dynamic fallback honestly. Never open protected static routes to anonymous requests.
+the native engine for anonymous-read repositories. Remote/gix serving stays dynamic. Protected URI acceleration
+needs authenticated downloads: stock git ≥ 2.46 sends them with `http.<url>.proactiveAuth`, and a clone asks
+with `server-option=uri-auth=proactive` (D50); the installer and clone recipes do both. Version strings alone
+are insufficient, and other protected clients stay dynamic. Never open protected static routes to anonymous
+requests.
 
 Normal discovery advertises configured `refs.advertise` selectors, independently of packing groups. The
 default includes heads and tags. A complete v2 mirror or backup must explicitly request all namespaces:

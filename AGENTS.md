@@ -99,9 +99,11 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
   exit 2 with the two things to do); writes `~/.config/git/<host>-token` (0600) and the credential helper
   `<host>-credential-helper` (`get` → `authtype=Bearer`; `store` keeps what git hands it; `erase` on a 401 deletes
   the token and names `/_auth/tokens`); sets exactly `credential.https://<host>.helper` = `""` then ours,
-  `fetch.uriProtocols https`; self-tests
-  (`/api/v1/me`, or `ls-remote` of `?repo=`). Recipes come from one place (`setup::Recipes`,
-  `/services/setup.json`); the Clone menu, API page, overview and git error help render them.
+  `fetch.uriProtocols https` and, when the host needs a token, `http.https://<host>/.proactiveAuth auto`
+  (D50); self-tests (`/api/v1/me`, or `ls-remote` of `?repo=`). Recipes come from one place
+  (`setup::Recipes`, `/services/setup.json`; on a protected host the clones record
+  `remote.origin.serverOption=uri-auth=proactive`); the Clone menu, API page, overview and git error help
+  render them.
 - **Host to host**: a front that forwards pushes to a broker presents `wal.push_broker_token` (or
   `WALGIT_BROKER_TOKEN`); the broker lists it in `tokens` and its principal in `trusted_forwarders`, so the end
   user travels in `X-Walgit-Principal`.
@@ -219,8 +221,9 @@ subtracted root, with complete same-generation dependencies and live checks on e
 stays outside normal code delivery; retained indexed objects survive maintenance. Static URLs require read
 authorization plus exact live/retired membership. Retired downloads do not expire arbitrarily.
 
-The native v2 path delivers proven URI packs for anonymous-read clients; gix/remote engines stay dynamic.
-Protected clients retain dynamic fallback pending independent authenticated-client qualification. Discovery
+The native v2 path delivers proven URI packs for anonymous-read clients and for protected clients that send
+`server-option=uri-auth=proactive` (D50); gix/remote engines stay dynamic. Other protected clients keep
+dynamic fallback. Discovery
 uses `refs.advertise`; v2 mirrors request `server-option=ref-view=all` for complete ordinary refs. Static pack
 and index GET/HEAD require read auth and fresh live/retired membership. Never subtract synthetic haves on a
 path that does not emit their URLs. See [migration gates](docs/PACKFILE_MIGRATION.md) before changing durable writers.
@@ -486,6 +489,18 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   current tip must appear in the resulting live inventory before the log claim/CAS. Raw producer admission
   and candidate external-boundary proof remain separate obligations; local loose objects and retired
   download membership cannot justify retirement. See the cost and remaining-evidence rows in the linked docs.
+
+- **D50 (2026-09-25): Protected packfile URIs for clients that authenticate proactively.** A v2 fetch that
+  sends `server-option=uri-auth=proactive` gets the anonymous-read URI selection on a protected repository.
+  The option promises that every URI download carries the fetch's credential: stock git ≥ 2.46 does so with
+  `http.<url>.proactiveAuth` (`basic` or `auto`) and a helper that answers with a username and password, as
+  the installer's does (git's URI download ignores an `authtype`-only answer). The installer sets
+  `proactiveAuth auto` for its host and the clone recipes record the option; git ≥ 2.48 reads
+  `remote.<name>.serverOption`, older git ignores it and stays dynamic. Pack routes keep ordinary read auth,
+  fresh membership and private caching; no credential type, signed URL or config key is added. Git has no
+  fallback when a URI download fails, so the option is never inferred, and a 401 inside a download is not
+  refreshed: the fetch fails and the next command re-authenticates. Supersedes the protected dynamic-fallback
+  clauses of D42/D46 for clients that opt in.
 
 ## 5. Working rules
 

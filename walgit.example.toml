@@ -203,8 +203,9 @@ lock_wait_warn = "1s"             # WARN "lock wait" (lock, repo, wait_ms, reque
 # webhook_secret = ""             # X-Walgit-Signature: sha256=<HMAC-SHA256 of the body>; unset = unsigned
 # sweep_interval = "5m"           # backstop + health check (warns when a sweep finds unpublished entries); 0 = off
 
-# Packfile foundations: these policies are validated and stored, but URI delivery and
-# ref filtering are not enabled by the foundation-only change.
+# Packfile URIs (docs/PACKFILE_URI_DESIGN.md): discovery follows [refs].advertise, the packing groups decide
+# what URI delivery may hand out. A protected host serves URIs only to clones that send
+# server-option=uri-auth=proactive (the installer and clone recipes set that up; D50).
 [refs]
 advertise = ["refs/heads/*", "refs/tags/*"] # discovery policy, independent of packing identity
 [refs.packfiles.code]
