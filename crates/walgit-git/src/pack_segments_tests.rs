@@ -306,6 +306,15 @@ async fn empty_groups_conserve_everything_and_invalid_budgets_fail() {
 }
 
 #[test]
+fn sort_budget_is_passed_in_bytes() {
+    let command = sort_command(Path::new("work"), resources());
+    assert!(
+        command.get_args().any(|a| a == "--buffer-size=1048576b"),
+        "{command:?}"
+    );
+}
+
+#[test]
 fn type_split_keeps_hint_bytes_and_rejects_missing_objects() {
     let root = tempfile::tempdir().unwrap();
     let typed = root.path().join("typed");

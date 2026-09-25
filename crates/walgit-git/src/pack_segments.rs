@@ -637,16 +637,19 @@ fn append_index(
 }
 
 fn sort(input: &Path, output: &Path, work: &Path, resources: Resources) -> Result<(), GitError> {
-    run(
-        Command::new("sort")
-            .args(["--stable", "--unique", "--key=1,1", "--parallel=1"])
-            .arg(format!("--buffer-size={}", resources.sort_memory_bytes))
-            .arg("--temporary-directory")
-            .arg(work),
-        input,
-        output,
-        work,
-    )
+    run(&mut sort_command(work, resources), input, output, work)
+}
+
+/// GNU and BSD `sort` both read a bare `--buffer-size` number as KiB; the `b`
+/// suffix keeps the budget in bytes instead of 1024 times larger.
+fn sort_command(work: &Path, resources: Resources) -> Command {
+    let mut command = Command::new("sort");
+    command
+        .args(["--stable", "--unique", "--key=1,1", "--parallel=1"])
+        .arg(format!("--buffer-size={}b", resources.sort_memory_bytes))
+        .arg("--temporary-directory")
+        .arg(work);
+    command
 }
 
 fn difference(a: &Path, b: &Path, output: &Path, work: &Path) -> Result<(), GitError> {
