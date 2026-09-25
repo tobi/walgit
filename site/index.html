@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>walgit — a git server that is one binary in front of a bucket</title>
-<meta name="description" content="walgit hosts git repositories with no database, no leader and no local state that matters. One binary, one S3 or GCS bucket: smart HTTP, bundle-uri clones, LFS, a web UI and an API — and repositories larger than the machine.">
+<meta name="description" content="walgit hosts git repositories with no database, no leader and no local state that matters. One binary, one S3 or GCS bucket: smart HTTP, packfile URIs, LFS, a web UI and an API — and repositories larger than the machine.">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -83,8 +83,8 @@ git push https://git.example.com/acme/app.git main</code></pre>
       <h3>What walgit adds</h3>
       <p>The same design on machines <em>smaller than the repository</em>: a remote reader that serves refs, the
       UI and the API from pack indexes plus HTTP range reads; a history pack that keeps commits and trees local
-      while blobs stay in the bucket; and bundle-uri as the clone transport, so a 30 GB fresh clone touches the
-      server for a few kilobytes.</p>
+      while blobs stay in the bucket; and packfile URIs, so a clone can download packs the repository already
+      holds as static files while upload-pack builds only the rest.</p>
     </div>
   </div>
 </section>
@@ -96,14 +96,14 @@ git push https://git.example.com/acme/app.git main</code></pre>
     <div class="arrow">→</div>
     <div class="node big"><b>walgit</b><span>any number of disposable hosts, one binary<br>refs from the WAL · small packs local · big packs by range</span></div>
     <div class="arrow">→</div>
-    <div class="node store"><b>the bucket</b><span>S3 or GCS — <em>the repository</em><br>immutable packs · WAL · manifest CAS · bundles · LFS</span></div>
+    <div class="node store"><b>the bucket</b><span>S3 or GCS — <em>the repository</em><br>immutable packs · WAL · manifest CAS · LFS</span></div>
   </div>
   <dl class="facts">
     <div><dt>A push</dt><dd>index the pack, check connectivity and policy, <code>PUT pack ∥ idx ∥ log</code>, then CAS the manifest. On a 412, re-read and retry. The client sees <code>ok</code> only after the bucket does.</dd></div>
     <div><dt>A read</dt><dd>one conditional GET of the manifest — 304 means serve from the local copy, 200 means apply the new entries. There is no "eventually".</dd></div>
-    <div><dt>A clone</dt><dd>git's <code>bundle-uri</code>: the newest weekly full plus the chain of dailies and hourlies above it, straight from the bucket or a CDN; upload-pack sends only the remainder.</dd></div>
-    <div><dt>A fetch</dt><dd>the catch-up list has no fulls: a days-stale client downloads exactly the slots it missed.</dd></div>
-    <div><dt>Maintenance</dt><dd>checkpoints, bundles, compaction, base rebuilds, fsck and repair are one loop: compute the desired state from (config, WAL), do one bounded unit, under a lease. Self-healing by construction.</dd></div>
+    <div><dt>A clone</dt><dd>git's <code>packfile-uris</code>: packs the repository already has, each with proof of what it covers, handed out as static URLs; upload-pack sends only the remainder. Today that is for anonymous-read repositories; protected ones use ordinary dynamic transfer.</dd></div>
+    <div><dt>A fetch</dt><dd>ordinary negotiation: the client says what it has and gets a pack with only what it lacks.</dd></div>
+    <div><dt>Maintenance</dt><dd>checkpoints, the pack lifecycle, fsck and repair are one loop: compute the desired state from (config, WAL), do one bounded unit, under a lease. Self-healing by construction.</dd></div>
     <div><dt>Nothing waits silently</dt><dd>slow work is a task with a progress stream, narrated to git on sideband 2 and to the browser as SSE.</dd></div>
   </dl>
 </section>
@@ -112,13 +112,13 @@ git push https://git.example.com/acme/app.git main</code></pre>
   <h2>What you get</h2>
   <ul class="grid">
     <li><b>Smart HTTP v0/v2</b> ls-refs with prefixes, fetch with filter/shallow/deepen, receive-pack with atomic pushes, deletes, tags, push options, report-status-v2. sha1 and sha256.</li>
-    <li><b>bundle-uri</b> weekly full, chained dailies, hourlies — cut on calendar slots as a pure function of the WAL. Blobless families for <code>--filter=blob:none</code>.</li>
+    <li><b>Packfile URIs</b> packs the repository already holds, each with proof of what it covers, handed to git as static URLs; a <code>--filter=blob:none</code> clone gets history packs only.</li>
     <li><b>Git LFS</b> batch + basic transfer into the bucket; optional read-through from an upstream LFS server for imported history.</li>
     <li><b>Web UI + API + SDK</b> tree, blob, commits, diffs, the WAL's own health page; sha-addressed answers are immutable and cached everywhere; <code>repos.js</code> for pages, agents and scripts.</li>
     <li><b>Push policy</b> protected refs, groups, fast-forward only, bypass lists — a small rule language per repository.</li>
     <li><b>Webhooks</b> a bridge tails the WAL and POSTs ref events with a durable cursor; exactly once per <code>(repo, seq, ref)</code>, signed.</li>
-    <li><b>Per-repo settings</b> bundle schedules, compaction, upstream follow — published into the WAL with history.</li>
-    <li><b>S3 and GCS, first class</b> AWS, MinIO, Ceph, R2, rustfs or GCS; server-side compose for the weekly bundle on both.</li>
+    <li><b>Per-repo settings</b> pack lifecycle, packfile URIs, ref advertisement, upstream follow — published into the WAL with history.</li>
+    <li><b>S3 and GCS, first class</b> AWS, MinIO, Ceph, R2, rustfs or GCS; server-side compose on both.</li>
   </ul>
 </section>
 
@@ -156,20 +156,20 @@ cargo build --release -p walgit-cli      <span class="c"># after `just web-build
   </table>
   <p>Developer setup is one idempotent command —
   <code>sh -c "$(curl -fsSL 'https://git.example.com/services/public/install.sh')"</code> — which stores the token
-  in a file only you can read, installs a tiny credential helper (on a real 401 it erases the token and tells you
-  where a new one comes from) and turns on <code>transfer.bundleURI</code>.</p>
+  in a file only you can read and installs a tiny credential helper (on a real 401 it erases the token and tells
+  you where a new one comes from).</p>
 </section>
 
 <section id="edge" class="band alt">
   <h2>Optional: an nginx in front</h2>
   <p>walgit needs no proxy. Put one in front when you want public TLS from your own ACME client, one cached
   auth verdict per credential, or <strong>byte offload</strong>: walgit still does auth, validators and 304s, but
-  answers a bundle or LFS download with <code>X-Accel-Redirect</code>; nginx fetches the object from the bucket
+  answers a pack or LFS download with <code>X-Accel-Redirect</code>; nginx fetches the object from the bucket
   itself (S3 presigned, or GCS with walgit's bearer), slices ranges and caches it on disk. The second download of
-  a 30 GB weekly costs the walgit process nothing.</p>
+  a large pack costs the walgit process one admission check.</p>
 <pre><code>nginx → walgit   X-Walgit-Capabilities: accel-redirect, client-authorization
 walgit → nginx   200 + X-Accel-Redirect: /_store/
-                 X-Walgit-Store-Url: https://…        X-Walgit-Store-Key: repos/o/r/bundles/…
+                 X-Walgit-Store-Url: https://…        X-Walgit-Store-Key: repos/o/r/wal/…
                  X-Walgit-Store-Authorization: Bearer … (GCS only)</code></pre>
   <p><a href="https://github.com/tobi/walgit/blob/main/deploy/nginx.conf.example">deploy/nginx.conf.example</a>
   is the reference and documents the contract. Nothing is assumed from configuration: the edge announces what it
@@ -181,7 +181,7 @@ walgit → nginx   200 + X-Accel-Redirect: /_store/
   <ul class="links">
     <li><a href="https://github.com/tobi/walgit/blob/main/README.md">README</a> — the introduction, running it, the invariants.</li>
     <li><a href="https://github.com/tobi/walgit/blob/main/AGENTS.md">AGENTS.md</a> — the architecture and every design decision with its reasoning.</li>
-    <li><a href="https://github.com/tobi/walgit/blob/main/docs/BUNDLE_URI_DESIGN.md">Bundle design</a> — slots, chains, the two lists, the numbers.</li>
+    <li><a href="https://github.com/tobi/walgit/blob/main/docs/PACKFILE_URI_DESIGN.md">Packfile delivery design</a> — groups, proofs, the pack lifecycle and what is still gated.</li>
     <li><a href="https://github.com/tobi/walgit/blob/main/docs/announcing-walgit.md">The announcement post</a>.</li>
     <li><a href="https://cursor.com/blog/git-at-any-scale">Git at any scale</a> — the design walgit descends from.</li>
   </ul>
