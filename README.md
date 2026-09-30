@@ -77,7 +77,7 @@ Read the [design](docs/PACKFILE_URI_DESIGN.md) and
 | **git** | smart HTTP v0/v2: `ls-refs` with prefixes, fetch with filter/shallow/deepen/sideband-all, receive-pack (atomic, deletes, tags, push options, report-status-v2), `<owner>/<repo>` namespaces, sha1 and sha256 repositories. Upstream `git` does upload-pack/repack; walgit does receive-pack, the WAL and the plumbing. |
 | **LFS** | Batch API + basic transfer, objects in the bucket, optional read-through from an upstream LFS server for imported repositories. |
 | **web UI + API** | A React UI (tree, blob, commits, diffs, the WAL's own health page) on a read-mostly JSON API under `/{owner}/{repo}/api/*`; sha-addressed answers are immutable and cached everywhere; long answers stream progress as SSE. `repos.js` is a dependency-free SDK for pages, agents and scripts. |
-| **policy** | Per-repository push rules (`policy.json`): protected refs, groups, fast-forward only, bypass lists. `docs/POLICY.md`. |
+| **policy** | Per-repository push rules (`policy.json`): protected refs, groups, fast-forward only, bypass lists; optionally a host baseline every repository is judged against too. `docs/POLICY.md`. |
 | **settings** | Per-repository config (maintenance, compaction, upstream follow) published into the WAL with history. |
 | **events** | A small bridge tails the WAL and POSTs ref events to a webhook, exactly-once per (repo, seq, ref) with a durable cursor. `docs/EVENTS.md`. |
 | **maintenance** | Checkpoints, geometric compaction, connectivity audits and repairs — one loop that computes the desired state from (config, WAL) every pass and does one bounded unit of the most important missing work. Manual `compact --base` rebuilds the base on a host with sufficient disk. |

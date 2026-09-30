@@ -262,7 +262,10 @@ Ref-level summary: head (`null` when unborn), O(1) ref counts from the ref
 index, URLs. `404` for an unknown repo. Cache: SWR + `ETag: "<head sha>"`.
 `PUT` creates the repository (write permission; `201`/`200`), `DELETE`
 removes it (admin permission) — the same handlers as `PUT|DELETE /{owner}/{repo}`.
-`GET|PUT|DELETE …/policy` is the push policy document (`docs/POLICY.md`).
+`GET|PUT|DELETE …/policy` is the repository's own push policy document (`docs/POLICY.md`; `GET` of none = the
+empty document). `GET …/policy/effective` → `{layers: [{source, policy}]}`, every document a push is judged
+against in evaluation order: `{"source": "baseline", …}` only when the host has a `[policy] baseline`, then
+`{"source": "repository", …}` (the `GET …/policy` document). An update must pass every layer. `no-store`.
 
 `GET|PUT|DELETE /{o}/{r}/api/settings` (D24, 2026-08-21) is the repository's **settings in the WAL**: a TOML document
 restricted to `[refs]`, `[packfile_uri]`, `[maintenance]`, `[packs]` and `[upstream]`, merged over the
@@ -285,7 +288,8 @@ detail,upstream:{ref:oid},ours:{ref:oid}}|null} (D33; last_round = this instance
 fields:[{key,value,host_value,source: host|setting}], head_seq}`; `POST …/settings/validate` (body TOML) → the same
 shape for the *would-be* effective config with `ok: true`, or `{ok: false, errors[]}` (nothing published);
 `POST …/policy/validate` (body policy JSON) → `{ok, errors[], rules, groups, protect}`; `POST …/policy/dry-run?last=N`
-(body policy JSON, empty = the saved policy) → the policy evaluated against the last N PUSH entries of the live log
+(body policy JSON, empty = the saved policy) → the policy evaluated, after the host baseline as receive-pack would
+(a baseline denial reads `rejected by baseline rule '<name>'`), against the last N PUSH entries of the live log
 (`{pushes, allowed, denied, results:[{seq,at,principal,atomic,refs:[{name,ok,reason,force}]}]}`; force = non-ancestor
 update when objects are local). SDK: `repo.settings.{get,put,delete,effective,history,describe,validate}`,
 `repo.policy.{validate,dryRun}`.

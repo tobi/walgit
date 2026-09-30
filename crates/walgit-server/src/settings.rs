@@ -369,7 +369,8 @@ pub async fn http_policy_validate(
 }
 
 /// `POST …/policy/dry-run?last=N` body = policy JSON (empty body = the saved
-/// policy): evaluate it against the last N PUSH entries in the live log
+/// policy): evaluate it, after the host baseline exactly as receive-pack
+/// would, against the last N PUSH entries in the live log
 /// (principal + ref transaction as recorded) → per push, per ref: allowed or
 /// the denying rule. Force detection uses the local copy when objects are
 /// local, else "unknown" (treated as fast-forward).
@@ -421,8 +422,9 @@ pub async fn http_policy_dry_run(
             .get("principal")
             .cloned()
             .unwrap_or_else(|| e.writer.clone());
+        let baseline = st.policy_baseline.as_ref();
         let mut forces = std::collections::HashSet::new();
-        if policy.has_protect() {
+        if crate::policy::needs_force_check(baseline, &policy) {
             for u in &txn.updates {
                 if crate::policy::classify(&u.old_oid, &u.new_oid) == crate::policy::RefOp::Update
                     && matches!(local.is_ancestor(&u.old_oid, &u.new_oid).await, Ok(false))
@@ -431,7 +433,9 @@ pub async fn http_policy_dry_run(
                 }
             }
         }
-        let ev = crate::policy::evaluate(&policy, &principal, &txn, |u| forces.contains(&u.name));
+        let ev = crate::policy::evaluate(baseline, &policy, &principal, &txn, |u| {
+            forces.contains(&u.name)
+        });
         let refs: Vec<serde_json::Value> = ev
             .per_ref
             .iter()

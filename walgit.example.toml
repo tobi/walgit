@@ -178,6 +178,15 @@ max_object_bytes = "16GiB"
 # follow = ["refs/heads/main"]                            # refs kept equal to upstream's by the maintaining host: fetched every
                                                           # maintenance.follow_interval, published through the WAL as a push; fast-forward only
 
+# Push policy every repository is judged against IN ADDITION to its own policy.json (docs/POLICY.md,
+# "Host baseline"): baseline first, then the repository's; an update must pass both, so a repository can
+# add restrictions but never lift one. Same language, parser and validator as policy.json; read once at
+# startup — unreadable or invalid stops the process. Host-only (not a repository setting); every host that
+# runs receive-pack must carry the same file. Unset = no baseline (a repository without policy.json is allow-all).
+[policy]
+# baseline = "/etc/walgit/policy-baseline.json"   # e.g. docs/POLICY.md's example: members in draft/** and explore/**,
+                                                  # production for svc:deploy, the rest of refs/heads + refs/tags for the robots
+
 [git]
 binary = "git"                    # path to upstream git binary (>= 2.47 recommended: pack.writeReverseIndex)
 upload_pack_engine = "auto"       # "auto" = stock git when packs are local/mount-linked, gix only for remote-served bases | "git" | "gix"

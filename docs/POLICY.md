@@ -7,7 +7,10 @@ the operating decision is `AGENTS.md §3 D16`. Read when touching receive-pack a
 Normative. Implementation: `crates/walgit-server/src/policy.rs`.
 On-store object: `repos/<owner>/<repo>/policy.json` (not on the WAL, not in
 `walgit.toml`). `GET`/`PUT`/`DELETE /{owner}/{repo}/policy` and
-`walgit repo policy get|set|clear`.
+`walgit repo policy get|set|clear`. A host may add one **baseline** document
+(`[policy] baseline` in `walgit.toml`) that every repository is judged against
+as well — [Host baseline](#host-baseline). `GET /{owner}/{repo}/api/policy/effective`
+shows both.
 
 This file is a **small rule language whose combination law is fixed**, then
 serialized. It is not a JSON bag that mixes ACL, protection, and size ceilings
@@ -30,7 +33,8 @@ Leave out anything receive-pack cannot enforce: required reviews, required CI,
 file just lies.
 
 Missing file / empty `rules` = allow-all (anyone with write may move any
-ref). That is the only implicit default.
+ref), unless the host has a baseline, which applies regardless. That is the
+only implicit default.
 
 ## Envelope
 
@@ -216,15 +220,87 @@ That is enough for a real host: lock the trunk, reserve bot namespaces, keep
 tags still. History / size rules can be added later without changing the
 envelope; they will not change a verdict until this document says they do.
 
+## Host baseline
+
+`[policy] baseline = "<path>"` names a document in this language, on the
+host's disk, that every repository is judged against **as well as** its own
+`policy.json`. It exists so a deployment can protect a ref in every repository
+from the first push, without a per-repo write that races that push.
+
+- **Both apply.** A push is judged against the baseline, then against the
+  repository's document; an update passes only if it passes both. That is the
+  `protect` law (AND) carried across documents, so the order never changes a
+  verdict. It only decides which rule is named: the first denying rule,
+  baseline first — `rejected by baseline rule '<name>'`, or
+  `rejected by rule '<name>'` for the repository's own.
+- **Not "own replaces baseline".** Repositories get a `policy.json` for local
+  reasons (lock their trunk). Under replacement that write, or a `PUT` of an
+  empty document, would silently drop the host's protection. There is no
+  admitting effect in the language — `protect` only restricts — so under AND a
+  repository can add restrictions and never lift one. An exception is the
+  operator's: change the baseline or its bypass list.
+- **Two namespaces.** `group:` resolves against the roster of the document
+  that references it; a repository defining `group:deployers` does not join
+  the baseline's. Rule names are unique per document.
+- **Loaded once.** Read at startup with the same parser and validator as
+  `policy.json`; unreadable or invalid stops the process (and fails
+  `walgit config check`). Never "no baseline". Held in memory: no store
+  request on a push. It is host config, like `server.auth.tokens`: every host
+  that runs receive-pack (a front's local fallback, the push broker) must carry
+  the same file. A repository's settings cannot set it.
+- **Lockout across documents is not refused.** The overlapping-bypass check
+  below runs per document. A repository rule whose bypass list is disjoint from
+  an overlapping baseline rule's makes that ref unpushable for everyone; a `PUT`
+  does not catch it (the baseline can change without the repository's document
+  changing, and the conservative overlap test would refuse most repository
+  rules under a baseline over `refs/heads/**`). `POST …/policy/dry-run` judges
+  a candidate after the baseline, exactly as receive-pack does.
+
+A baseline that gives members two sandboxes, production to the deploy robot,
+and the rest of `refs/heads` and `refs/tags` to the robots:
+
+```json
+{
+  "version": 1,
+  "_comment": "members work in draft/** and explore/**; production is the deploy robot's; the rest of refs/heads and refs/tags is automation's",
+  "rules": [
+    {
+      "name": "reserve-heads-and-tags",
+      "match": {
+        "refs": ["refs/heads/**", "refs/tags/**", "^refs/heads/draft/**", "^refs/heads/explore/**"]
+      },
+      "effect": { "protect": { "bypass": ["svc:deploy", "svc:platform"] } }
+    },
+    {
+      "name": "production-deploy-only",
+      "match": { "refs": ["refs/heads/production", "refs/heads/production/**"] },
+      "effect": { "protect": { "bypass": ["svc:deploy"] } }
+    }
+  ]
+}
+```
+
+Anyone with write may create, update, force and delete under `draft/**` and
+`explore/**`: no rule matches there. Everything else under `refs/heads` and
+`refs/tags` — `refs/heads/draft` itself included — is reserved. Production
+matches both rules; AND admits only a principal that bypasses both, so
+`svc:platform` is held by the second. `refs/heads/production` is listed next to
+`refs/heads/production/**` because `**` after a `/` needs that `/`. The robots
+are spelled out rather than grouped: the lockout check compares bypass entries
+as written, and `group:robots` against `svc:deploy` would read as disjoint.
+Refs outside `refs/heads` and `refs/tags` (notes, review refs) are untouched.
+
 ## Load rules
 
 - Fail closed on a half-wired file. A document that does not parse is a
-  `400` on `PUT` and a reject on the next push (not “skip policy”).
+  `400` on `PUT` and a reject on the next push (not “skip policy”); a
+  baseline that does not parse stops startup.
 - Last-good backup is **not implemented**. A corrupt object currently fails
   the push. Do not pretend otherwise.
 - Pin the shipped file in tests. Load real JSON, drive
   `(principal, ref, op)` through the real matcher, assert allow / deny.
-- Explain the verdict. The `ng` line is `rejected by rule '<name>'`.
+- Explain the verdict. The `ng` line is `rejected by rule '<name>'`
+  (`rejected by baseline rule '<name>'` when the baseline denied).
 - Overlapping-bypass lockout: if two `protect` rules can match the same ref
   and the same op, and both have non-empty bypass lists whose intersection
   is empty, load fails. AND would make the intended bot unable to land.

@@ -30,6 +30,7 @@ pub struct Config {
     pub lfs: LfsConfig,
     pub git: GitConfig,
     pub upstream: UpstreamConfig,
+    pub policy: PolicyConfig,
     /// Links to the systems around a repository (per repo via settings).
     #[serde(default)]
     pub telemetry: TelemetryConfig,
@@ -339,6 +340,21 @@ pub struct CacheConfig {
     /// so stock git can still read any base object (slowly) while everything
     /// hot (refs, recent packs, indexes, commit-graph) is local.
     pub store_mount: Option<PathBuf>,
+}
+
+/// Host-side push policy (`docs/POLICY.md`). Host-only: not a settings section, so a
+/// repository cannot name, replace or drop it.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct PolicyConfig {
+    /// A `policy.json` document every repository is evaluated against **in addition to**
+    /// its own `repos/<o>/<r>/policy.json` (baseline first, then the repository's; a
+    /// repository can add restrictions, never lift one). Read and parsed at startup by
+    /// the same parser and validator as `policy.json`; unreadable or invalid = the
+    /// process does not start. Held in memory: no store request. Every host that runs
+    /// receive-pack (fronts with a local fallback, the push broker) must carry the same
+    /// file, like `server.auth.tokens`. Unset = no baseline.
+    pub baseline: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1088,6 +1104,12 @@ impl Config {
             "packfile_uri.max_uris_per_fetch must be 1..=64"
         );
         anyhow::ensure!(!self.store.bucket.is_empty(), "store.bucket must be set");
+        if let Some(p) = &self.policy.baseline {
+            anyhow::ensure!(
+                !p.as_os_str().is_empty(),
+                "policy.baseline is empty (omit the key for no baseline)"
+            );
+        }
         let t = &self.server.tls;
         match t.mode {
             TlsMode::Files => anyhow::ensure!(
@@ -1547,6 +1569,30 @@ mod tests {
                 .unwrap()
                 .contains("[compaction]")
         );
+    }
+
+    #[test]
+    fn policy_baseline_is_a_host_only_path() {
+        let c =
+            Config::parse("[policy]\nbaseline = \"/etc/walgit/policy-baseline.json\"\n").unwrap();
+        assert_eq!(
+            c.policy.baseline.as_deref(),
+            Some(std::path::Path::new("/etc/walgit/policy-baseline.json"))
+        );
+        assert!(Config::parse("").unwrap().policy.baseline.is_none());
+        // Parsing the document is the server's job (same parser as policy.json); the
+        // config only refuses what cannot name a file and typos in the section.
+        let e = Config::parse("[policy]\nbaseline = \"\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("policy.baseline"), "{e}");
+        assert!(Config::parse("[policy]\ndefault = \"/x.json\"\n").is_err());
+        // A repository cannot set, replace or clear the host's baseline.
+        let e = Config::default()
+            .with_settings("[policy]\nbaseline = \"/tmp/allow-all.json\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("[policy]"), "{e}");
     }
 
     #[test]

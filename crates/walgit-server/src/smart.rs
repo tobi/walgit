@@ -1102,8 +1102,9 @@ async fn receive_pack_process(
     let policy = crate::policy::load(&st.store, &route_id)
         .await
         .map_err(|e| ApiError::Internal(format!("load policy: {e}")))?;
+    let baseline = st.policy_baseline.as_ref();
     let mut forces = std::collections::HashSet::<String>::new();
-    if policy.has_protect() {
+    if crate::policy::needs_force_check(baseline, &policy) {
         for u in &txn.updates {
             if crate::policy::classify(&u.old_oid, &u.new_oid) == crate::policy::RefOp::Update {
                 match local.is_ancestor(&u.old_oid, &u.new_oid).await {
@@ -1115,7 +1116,9 @@ async fn receive_pack_process(
             }
         }
     }
-    let ev = crate::policy::evaluate(&policy, &principal.name, &txn, |u| forces.contains(&u.name));
+    let ev = crate::policy::evaluate(baseline, &policy, &principal.name, &txn, |u| {
+        forces.contains(&u.name)
+    });
     if !ev.any_allowed() {
         let report = build_report(&caps, unpack_result, &ev.per_ref).await;
         return Ok(report);

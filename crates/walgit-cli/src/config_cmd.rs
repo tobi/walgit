@@ -27,6 +27,8 @@ pub async fn run(action: ConfigAction, cfg: &Arc<Config>) -> Result<()> {
             }
             let ignored = cfg.apply_env_report(vars.into_iter())?;
             cfg.validate()?;
+            // Startup parses the baseline too; `check` must fail where startup would.
+            walgit_server::policy::load_baseline(&cfg)?;
             for (k, why) in &ignored {
                 eprintln!("ignored {k}: {why}");
             }
