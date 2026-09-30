@@ -599,9 +599,18 @@ export class RepoClient {
   get(opts?: CallOptions) {
     return this.client.json<RepoSummary>(this.p, opts);
   }
-  /** Create the repository (write permission). */
-  async create(opts?: CallOptions): Promise<void> {
-    await this.client.json<unknown>(this.p, opts, { method: "PUT" });
+  /** Create the repository (write permission); `defaultBranch` (short name) overrides the host's `git.default_branch`. */
+  async create(options: { defaultBranch?: string } = {}, opts?: CallOptions): Promise<void> {
+    const query = options.defaultBranch ? `?default_branch=${encodeURIComponent(options.defaultBranch)}` : "";
+    await this.client.json<unknown>(`${this.p}${query}`, opts, { method: "PUT" });
+  }
+  /** Point HEAD (the default branch) at an existing branch (admin). `seq: 0` = it was already there. */
+  setHead(branch: string, opts?: CallOptions) {
+    return this.client.json<{ head: RefInfo; seq: number }>(`${this.p}/head`, opts, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ branch }),
+    });
   }
   /** Delete the repository (admin permission). Irreversible. */
   async delete(opts?: CallOptions): Promise<void> {

@@ -184,6 +184,8 @@ upload_pack_engine = "auto"       # "auto" = stock git when packs are local/moun
 allow_filter = true               # uploadpack.allowFilter
 allow_any_sha1_in_want = false    # uploadpack.allowAnySHA1InWant
 object_format = "sha1"            # default for new repos: "sha1" | "sha256"
+default_branch = "main"           # HEAD's branch in repos created here (PUT ?default_branch= overrides); recorded in the
+                                  # bucket, and preferred when a push heals a HEAD that resolves to nothing (AGENTS D50)
 commit_graph = true               # maintain a split commit-graph chain per repo (tier-2 layer from the WAL + incremental)
 history_pack = true               # base rebuild also publishes commits+trees as a local "history pack"
 commit_graph_changed_paths = false # Bloom filters for incremental layers (diffs against parent trees = base pack reads)

@@ -2988,3 +2988,333 @@ async fn readiness_carries_only_proven_inventory_and_rechecks_revision_only_rest
         "reconciliation must settle at the held revision"
     );
 }
+
+// ---- HEAD: recorded at creation, healed by pushes, moved by publish_head (D50) ----
+
+fn head_target(handle: &walgit_wal::RepoHandle) -> String {
+    handle.local().refs().unwrap().head_target
+}
+
+/// The HEAD updates an entry's transaction carries (symbolic targets).
+fn head_updates(entry: &walgit_proto::v1::LogEntry) -> Vec<String> {
+    entry
+        .txn
+        .iter()
+        .flat_map(|t| &t.updates)
+        .filter(|u| !u.new_symbolic_target.is_empty())
+        .map(|u| u.new_symbolic_target.clone())
+        .collect()
+}
+
+/// A commit known to `handle`'s local copy, so ref-only publishes can point at it.
+async fn seed_commit(handle: &walgit_wal::RepoHandle, work: &WorkRepo) -> String {
+    let tip = work.commit("seed", "content");
+    let pack = ingest_pack_data(handle, work.create_pack()).await.unwrap();
+    // Install the pack locally without publishing a ref: a throwaway ref, then its delete.
+    let seeded = handle
+        .publish_push(
+            Some(pack),
+            make_txn(vec![("refs/tags/seed", "", &tip)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    assert!(seeded.per_ref.iter().all(|(_, r)| r.is_ok()));
+    tip
+}
+
+#[tokio::test]
+async fn create_records_only_a_non_implicit_head_in_the_same_commit() {
+    use walgit_store::fault::{FaultPlan, FaultStore};
+    let cache = tempfile::tempdir().unwrap();
+    let truth = MemoryStore::shared();
+    let link = FaultStore::new(truth.clone(), "create", 1);
+    let registry = Registry::new(link.clone(), Arc::new(make_config(cache.path(), 0)));
+    let ops = || link.stats().ops.load(std::sync::atomic::Ordering::Relaxed);
+
+    // The host default (`main`) is the implicit HEAD: one Create, no entry — as before.
+    let before = ops();
+    let plain = registry
+        .create(&repo_id("o", "plain"), ObjectFormat::Sha1)
+        .await
+        .unwrap();
+    assert_eq!(ops() - before, 1, "an implicit-HEAD create is one Create");
+    assert_eq!(plain.manifest().head_seq, 0);
+    assert_eq!(head_target(&plain), "refs/heads/main");
+
+    // Another target is the first entry, claimed before and listed by the manifest Create.
+    let before = ops();
+    let id = repo_id("o", "trunk");
+    let trunk = registry
+        .create_with_default_branch(&id, ObjectFormat::Sha1, "trunk")
+        .await
+        .unwrap();
+    assert_eq!(ops() - before, 2, "log slot Create -> manifest Create");
+    assert_eq!(trunk.manifest().head_seq, 1);
+    assert_eq!(head_target(&trunk), "refs/heads/trunk");
+    let log = trunk.read_log(1, None).await.unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].kind, EntryKind::RefUpdate as i32);
+    assert_eq!(head_updates(&log[0]), ["refs/heads/trunk"]);
+
+    // Every other instance replays it; a second creator loses cleanly.
+    let other_cache = tempfile::tempdir().unwrap();
+    let other = Registry::new(truth.clone(), Arc::new(make_config(other_cache.path(), 0)));
+    let replica = other.open(&id).await.unwrap();
+    assert_eq!(head_target(&replica), "refs/heads/trunk");
+    let third_cache = tempfile::tempdir().unwrap();
+    let third = Registry::new(truth.clone(), Arc::new(make_config(third_cache.path(), 0)));
+    assert!(matches!(
+        third
+            .create_with_default_branch(&id, ObjectFormat::Sha1, "other")
+            .await,
+        Err(walgit_wal::WalError::AlreadyExists)
+    ));
+    assert!(matches!(
+        registry
+            .create_with_default_branch(&repo_id("o", "bad"), ObjectFormat::Sha1, "a..b")
+            .await,
+        Err(walgit_wal::WalError::Invalid(_))
+    ));
+
+    // A lost Create reply is resolved from the exact claimed segment, not reported failed.
+    link.set(FaultPlan {
+        p_err_after: 1.0,
+        only_keys: Some(vec!["manifest.pb".into()]),
+        ..Default::default()
+    });
+    let lost = registry
+        .create_with_default_branch(&repo_id("o", "lost"), ObjectFormat::Sha1, "dev")
+        .await
+        .unwrap();
+    link.heal();
+    assert_eq!(lost.manifest().head_seq, 1);
+    assert_eq!(head_target(&lost), "refs/heads/dev");
+}
+
+#[tokio::test]
+async fn a_push_without_heads_target_heals_head_in_its_own_entry() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let registry = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
+    let id = repo_id("o", "heal");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    let work = WorkRepo::new();
+    let tip = seed_commit(&handle, &work).await;
+    // Tags alone never move HEAD: it names a branch.
+    assert_eq!(head_target(&handle), "refs/heads/main");
+    assert!(head_updates(&handle.read_log(1, None).await.unwrap()[0]).is_empty());
+
+    // No `main` in the push: HEAD goes to the first created branch by name, not by command order.
+    let r = handle
+        .publish_push(
+            None,
+            make_txn(vec![
+                ("refs/heads/zeta", "", &tip),
+                ("refs/heads/alpha", "", &tip),
+            ]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.seq, 2);
+    let reported: Vec<&str> = r.per_ref.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        reported,
+        ["refs/heads/zeta", "refs/heads/alpha"],
+        "HEAD is not reported to the client"
+    );
+    assert_eq!(head_target(&handle), "refs/heads/alpha");
+    let log = handle.read_log(1, None).await.unwrap();
+    assert_eq!(head_updates(&log[1]), ["refs/heads/alpha"]);
+    assert_eq!(handle.manifest().head_seq, 2, "no extra entry");
+
+    // HEAD resolves now: later branch creations leave it alone.
+    handle
+        .publish_push(
+            None,
+            make_txn(vec![("refs/heads/beta", "", &tip)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(head_target(&handle), "refs/heads/alpha");
+    // Deleting HEAD's branch leaves it dangling (a delete moves nothing else) …
+    handle
+        .publish_push(
+            None,
+            make_txn(vec![("refs/heads/alpha", &tip, "")]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(head_target(&handle), "refs/heads/alpha");
+    // … until the next publish that creates a branch.
+    handle
+        .publish_push(
+            None,
+            make_txn(vec![("refs/heads/gamma", "", &tip)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(head_target(&handle), "refs/heads/gamma");
+
+    // Replicas replay the healed HEAD from the log.
+    let other_cache = tempfile::tempdir().unwrap();
+    let other = Registry::new(store, Arc::new(make_config(other_cache.path(), 0)));
+    let replica = other.open(&id).await.unwrap();
+    drop(replica.sync_refs().await.unwrap());
+    assert_eq!(head_target(&replica), "refs/heads/gamma");
+}
+
+#[tokio::test]
+async fn heal_prefers_the_default_branch_and_respects_an_explicit_head() {
+    let cache = tempfile::tempdir().unwrap();
+    let mut cfg = make_config(cache.path(), 0);
+    cfg.git.default_branch = "trunk".into();
+    let registry = Registry::new(MemoryStore::shared(), Arc::new(cfg));
+    // HEAD → the implicit main, which this repository never gets.
+    let handle = registry
+        .create_with_default_branch(&repo_id("o", "prefer"), ObjectFormat::Sha1, "main")
+        .await
+        .unwrap();
+    let work = WorkRepo::new();
+    let tip = seed_commit(&handle, &work).await;
+    handle
+        .publish_push(
+            None,
+            make_txn(vec![
+                ("refs/heads/alpha", "", &tip),
+                ("refs/heads/trunk", "", &tip),
+            ]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(head_target(&handle), "refs/heads/trunk");
+
+    // A transaction that names HEAD keeps what it says (imports).
+    let explicit = registry
+        .create(&repo_id("o", "explicit"), ObjectFormat::Sha1)
+        .await
+        .unwrap();
+    let tip = seed_commit(&explicit, &work).await;
+    let mut txn = make_txn(vec![("refs/heads/alpha", "", &tip)]);
+    txn.updates.push(RefUpdate {
+        name: "HEAD".into(),
+        new_symbolic_target: "refs/heads/unborn".into(),
+        ..Default::default()
+    });
+    explicit
+        .publish_push(None, txn, HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(head_target(&explicit), "refs/heads/unborn");
+}
+
+#[tokio::test]
+async fn one_batch_heals_head_once() {
+    let cache = tempfile::tempdir().unwrap();
+    let registry = Registry::new(
+        MemoryStore::shared(),
+        Arc::new(make_config(cache.path(), 50)),
+    );
+    let handle = registry
+        .create(&repo_id("o", "batch"), ObjectFormat::Sha1)
+        .await
+        .unwrap();
+    let work = WorkRepo::new();
+    let tip = seed_commit(&handle, &work).await;
+    let (a, b) = tokio::join!(
+        handle.publish_push(
+            None,
+            make_txn(vec![("refs/heads/one", "", &tip)]),
+            HashMap::new()
+        ),
+        handle.publish_push(
+            None,
+            make_txn(vec![("refs/heads/two", "", &tip)]),
+            HashMap::new()
+        ),
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert!(a.seq > 1 && b.seq > 1);
+    let log = handle.read_log(1, None).await.unwrap();
+    let heals: Vec<String> = log.iter().flat_map(head_updates).collect();
+    assert_eq!(
+        heals.len(),
+        1,
+        "the later entry sees the healed HEAD: {heals:?}"
+    );
+    assert_eq!(head_target(&handle), heals[0]);
+}
+
+#[tokio::test]
+async fn publish_head_needs_an_existing_target_on_every_attempt_and_is_idempotent() {
+    let store = MemoryStore::shared();
+    let cache_a = tempfile::tempdir().unwrap();
+    let cache_b = tempfile::tempdir().unwrap();
+    let a = Registry::new(store.clone(), Arc::new(make_config(cache_a.path(), 0)));
+    let b = Registry::new(store, Arc::new(make_config(cache_b.path(), 0)));
+    let id = repo_id("o", "head");
+    let handle = a.create(&id, ObjectFormat::Sha1).await.unwrap();
+    let work = WorkRepo::new();
+    let tip = seed_commit(&handle, &work).await;
+    handle
+        .publish_push(
+            None,
+            make_txn(vec![
+                ("refs/heads/main", "", &tip),
+                ("refs/heads/dev", "", &tip),
+            ]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    let missing = handle
+        .publish_head("refs/heads/nope", HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(missing.seq, 0);
+    assert!(missing.per_ref[0].1.is_err());
+    assert_eq!(head_target(&handle), "refs/heads/main");
+
+    let moved = handle
+        .publish_head("refs/heads/dev", HashMap::new())
+        .await
+        .unwrap();
+    assert!(moved.seq > 0);
+    assert!(moved.per_ref.iter().all(|(_, r)| r.is_ok()));
+    assert_eq!(head_target(&handle), "refs/heads/dev");
+    let again = handle
+        .publish_head("refs/heads/dev", HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(again.seq, 0, "HEAD already there: nothing written");
+    assert_eq!(handle.manifest().head_seq, moved.seq);
+
+    // B's copy still has `main`; A deletes it. B's publish revalidates first and refuses.
+    let replica = b.open(&id).await.unwrap();
+    handle
+        .publish_push(
+            None,
+            make_txn(vec![("refs/heads/main", &tip, "")]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let stale = replica
+        .publish_head("refs/heads/main", HashMap::new())
+        .await
+        .unwrap();
+    assert!(stale.per_ref[0].1.is_err(), "{:?}", stale.per_ref);
+    assert_eq!(head_target(&replica), "refs/heads/dev");
+    assert!(matches!(
+        replica
+            .publish_head("refs/heads/a..b", HashMap::new())
+            .await,
+        Err(walgit_wal::WalError::Git(_))
+    ));
+}

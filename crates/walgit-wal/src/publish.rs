@@ -66,6 +66,10 @@ pub(crate) struct PublishRequest {
     /// Explicit entry time (history replay); None = now. Validated monotonic
     /// (>= the head entry's `created_at`) before the batch is written.
     pub(crate) created_at: Option<prost_types::Timestamp>,
+    /// A symbolic HEAD update in `txn` is rejected unless its target exists in
+    /// the ref state this attempt commits on (the admin route; checked on every
+    /// CAS attempt, so a concurrent delete of the target cannot slip past it).
+    pub(crate) head_must_exist: bool,
     pub(crate) response: oneshot::Sender<Result<PublishResult, WalError>>,
 }
 
@@ -403,13 +407,63 @@ pub(crate) fn is_null_oid(hex: &str) -> bool {
 pub(crate) fn apply_txn_to_map(txn: &RefTransaction, refs: &mut walgit_git::RefView) {
     for u in &txn.updates {
         if !u.new_symbolic_target.is_empty() {
-            refs.set(&u.name, u.new_symbolic_target.clone());
+            // Only HEAD is symbolic (`validate_ref_update`). Its target lives beside the ref map,
+            // where `head_target()`/`head_oid()` read it: storing it *in* the map made a later
+            // request of the same batch see the old target (and `get("HEAD")` a ref name).
+            refs.set_head_target(u.new_symbolic_target.clone());
         } else if is_null_oid(&u.new_oid) {
             refs.remove(&u.name);
         } else {
             refs.set(&u.name, u.new_oid.clone());
         }
     }
+}
+
+/// D50: the HEAD retarget a publish carries when HEAD's target was absent before it and
+/// still is after it, and the publish creates branches — a repository whose first pushes
+/// named no `main` would otherwise advertise a HEAD that resolves to nothing (clones warn
+/// "remote HEAD refers to nonexistent ref", the UI shows an empty repository) while it has
+/// branches. The target is `refs/heads/<git.default_branch>` when this publish creates it,
+/// else the lexicographically first `refs/heads/*` it creates — a rule of the ref names
+/// alone, so it does not depend on the order a client lists its commands in. A transaction
+/// that names HEAD itself keeps what it says (import, the admin route). A HEAD whose branch
+/// is deleted is left dangling by that delete, as a delete moves nothing else; the next
+/// publish that creates a branch heals it.
+///
+/// The retarget is appended to the publishing entry's own transaction, computed against the
+/// attempt's CAS basis: it commits in the same log entry and manifest CAS as the refs that
+/// justify it, is recomputed on every retry, and costs no request. Policy has nothing to add:
+/// HEAD moves only onto a branch this very transaction was allowed to create.
+fn heal_head(
+    txn: &RefTransaction,
+    after: &walgit_git::RefView,
+    default_branch: &str,
+) -> Option<walgit_proto::v1::RefUpdate> {
+    if after.head_oid().is_some() || txn.updates.iter().any(|u| u.name == "HEAD") {
+        return None;
+    }
+    let preferred = format!("refs/heads/{default_branch}");
+    let created = || {
+        txn.updates
+            .iter()
+            .filter(|u| {
+                u.new_symbolic_target.is_empty()
+                    && u.name.starts_with("refs/heads/")
+                    && is_null_oid(&u.old_oid)
+                    && !is_null_oid(&u.new_oid)
+            })
+            .map(|u| u.name.as_str())
+    };
+    let target = if created().any(|name| name == preferred) {
+        preferred.as_str()
+    } else {
+        created().min()?
+    };
+    Some(walgit_proto::v1::RefUpdate {
+        name: "HEAD".into(),
+        new_symbolic_target: target.to_string(),
+        ..Default::default()
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -498,6 +552,9 @@ pub(crate) async fn publisher_task(
 struct Verified {
     per_ref: Vec<(String, Result<(), RefError>)>,
     valid: bool,
+    /// The request's transaction plus a healed HEAD ([`heal_head`]), when one applies: what
+    /// the entry records and the local copy applies. `None` = the request's own `txn`.
+    healed: Option<RefTransaction>,
 }
 
 /// Process a batch of publish requests through the full CAS loop.
@@ -549,6 +606,21 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
         let mut floor: Option<std::time::SystemTime> = *handle.last_entry_time.lock();
         for req in &batch {
             let mut per_ref = verify_txn(&req.txn, &working_refs);
+            // HEAD as the batch left it so far: the heal rule needs "dangling before".
+            let head_dangling = working_refs.head_oid().is_none();
+            if req.head_must_exist {
+                for (u, (_, status)) in req.txn.updates.iter().zip(per_ref.iter_mut()) {
+                    if !u.new_symbolic_target.is_empty()
+                        && status.is_ok()
+                        && working_refs.get(&u.new_symbolic_target).is_none()
+                    {
+                        *status = Err(RefError::Rejected(format!(
+                            "{} does not exist",
+                            u.new_symbolic_target
+                        )));
+                    }
+                }
+            }
             let changes = req.pack.is_some()
                 || req.txn.updates.iter().any(|update| {
                     if !update.new_symbolic_target.is_empty() {
@@ -581,8 +653,19 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                 }
             }
             let all_ok = per_ref.iter().all(|(_, r)| r.is_ok());
+            let mut healed = None;
             if all_ok {
                 apply_txn_to_map(&req.txn, &mut working_refs);
+                if changes
+                    && head_dangling
+                    && let Some(head) =
+                        heal_head(&req.txn, &working_refs, &handle.cfg.git.default_branch)
+                {
+                    working_refs.set_head_target(head.new_symbolic_target.clone());
+                    let mut txn = req.txn.clone();
+                    txn.updates.push(head);
+                    healed = Some(txn);
+                }
             } else {
                 for (_, status) in &mut per_ref {
                     if status.is_ok() {
@@ -597,6 +680,7 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                 // A no-op still validates its preconditions and reports success,
                 // but must not manufacture a log entry or claim a sibling's seq.
                 valid: all_ok && changes,
+                healed,
             });
         }
 
@@ -630,7 +714,7 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
         let build = |first_seq: u64| -> (Vec<LogEntry>, Vec<PackRef>) {
             let mut entries = Vec::with_capacity(valid_indices.len());
             let mut new_packs = Vec::new();
-            for (offset, (req, _)) in batch
+            for (offset, (req, v)) in batch
                 .iter()
                 .zip(&verified)
                 .filter(|(_, v)| v.valid)
@@ -649,7 +733,7 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                     seq,
                     EntryKind::Push,
                     pack_ref,
-                    Some(&req.txn),
+                    Some(v.healed.as_ref().unwrap_or(&req.txn)),
                     Vec::new(),
                     &req.meta,
                     &writer,
@@ -803,12 +887,13 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                     tracing::warn!(error = %e, "landed push catch-up failed; next sync repairs it");
                     local_ok = false;
                 }
-                for (req, _) in batch
+                for (req, v) in batch
                     .iter()
                     .zip(&verified)
                     .filter(|(_, v)| v.valid && !already_applied && committed.head_seq == last_seq)
                 {
-                    if let Err(e) = handle.local.apply_ref_txn(&req.txn, false) {
+                    let txn = v.healed.as_ref().unwrap_or(&req.txn);
+                    if let Err(e) = handle.local.apply_ref_txn(txn, false) {
                         tracing::warn!(repo = %handle.id, seq = last_seq, error = %e, "published (CAS ok), but applying the ref txn to the local copy failed; the next sync replays it");
                         metrics::counter!("walgit_publish_local_apply_failed_total").increment(1);
                         local_ok = false;
@@ -984,7 +1069,7 @@ fn maybe_trigger_checkpoint(handle: &RepoHandle, _head_seq: u64) {
 /// Every entry this process commits moves `last_entry_time`: the checkpoint's `as_of` (the time
 /// of the newest folded entry, D22) is then known locally for COMPACT/SETTINGS entries too, not
 /// only for pushes and replayed segments — no log read at checkpoint time.
-fn note_entry_time(handle: &RepoHandle, seq: u64, at: &prost_types::Timestamp) {
+pub(crate) fn note_entry_time(handle: &RepoHandle, seq: u64, at: &prost_types::Timestamp) {
     let t = time::to_system(at);
     let mut slot = handle.last_entry_time.lock();
     if slot.map(|p| t > p).unwrap_or(true) {

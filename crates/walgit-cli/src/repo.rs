@@ -25,6 +25,7 @@ pub async fn run(action: RepoAction, cfg: &Arc<Config>) -> Result<()> {
         RepoAction::Create {
             repo,
             object_format,
+            default_branch,
         } => {
             let (owner, name) = parse_repo_id(&repo)?;
             let id = walgit_git::RepoId::new(owner, name)?;
@@ -33,10 +34,14 @@ pub async fn run(action: RepoAction, cfg: &Arc<Config>) -> Result<()> {
                 "sha256" => ObjectFormat::Sha256,
                 other => bail!("unknown object format `{other}` (expected sha1 or sha256)"),
             };
-            let handle = registry.create(&id, format).await?;
+            let branch = default_branch.unwrap_or_else(|| cfg.git.default_branch.clone());
+            let handle = registry
+                .create_with_default_branch(&id, format, &branch)
+                .await?;
             let manifest = handle.manifest();
             println_kv("repo", &id);
             println_kv("object_format", &manifest.object_format);
+            println_kv("default_branch", &branch);
             println_kv("head_seq", manifest.head_seq);
             info!(repo = %id, "repo created");
         }

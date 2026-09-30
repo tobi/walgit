@@ -564,7 +564,13 @@ async fn check_truth(c: &Cluster, pushers: &[Pusher]) -> Result<()> {
     // (errored-but-committed) push moved it further along the same chain.
     for e in &log {
         if let Some(t) = &e.txn {
-            for u in &t.updates {
+            // A symbolic update (HEAD's target: the heal a push into a repository without
+            // `main` carries, D52) names a ref, not an object: nothing to fold or fetch.
+            for u in t
+                .updates
+                .iter()
+                .filter(|u| u.new_symbolic_target.is_empty())
+            {
                 folded.insert(u.name.clone(), u.new_oid.clone());
             }
         }

@@ -20,7 +20,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::Next,
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use serde::Serialize;
 
@@ -48,10 +48,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             &format!("{API_V1}/owners/{{owner}}/repos"),
             get(crate::web::api::owner_repos),
         );
-    // Repo admin under both lanes: summary/create/delete, policy, settings.
+    // Repo admin under both lanes: summary/create/delete, HEAD, policy, settings.
     for base in crate::web::api::REPO_API_BASES {
         r = r
             .route(base, get(repo_summary).put(repo_admin).delete(repo_admin))
+            .route(&format!("{base}/head"), put(repo_admin))
             .route(
                 &format!("{base}/policy"),
                 get(repo_admin).put(repo_admin).delete(repo_admin),
@@ -375,7 +376,7 @@ async fn repo_admin_sub(
     repo_admin(State(st), Path((owner, name)), req).await
 }
 
-/// `PUT|DELETE /{o}/{r}/api[-browser]` and `GET|PUT|DELETE …/policy|settings`: the
+/// `PUT|DELETE /{o}/{r}/api[-browser]`, `PUT …/head` and `GET|PUT|DELETE …/policy|settings`: the
 /// same handlers as the repo root (`crate::dispatch_route`).
 async fn repo_admin(
     State(st): State<Arc<AppState>>,

@@ -68,6 +68,13 @@ fn ge<E: std::error::Error + Send + Sync + 'static>(e: E) -> GitError {
     GitError::Gix(Box::new(e))
 }
 
+/// HEAD's target in a repository whose WAL records none: every repository
+/// created before targets were recorded, and every one created with this
+/// target since (creation records only a different one, D50). A format
+/// constant, never configuration — changing it would retarget those
+/// repositories' HEAD on every reader.
+pub const IMPLICIT_HEAD: &str = "refs/heads/main";
+
 /// Reject ref names that would inject `git update-ref --stdin` commands or
 /// poison packed-refs (newlines, NULs, git-illegal bytes).
 #[expect(
@@ -624,9 +631,11 @@ impl LocalRepo {
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             });
         }
-        // Deterministic HEAD -> refs/heads/main regardless of the host's
-        // init.defaultBranch (git init writes master/main depending on config).
-        std::fs::write(path.join("HEAD"), "ref: refs/heads/main\n").map_err(GitError::Io)?;
+        // Deterministic HEAD regardless of the host's init.defaultBranch (git
+        // init writes master/main depending on config): the WAL's meaning of a
+        // HEAD it has no record of. A recorded target replaces it on replay.
+        std::fs::write(path.join("HEAD"), format!("ref: {IMPLICIT_HEAD}\n"))
+            .map_err(GitError::Io)?;
         // Permissive upload-pack config so filter / any-sha1 fetches work.
         // `pack.writeReverseIndex`: every pack this repo writes (index-pack on
         // ingest, repack in compaction) gets a `.rev` — git < 2.41 defaults it

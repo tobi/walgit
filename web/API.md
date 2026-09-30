@@ -262,7 +262,17 @@ Ref-level summary: head (`null` when unborn), O(1) ref counts from the ref
 index, URLs. `404` for an unknown repo. Cache: SWR + `ETag: "<head sha>"`.
 `PUT` creates the repository (write permission; `201`/`200`), `DELETE`
 removes it (admin permission) — the same handlers as `PUT|DELETE /{owner}/{repo}`.
-`GET|PUT|DELETE …/policy` is the push policy document (`docs/POLICY.md`).
+`PUT ?object_format=sha1|sha256&default_branch=<name>` (both optional; defaults `git.object_format`,
+`git.default_branch`): `default_branch` is HEAD's branch as a short name (`main`, `release%2Fnext`), `400` when Git
+would not accept it as a branch. `GET|PUT|DELETE …/policy` is the push policy document (`docs/POLICY.md`).
+
+`PUT /{o}/{r}/api/head` (browser lane `…/api-browser/head`; D50) with `{"branch": "<name>"}` points HEAD — the
+default branch clones check out and the UI opens — at an **existing** branch. Admin only. One WAL entry through the
+push publisher (CAS like any ref update; the branch is re-checked on every attempt) → `200 {head: {name, sha}, seq}`,
+`seq: 0` when HEAD was already there (idempotent, nothing written); `400` bad body or name, `404` unknown
+repository, `409` no such branch. HEAD otherwise moves by itself only when a push publishes branches while HEAD
+resolves to nothing: it then points at `git.default_branch` if that push creates it, else at the push's first
+created branch by name, in the same entry. SDK: `repo.create({defaultBranch})`, `repo.setHead(branch)`.
 
 `GET|PUT|DELETE /{o}/{r}/api/settings` (D24, 2026-08-21) is the repository's **settings in the WAL**: a TOML document
 restricted to `[refs]`, `[packfile_uri]`, `[maintenance]`, `[packs]` and `[upstream]`, merged over the
@@ -504,7 +514,7 @@ redelivers). Never cached, never served to the SPA.
   after a push is acknowledged, the next API call (any node) reflects it.
 - Writes on the JSON surface need a token with the matching permission:
   write for `PUT /{o}/{r}/api` (create) and `POST …/ops/{op}`, admin for
-  `DELETE /{o}/{r}/api`, `PUT|DELETE …/policy` and `PUT|DELETE …/settings`
+  `DELETE /{o}/{r}/api`, `PUT …/head`, `PUT|DELETE …/policy` and `PUT|DELETE …/settings`
   (D24: write is push, not admin). Content moves over git
   (`git-receive-pack`) and LFS, never through JSON.
 
@@ -516,6 +526,8 @@ GET /api/v1/me                                  → 200 {principal,write,anonymo
 GET /api/v1/owners                              → 200 [..]   ([] when empty)
 GET /api/v1/owners/nobody/repos                 → 200 []
 GET /o/r/api                                    → 200 {owner,name,full_name,head,branches,tags,clone_url,html_url,api_url}; SWR + ETag "<head sha>"
+PUT /o/r/api?default_branch=a..b                → 400 (nothing created)
+PUT /o/r/api/head {"branch":"dev"} (admin)      → 200 {head:{name:"dev",sha},seq}; again → seq 0; unknown branch → 409; non-admin → 403
 GET /o/r/api-browser/refs                           → same handlers (browser lane)
 OPTIONS /api/v1/… (Origin ∈ cors_origins)       → 204 + Access-Control-Allow-{Origin,Credentials,Methods,Headers}
 GET /api/v1/… (Origin ∉ cors_origins)           → 200, no CORS headers; DELETE/PUT/POST → 403

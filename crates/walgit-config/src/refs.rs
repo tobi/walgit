@@ -76,6 +76,25 @@ fn valid_ref(name: &str) -> bool {
             .all(|p| !p.is_empty() && !p.starts_with('.') && !p.ends_with(".lock"))
 }
 
+/// `refs/heads/<name>` for a short branch name (`main`, `release/1.x`), refused
+/// unless Git would accept it as a branch: HEAD's target is always a branch, and
+/// a full ref name here (`refs/heads/main`) would silently become
+/// `refs/heads/refs/heads/main`. One rule for `git.default_branch`, the create
+/// override and the HEAD admin route.
+pub fn branch_ref(name: &str) -> Result<String> {
+    ensure!(
+        !name.is_empty() && name != "HEAD" && !name.starts_with('-'),
+        "invalid branch name {name:?}"
+    );
+    ensure!(
+        !name.starts_with("refs/"),
+        "a branch name is short (\"main\"), not a ref (got {name:?})"
+    );
+    let full = format!("refs/heads/{name}");
+    ensure!(valid_ref(&full), "invalid branch name {name:?}");
+    Ok(full)
+}
+
 fn validate_selectors(selectors: &[String]) -> Result<()> {
     ensure!(selectors.len() <= 256, "at most 256 ref selectors per list");
     for selector in selectors {
@@ -287,6 +306,27 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
+    }
+    #[test]
+    fn branch_names_are_short_and_git_valid() {
+        assert_eq!(branch_ref("main").unwrap(), "refs/heads/main");
+        assert_eq!(branch_ref("release/1.x").unwrap(), "refs/heads/release/1.x");
+        for bad in [
+            "",
+            "HEAD",
+            "-x",
+            "refs/heads/main",
+            "a..b",
+            "a b",
+            "a/",
+            "a.lock",
+            ".hidden",
+            "a//b",
+            "x@{1}",
+            "a\nb",
+        ] {
+            assert!(branch_ref(bad).is_err(), "{bad:?}");
+        }
     }
 }
 

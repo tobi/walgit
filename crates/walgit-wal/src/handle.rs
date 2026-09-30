@@ -996,6 +996,7 @@ impl RepoHandle {
             meta,
             false,
             Some(walgit_proto::time::from_system(at)),
+            false,
         )
         .await
     }
@@ -1007,7 +1008,8 @@ impl RepoHandle {
         meta: HashMap<String, String>,
         synced: bool,
     ) -> Result<PublishResult, WalError> {
-        self.enqueue_publish_at(pack, txn, meta, synced, None).await
+        self.enqueue_publish_at(pack, txn, meta, synced, None, false)
+            .await
     }
 
     async fn enqueue_publish_at(
@@ -1017,6 +1019,7 @@ impl RepoHandle {
         meta: HashMap<String, String>,
         synced: bool,
         created_at: Option<prost_types::Timestamp>,
+        head_must_exist: bool,
     ) -> Result<PublishResult, WalError> {
         if pack.is_some() && txn.updates.is_empty() {
             return Err(WalError::Invalid(
@@ -1032,6 +1035,7 @@ impl RepoHandle {
             meta,
             synced,
             created_at,
+            head_must_exist,
             response: tx,
         };
 
@@ -1053,6 +1057,31 @@ impl RepoHandle {
         meta: HashMap<String, String>,
     ) -> Result<PublishResult, WalError> {
         self.publish_push(None, txn, meta).await
+    }
+
+    /// Point HEAD at `target` (a full `refs/heads/…` name), through the same publisher, log
+    /// entry and manifest CAS as a push (D50). The target must exist in the ref state the
+    /// entry commits on — checked on every CAS attempt, so a concurrent delete wins or loses
+    /// cleanly — else the result's `HEAD` entry is rejected. Idempotent: HEAD already there
+    /// is a no-op (`seq` 0, no entry). Refs-level: no pack is downloaded to move a symref.
+    pub async fn publish_head(
+        &self,
+        target: &str,
+        meta: HashMap<String, String>,
+    ) -> Result<PublishResult, WalError> {
+        let update = walgit_proto::v1::RefUpdate {
+            name: "HEAD".into(),
+            new_symbolic_target: target.to_string(),
+            ..Default::default()
+        };
+        walgit_git::validate_ref_update(&update)?;
+        drop(self.sync_refs().await?);
+        let txn = walgit_proto::v1::RefTransaction {
+            updates: vec![update],
+            ..Default::default()
+        };
+        self.enqueue_publish_at(None, txn, meta, true, None, true)
+            .await
     }
 
     /// Publish a compact entry.

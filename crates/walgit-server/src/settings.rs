@@ -176,7 +176,7 @@ async fn publish(
     }
 }
 
-fn percent_decode(v: &str) -> String {
+pub(crate) fn percent_decode(v: &str) -> String {
     let mut out = Vec::with_capacity(v.len());
     let b = v.as_bytes();
     let mut i = 0;

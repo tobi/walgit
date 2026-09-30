@@ -631,3 +631,143 @@ async fn policy_and_settings_writes_require_admin() -> TestResult {
     assert_eq!(st, 200, "{text}");
     Ok(())
 }
+
+/// D50: a repository's HEAD — named at creation (`?default_branch=`), healed by a push that
+/// publishes branches while HEAD resolves to nothing, moved by `PUT …/api/head` (admin only,
+/// existing branch, idempotent, both lanes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn default_branch_is_chosen_at_creation_healed_by_push_and_moved_by_admin() -> TestResult {
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = false;
+        c.server.auto_create_on_push = true;
+        c.server.auth.tokens = vec![
+            walgit_config::StaticToken {
+                principal: "writer".into(),
+                token: "writer-token".into(),
+                token_env: None,
+                write: true,
+                admin: false,
+            },
+            walgit_config::StaticToken {
+                principal: "admin".into(),
+                token: "admin-token".into(),
+                token_env: None,
+                write: true,
+                admin: true,
+            },
+        ];
+    })
+    .await?;
+    let writer = [("Authorization", "Bearer writer-token")];
+    let admin = [("Authorization", "Bearer admin-token")];
+    let summary_head = |path: &'static str| {
+        let server = &server;
+        async move {
+            let (st, text, _) = req(server, reqwest::Method::GET, path, &admin).await?;
+            anyhow::ensure!(st == 200, "GET {path} -> {st}: {text}");
+            let v: Value = serde_json::from_str(&text)?;
+            Ok::<Value, anyhow::Error>(v["head"].clone())
+        }
+    };
+
+    // Creation: the override is validated and recorded before any push.
+    let (st, text, _) = req(
+        &server,
+        reqwest::Method::PUT,
+        "/h/named/api?default_branch=a..b",
+        &writer,
+    )
+    .await?;
+    assert_eq!(st, 400, "{text}");
+    let (st, text, _) = req(
+        &server,
+        reqwest::Method::PUT,
+        "/h/named/api?default_branch=release%2Fnext",
+        &writer,
+    )
+    .await?;
+    assert_eq!(st, 201, "{text}");
+    let log = server.read_log("h", "named").await?;
+    assert_eq!(log.len(), 1);
+    assert_eq!(
+        log[0].txn.as_ref().unwrap().updates[0].new_symbolic_target,
+        "refs/heads/release/next"
+    );
+    assert_eq!(summary_head("/h/named/api").await?, Value::Null, "unborn");
+
+    // A first push (auto-created repository) without `main`: HEAD heals to its first branch.
+    let dir = tempfile::tempdir()?;
+    let work = dir.path();
+    git_in(work, &["init", "-q", "-b", "zeta"])?;
+    git_in(work, &["config", "user.email", "t@t"])?;
+    git_in(work, &["config", "user.name", "Tester"])?;
+    std::fs::write(work.join("f"), "x\n")?;
+    git_in(work, &["add", "."])?;
+    git_in(work, &["commit", "-q", "-m", "one"])?;
+    git_in(work, &["branch", "dev"])?;
+    let auth = "http.extraHeader=Authorization: Bearer admin-token";
+    let url = server.repo_url("h", "healed");
+    git_in(work, &["-c", auth, "push", "-q", &url, "zeta", "dev"])?;
+    assert_eq!(summary_head("/h/healed/api").await?["name"], "dev");
+    let symref = git_in(work, &["-c", auth, "ls-remote", "--symref", &url, "HEAD"])?;
+    assert!(symref.contains("ref: refs/heads/dev\tHEAD"), "{symref}");
+
+    // The admin route: admin only, a valid short name, an existing branch.
+    let put_head =
+        |lane: &'static str, who: &'static [(&'static str, &'static str)], body: &'static str| {
+            let server = &server;
+            async move {
+                req_body(
+                    server,
+                    reqwest::Method::PUT,
+                    &format!("/h/healed/{lane}/head"),
+                    who,
+                    body,
+                )
+                .await
+            }
+        };
+    // Promoted constants (`'static`, as the closure needs), not items after statements.
+    let writer_hdr: &'static [(&str, &str)] = &[("Authorization", "Bearer writer-token")];
+    let admin_hdr: &'static [(&str, &str)] = &[("Authorization", "Bearer admin-token")];
+    assert_eq!(
+        put_head("api", writer_hdr, r#"{"branch":"zeta"}"#).await?.0,
+        403
+    );
+    for bad in [
+        r#"{"branch":"refs/heads/zeta"}"#,
+        r#"{"branch":""}"#,
+        r#"{"name":"zeta"}"#,
+        "zeta",
+    ] {
+        let (st, text) = put_head("api", admin_hdr, bad).await?;
+        assert_eq!(st, 400, "{bad}: {text}");
+    }
+    let (st, text) = put_head("api", admin_hdr, r#"{"branch":"nope"}"#).await?;
+    assert_eq!(st, 409, "{text}");
+    let (st, text) = put_head("api", admin_hdr, r#"{"branch":"zeta"}"#).await?;
+    assert_eq!(st, 200, "{text}");
+    let moved: Value = serde_json::from_str(&text)?;
+    assert_eq!(moved["head"]["name"], "zeta");
+    assert_eq!(moved["head"]["sha"].as_str().map(str::len), Some(40));
+    assert!(moved["seq"].as_u64().unwrap() > 0);
+    let (st, text) = put_head("api-browser", admin_hdr, r#"{"branch":"zeta"}"#).await?;
+    assert_eq!(st, 200, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text)?["seq"],
+        0,
+        "idempotent"
+    );
+    assert_eq!(summary_head("/h/healed/api").await?["name"], "zeta");
+    let (st, _) = req_body(
+        &server,
+        reqwest::Method::PUT,
+        "/h/missing/api/head",
+        &admin,
+        r#"{"branch":"zeta"}"#,
+    )
+    .await?;
+    assert_eq!(st, 404);
+    Ok(())
+}

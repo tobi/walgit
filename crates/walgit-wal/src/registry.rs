@@ -11,11 +11,12 @@ use prost::Message;
 use walgit_git::{LocalRepo, ObjectFormat, RepoId};
 use walgit_proto::WAL_FORMAT_VERSION;
 use walgit_proto::keys;
-use walgit_proto::v1::Manifest;
+use walgit_proto::v1::{EntryKind, LogEntry, LogSegmentRef, Manifest, RefTransaction, RefUpdate};
 use walgit_store::{DynStore, ObjectStore, Prefixed, PutBody, PutMode, StoreError};
 
 use crate::error::WalError;
 use crate::handle::RepoHandle;
+use crate::publish::{ClaimOutcome, cas_landed, claim_log_slot, drop_own_slot, sweep_burned};
 use crate::state::{RepoState, load_state, save_state};
 use crate::store_proto::get_message;
 
@@ -193,12 +194,38 @@ impl Registry {
         Ok(())
     }
 
-    /// CAS-create manifest.pb (`PutMode::Create`). Err(AlreadyExists) on 412.
+    /// Create a repository whose HEAD names this host's `git.default_branch`
+    /// ([`Self::create_with_default_branch`]).
     pub async fn create(
         &self,
         id: &RepoId,
         format: ObjectFormat,
     ) -> Result<Arc<RepoHandle>, WalError> {
+        let branch = self.cfg.git.default_branch.clone();
+        self.create_with_default_branch(id, format, &branch).await
+    }
+
+    /// CAS-create manifest.pb (`PutMode::Create`) with HEAD → `refs/heads/<branch>`.
+    /// Err(AlreadyExists) on 412, Err(Invalid) for a bad branch name.
+    ///
+    /// HEAD lives where every ref lives — checkpoint `RefSnapshot.head_target` plus the
+    /// log's symbolic `HEAD` updates — and a repository with no record means
+    /// [`walgit_git::IMPLICIT_HEAD`]. That target needs no record: creation stays the one
+    /// Create it always was. Any other target is recorded as the repository's first entry
+    /// (a HEAD-only `REF_UPDATE`): its log slot is claimed exactly as a publish claims one
+    /// (`claim_log_slot`, orphans burned) and the manifest Create lists it, so the
+    /// repository appears with its HEAD in one commit or not at all — 2 sequential
+    /// requests instead of 1 (docs/ROUNDTRIPS.md). A Create lost to a concurrent creator
+    /// deletes our slot as a lost publish CAS does; an ambiguous Create error is resolved
+    /// by `cas_landed` (the exact segment listed ⇒ it is ours).
+    pub async fn create_with_default_branch(
+        &self,
+        id: &RepoId,
+        format: ObjectFormat,
+        branch: &str,
+    ) -> Result<Arc<RepoHandle>, WalError> {
+        let head = walgit_config::refs::branch_ref(branch)
+            .map_err(|e| WalError::Invalid(format!("default branch: {e}")))?;
         if let Some(h) = self.repos.get(id) {
             return Ok(h.clone());
         }
@@ -210,66 +237,125 @@ impl Registry {
 
         let prefix = id.store_prefix();
         let prefixed = Prefixed::new(self.store.clone(), prefix);
+        let writer = crate::handle::instance_id();
 
-        // Create manifest with PutMode::Create
+        let initial = (head != walgit_git::IMPLICIT_HEAD).then(|| RefTransaction {
+            updates: vec![RefUpdate {
+                name: "HEAD".into(),
+                new_symbolic_target: head.clone(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let created_at = walgit_proto::time::now();
+        let slot = match &initial {
+            None => None,
+            Some(txn) => {
+                let entry = |seq: u64| LogEntry {
+                    seq,
+                    kind: EntryKind::RefUpdate as i32,
+                    txn: Some(txn.clone()),
+                    created_at: Some(created_at),
+                    writer: writer.clone(),
+                    ..Default::default()
+                };
+                match claim_log_slot(&prefixed, 0, |seq| {
+                    walgit_proto::frame::encode_entries(std::iter::once(&entry(seq)))
+                })
+                .await?
+                {
+                    ClaimOutcome::Claimed(slot) => Some(slot),
+                    // A committed entry holds the slot: the repository exists.
+                    ClaimOutcome::Contended => return Err(WalError::AlreadyExists),
+                }
+            }
+        };
+
         let manifest = Manifest {
             format_version: WAL_FORMAT_VERSION,
             repo: id.to_string(),
             object_format: format.as_str().to_string(),
-            head_seq: 0,
+            head_seq: slot.as_ref().map_or(0, |s| s.first_seq),
             min_seq: 0,
             checkpoint: None,
-            log_segments: vec![],
+            log_segments: slot
+                .iter()
+                .map(|s| LogSegmentRef {
+                    key: s.key.clone(),
+                    first_seq: s.first_seq,
+                    last_seq: s.first_seq,
+                    size: s.bytes.len() as u64,
+                    sealed: true,
+                })
+                .collect(),
             packs: vec![],
             updated_at: Some(walgit_proto::time::now()),
-            writer: crate::handle::instance_id(),
+            writer,
             revision: 1,
             settings: None,
             retired_packs: Vec::new(),
         };
 
         let buf = manifest.encode_to_vec();
-        match prefixed
+        let put = prefixed
             .put(
                 keys::MANIFEST,
                 PutBody::Bytes(bytes::Bytes::from(buf)),
                 PutMode::Create.into(),
             )
-            .await
-        {
-            Ok(meta) => {
-                // Init local repo
-                let local = LocalRepo::init(&self.cache_root, id, format)?;
-
-                let state = RepoState {
-                    manifest_version: Some(meta.version.as_str().to_string()),
-                    revision: manifest.revision,
-                    packs_revision: manifest.revision,
-                    ..Default::default()
-                };
-                save_state(local.path(), &state)?;
-
-                let handle = RepoHandle::new(
-                    id.clone(),
-                    local,
-                    prefixed,
-                    self.cfg.clone(),
-                    manifest,
-                    Some(meta.version),
-                    state,
-                    self.tasks.clone(),
-                    self.blocks.clone(),
-                );
-                let handle = Arc::new(handle);
-                handle.set_self_arc(handle.clone());
-
-                self.repos.insert(id.clone(), handle.clone());
-                self.invalidate_listing();
-                Ok(handle)
+            .await;
+        let (manifest, version) = match (put, &slot) {
+            (Ok(meta), _) => (manifest, meta.version),
+            (Err(StoreError::PreconditionFailed { .. }), slot) => {
+                if let Some(slot) = slot {
+                    drop_own_slot(&prefixed, slot).await;
+                }
+                return Err(WalError::AlreadyExists);
             }
-            Err(StoreError::PreconditionFailed { .. }) => Err(WalError::AlreadyExists),
-            Err(e) => Err(WalError::Store(e)),
+            (Err(e), None) => return Err(WalError::Store(e)),
+            (Err(e), Some(slot)) => match cas_landed(&prefixed, slot).await {
+                Ok(Some(landed)) => landed,
+                _ => return Err(WalError::CommitUnknown(e.to_string())),
+            },
+        };
+        if let Some(slot) = &slot {
+            sweep_burned(&prefixed, slot).await;
         }
+
+        let local = LocalRepo::init(&self.cache_root, id, format)?;
+        if let Some(txn) = &initial {
+            local.apply_ref_txn(txn, false)?;
+        }
+        let state = RepoState {
+            manifest_version: Some(version.as_str().to_string()),
+            applied_seq: manifest.head_seq,
+            revision: manifest.revision,
+            packs_revision: manifest.revision,
+            ..Default::default()
+        };
+        save_state(local.path(), &state)?;
+
+        let head_seq = manifest.head_seq;
+        let handle = RepoHandle::new(
+            id.clone(),
+            local,
+            prefixed,
+            self.cfg.clone(),
+            manifest,
+            Some(version),
+            state,
+            self.tasks.clone(),
+            self.blocks.clone(),
+        );
+        let handle = Arc::new(handle);
+        handle.set_self_arc(handle.clone());
+        if head_seq > 0 {
+            crate::publish::note_entry_time(&handle, head_seq, &created_at);
+        }
+
+        self.repos.insert(id.clone(), handle.clone());
+        self.invalidate_listing();
+        Ok(handle)
     }
 
     /// Open or create.

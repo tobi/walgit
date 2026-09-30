@@ -168,8 +168,12 @@ impl Registry {
   pub fn new(store: DynStore, cfg: Arc<walgit_config::Config>) -> Arc<Self>;
   /// Open existing (materialize local copy lazily). Err(WalError::NotFound) if manifest.pb absent.
   pub async fn open(&self, id: &RepoId) -> Result<Arc<RepoHandle>, WalError>;
-  /// CAS-create manifest.pb (PutMode::Create). Err(WalError::AlreadyExists).
+  /// CAS-create manifest.pb (PutMode::Create). Err(WalError::AlreadyExists). HEAD → git.default_branch.
   pub async fn create(&self, id: &RepoId, format: ObjectFormat) -> Result<Arc<RepoHandle>, WalError>;
+  /// Same with HEAD → refs/heads/<branch> (short name; Err(Invalid) otherwise). A target other than
+  /// walgit_git::IMPLICIT_HEAD is the first log entry, committed by the same manifest Create (D50).
+  pub async fn create_with_default_branch(&self, id: &RepoId, format: ObjectFormat, branch: &str)
+      -> Result<Arc<RepoHandle>, WalError>;
   pub async fn open_or_create(&self, id: &RepoId, format: ObjectFormat) -> Result<Arc<RepoHandle>, WalError>;
   pub async fn list(&self) -> Result<Vec<RepoId>, WalError>;   // list "repos/" prefix (delimiter-less scan is ok v1)
   pub fn store(&self) -> &DynStore; pub fn config(&self) -> &Arc<Config>;
@@ -199,6 +203,11 @@ impl RepoHandle {
       -> Result<PublishResult, WalError>;
   pub struct PublishResult { pub seq: u64, pub per_ref: Vec<(String, Result<(), RefError>)> }
   pub async fn publish_ref_update(&self, txn: RefTransaction, meta) -> Result<PublishResult, WalError>;
+  /// Every publish: a txn that creates refs/heads/* while HEAD resolves to nothing before and after it
+  /// also retargets HEAD in its own entry (default branch if created, else the first created by name).
+  /// HEAD → `target` (full refs/heads/ name) through the same publisher; rejected per ref (`HEAD`) unless
+  /// the target exists on the attempt's CAS basis; seq 0 when already there (D50).
+  pub async fn publish_head(&self, target: &str, meta: HashMap<String,String>) -> Result<PublishResult, WalError>;
   /// COMPACT entry: new pack (already local, e.g. from LocalRepo::repack) superseding `supersedes`.
   pub async fn publish_compact(&self, new_pack: PackInfo, supersedes: Vec<gix_hash::ObjectId>, tier: u32)
       -> Result<u64, WalError>;

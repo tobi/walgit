@@ -487,6 +487,19 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   and candidate external-boundary proof remain separate obligations; local loose objects and retired
   download membership cannot justify retirement. See the cost and remaining-evidence rows in the linked docs.
 
+- **D50 (2026-09-30): HEAD is WAL state; creation records it, pushes heal it, admins move it.** HEAD's
+  target lives where refs live (checkpoint `RefSnapshot.head_target` + symbolic `HEAD` updates in log
+  transactions); no record means `walgit_git::IMPLICIT_HEAD` (`refs/heads/main`), a format constant. New
+  repositories point at `git.default_branch` (host) or `PUT /{o}/{r}?default_branch=` (short name, validated):
+  the implicit target records nothing (one Create, as before); any other is the first entry, its log slot
+  claimed before and listed by the manifest Create (2 requests, one commit). A publish that creates
+  `refs/heads/*` while HEAD resolves to nothing before and after it carries the retarget in its own entry —
+  `default_branch` if created, else the first created branch by name; a transaction naming HEAD keeps it; a
+  delete of HEAD's branch leaves it dangling until such a publish — computed on each attempt's CAS basis, no
+  extra request. `PUT /{o}/{r}/api/head` (admin) retargets through the same publisher, the branch re-checked
+  on every attempt, idempotent. Receive-pack refuses `HEAD` as a command name (`funny refname`), so policy
+  sees every ref move; HEAD retargets emit no events (D32).
+
 ## 5. Working rules
 
 - **No backwards compatibility (pre-1.0, banner at top):** change the shape and delete the old one in the same

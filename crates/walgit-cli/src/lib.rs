@@ -228,6 +228,9 @@ enum RepoAction {
         /// `sha1` or `sha256`.
         #[arg(long, default_value = "sha1")]
         object_format: String,
+        /// HEAD's branch (short name); default `git.default_branch`.
+        #[arg(long)]
+        default_branch: Option<String>,
     },
     /// List all repositories.
     List,

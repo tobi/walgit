@@ -47,8 +47,9 @@ repos.owners.repos("acme")                   → ["monorepo", …]
 repos.repo("acme/monorepo")                     → RepoClient (no request)
 
 r.get()                                      → { owner, name, full_name, head, branches, tags, clone_url, html_url, api_url }
-r.create()                                   → write permission
+r.create({ defaultBranch })                  → write permission (defaultBranch optional: HEAD's branch)
 r.delete()                                   → admin permission
+r.setHead("dev")                             → { head: {name, sha}, seq }   (admin; an existing branch; seq 0 = unchanged)
 r.refs()                                     → { head: {name, sha} | null }
 r.branches({ prefix, q, after, n })          → { refs: [{name, sha}], more }      (one page; tags likewise)
 r.tags({ … })

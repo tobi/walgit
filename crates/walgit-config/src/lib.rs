@@ -572,6 +572,13 @@ pub struct GitConfig {
     pub allow_any_sha1_in_want: bool,
     /// Default object format for new repos.
     pub object_format: ObjectFormat,
+    /// Branch HEAD names in a repository created on this host (`PUT /{o}/{r}`,
+    /// `walgit repo create`, auto-create on push), unless the request names
+    /// one. A short name (`main`, not `refs/heads/main`). The bucket records
+    /// the choice, so hosts with different values never disagree about an
+    /// existing repository; it is also the preferred target when a push heals
+    /// a dangling HEAD (D50).
+    pub default_branch: String,
     /// Maintain a split commit-graph chain per local repo: tier-2 packs that
     /// publish a commit-graph layer install it as the chain base; every other
     /// installed pack is folded in incrementally (`commit-graph write --split`).
@@ -929,6 +936,7 @@ impl Default for GitConfig {
             allow_filter: true,
             allow_any_sha1_in_want: false,
             object_format: ObjectFormat::Sha1,
+            default_branch: "main".into(),
             commit_graph: true,
             commit_graph_changed_paths: false,
             history_pack: true,
@@ -1079,6 +1087,8 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         self.refs.validate()?;
         self.packs.validate()?;
+        refs::branch_ref(&self.git.default_branch)
+            .map_err(|e| anyhow::anyhow!("git.default_branch: {e}"))?;
         anyhow::ensure!(
             self.packfile_uri.uri_min_bytes.as_u64() > 0,
             "packfile_uri.uri_min_bytes must be positive"
@@ -1436,6 +1446,21 @@ mod tests {
         c.apply_env(vec![("WALGIT__WAL__MAX_BATCH".to_string(), "7".to_string())].into_iter())
             .unwrap();
         assert_eq!(c.placement.serve_exclude, vec!["acme/monorepo"]);
+    }
+
+    /// `git.default_branch` is a short, Git-valid branch name; a bad one fails at startup.
+    #[test]
+    fn validate_refuses_an_invalid_default_branch() {
+        let mut c = Config::default();
+        c.store.bucket = "b".into();
+        assert_eq!(c.git.default_branch, "main");
+        c.git.default_branch = "trunk".into();
+        c.validate().unwrap();
+        for bad in ["refs/heads/main", "a..b", ""] {
+            c.git.default_branch = bad.into();
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains("git.default_branch"), "{bad:?}: {err}");
+        }
     }
 
     /// You cannot maintain what you refuse to serve.
