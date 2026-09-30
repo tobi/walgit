@@ -535,6 +535,13 @@ fn deny_reason(
     u: &RefUpdate,
     is_force: &impl Fn(&RefUpdate) -> bool,
 ) -> Option<String> {
+    // A pushed command names a ref under `refs/`, never `HEAD` (git's own receive-pack refuses
+    // it as a "funny refname"). `HEAD <oid>` would move HEAD's branch through the symref under a
+    // name no rule matches — around every `protect` on `refs/heads/*`. HEAD's target is a
+    // symbolic update (import), never a pushed command.
+    if u.new_symbolic_target.is_empty() && !u.name.starts_with("refs/") {
+        return Some("funny refname".into());
+    }
     let op = classify(&u.old_oid, &u.new_oid);
     if op == RefOp::NoOp {
         return None;
@@ -868,6 +875,31 @@ mod tests {
         let p = lock_main();
         let t = txn(vec![upd("refs/heads/main", "", "aaa")], false);
         let ev = evaluate(&p, "bob@example.com", &t, |_| true);
+        assert!(ev.per_ref[0].1.is_ok());
+    }
+
+    /// `HEAD <oid>` would update main through the symref under a name `lock-main` never sees:
+    /// refused under any policy, including none. Symbolic HEAD updates (heal, admin route,
+    /// imports — never pushed) are not ref moves and pass.
+    #[test]
+    fn a_pushed_head_is_a_funny_refname_under_any_policy() {
+        for p in [RepoPolicy::empty(), lock_main()] {
+            let t = txn(vec![upd("HEAD", "aaa", "bbb")], false);
+            let ev = evaluate(&p, "Alice@example.com", &t, |_| false);
+            assert_eq!(ev.per_ref[0].1.as_ref().unwrap_err(), "funny refname");
+            assert!(!ev.any_allowed());
+        }
+        let retarget = RefUpdate {
+            name: "HEAD".into(),
+            new_symbolic_target: "refs/heads/dev".into(),
+            ..Default::default()
+        };
+        let ev = evaluate(
+            &lock_main(),
+            "bob@example.com",
+            &txn(vec![retarget], false),
+            |_| false,
+        );
         assert!(ev.per_ref[0].1.is_ok());
     }
 
