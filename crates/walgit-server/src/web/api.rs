@@ -414,6 +414,15 @@ pub(crate) fn etag_for(sha: &str) -> String {
 pub(crate) fn json_swr<T: Serialize>(value: &T, etag: Option<&str>) -> Rendered {
     Rendered::json(json_bytes(value), SWR, etag.map(str::to_string))
 }
+/// SWR JSON whose `ETag` is a digest of the body: for answers with no natural version (a
+/// control object outside the WAL, a listing with detail). A revalidation that finds nothing
+/// changed ends in a `304` — it saves the transfer, not the server's store reads.
+pub(crate) fn json_swr_digest<T: Serialize>(value: &T) -> Rendered {
+    use sha1::Digest;
+    let body = json_bytes(value);
+    let etag = etag_for(&hex::encode(sha1::Sha1::digest(&body)));
+    Rendered::json(body, SWR, Some(etag))
+}
 fn json_bytes<T: Serialize>(value: &T) -> bytes::Bytes {
     bytes::Bytes::from(serde_json::to_vec(value).unwrap_or_default())
 }
@@ -470,31 +479,75 @@ async fn instance_info(
 
 // ---- owners ------------------------------------------------------------------
 
+/// `?detail=1` on the owner listings (`web/API.md`). Plain calls keep their `string[]`
+/// shape; detail answers objects with the human-readable metadata (`crate::metadata`).
+#[derive(serde::Deserialize, Default)]
+pub(crate) struct ListQuery {
+    detail: Option<String>,
+}
+
+impl ListQuery {
+    fn detail(&self) -> Result<bool, ApiError> {
+        match self.detail.as_deref() {
+            None | Some("0" | "false") => Ok(false),
+            Some("1" | "true") => Ok(true),
+            Some(other) => Err(ApiError::BadRequest(format!(
+                "detail={other}: expected 1 or 0"
+            ))),
+        }
+    }
+}
+
+/// `GET /api/v1/owners[?detail=1]` → `["o", …]`, or `[{name, display_name?, description?}]`:
+/// the listing (`Registry::list`, cached `LIST_TTL`) then one profile GET per owner,
+/// `metadata::DETAIL_CONCURRENCY` in flight. The detail answer carries a body-digest `ETag`.
 pub(crate) async fn owners(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(q): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     st.auth.require_read(&headers).await.map_err(auth_err)?;
+    let detail = q.detail()?;
     let repos = st.registry.list().await.map_err(internal)?;
     let mut out: Vec<String> = repos.into_iter().map(|r| r.owner().to_string()).collect();
     out.sort();
     out.dedup();
+    if detail {
+        let rows = crate::metadata::owner_details(&st.store, out)
+            .await
+            .map_err(internal)?;
+        return Ok(json_swr_digest(&rows).into_response(&headers));
+    }
     Ok(json_swr(&out, None).into_response(&headers))
 }
+
+/// `GET /api/v1/owners/{owner}/repos[?detail=1]` → `["r", …]`, or `[{name, description?}]`
+/// (one description GET per repository, as above). `[]` for an unknown owner either way.
 pub(crate) async fn owner_repos(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(owner): Path<String>,
+    Query(q): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     st.auth.require_read(&headers).await.map_err(auth_err)?;
-    let repos = st.registry.list().await.map_err(internal)?;
-    let mut out: Vec<String> = repos
+    let detail = q.detail()?;
+    let mut repos: Vec<walgit_git::RepoId> = st
+        .registry
+        .list()
+        .await
+        .map_err(internal)?
         .into_iter()
         .filter(|r| r.owner() == owner)
-        .map(|r| r.name().to_string())
         .collect();
-    out.sort();
-    out.dedup();
+    repos.sort_by(|a, b| a.name().cmp(b.name()));
+    repos.dedup();
+    if detail {
+        let rows = crate::metadata::repo_details(&st.store, repos)
+            .await
+            .map_err(internal)?;
+        return Ok(json_swr_digest(&rows).into_response(&headers));
+    }
+    let out: Vec<String> = repos.into_iter().map(|r| r.name().to_string()).collect();
     Ok(json_swr(&out, None).into_response(&headers))
 }
 

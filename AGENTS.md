@@ -134,10 +134,12 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `leases/<name>.pb` | CAS lease with TTL heartbeat: `compact`. The only cross-instance mutex. |
 | `cache/api/v1/<sha1>.json` | Shared render cache of immutable web API answers. |
 | `policy.json` | Per-repo push policy (rule language, not on the WAL). `docs/POLICY.md`. Missing = allow-all. |
+| `description.json` | Per-repo human-readable description (`{"description"}`, not on the WAL, never read by git; D50). Missing = none. |
 | `fsck.pb` | Last connectivity audit (`FsckReport`), written by the maintainer's `fsck` unit, consumed by `repair` (`docs/INTEGRITY.md`). |
 | `events/cursor.json` | Durable acknowledged WAL sequence of the events bridge; advanced only after the webhook acknowledged (D32). |
 | `lfs/objects/<aa>/<bb>/<oid>` | LFS objects (sha256-addressed, immutable). Missing ones can be read through from `upstream.lfs` and persisted (`docs/LFS.md`). |
-Schema `crates/walgit-proto/proto/walgit/v1/wal.proto`; GCS over gRPC, S3 (AWS SDK) and in-memory stores share
+Outside `repos/`: `owners/<owner>/profile.json` (an owner's display name + description, D50), `maintain/<host>.pb`
+(maintainer heartbeats). Schema `crates/walgit-proto/proto/walgit/v1/wal.proto`; GCS over gRPC, S3 (AWS SDK) and in-memory stores share
 one contract suite (`crates/walgit-store/tests/contract.rs`, incl. compose).
 
 ### 2.2 Write path
@@ -289,7 +291,7 @@ Unrelated constraints remain in force. The current design target and migration g
 - **D13** Long work is a task and is narrated (§2.7); no endpoint may block silently.
 - **D14** Web toolchain: pnpm + Vite only. The build fails unless the optimized SPA artefacts are present.
 - **D15** Repo-scoped API lives at `/{o}/{r}/api/…` (refs, resolve, tree, blob, commits, commit, overview, ops,
-  tasks, policy, settings) so the repository prefix determines placement. The browser lane is
+  tasks, policy, description, settings) so the repository prefix determines placement. The browser lane is
   `/{o}/{r}/api-browser/…`; `/api/v1` is non-repository discovery, identity and owner listing. No aliases.
 - **D16** Push authorization is a per-repo **rule language** at `repos/<o>/<r>/policy.json` (`docs/POLICY.md`).
   Envelope `version` + `groups` + `rules`; `protect` = AND. Empty/missing = anyone with write may move any ref.
@@ -486,6 +488,18 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   current tip must appear in the resulting live inventory before the log claim/CAS. Raw producer admission
   and candidate external-boundary proof remain separate obligations; local loose objects and retired
   download membership cannot justify retirement. See the cost and remaining-evidence rows in the linked docs.
+
+- **D50 (2026-09-30): Human-readable metadata is two small control objects, not state.** A repository's
+  description (`repos/<o>/<r>/description.json`) and an owner's profile (`owners/<o>/profile.json`:
+  `display_name`, `description`) give opaque ids a readable name. Like `policy.json` (D16) they are outside the
+  WAL — a label is not repository state, advances nothing, rides no sync and is read by no git path — and are
+  overwritten last-writer-wins. The profile sits at the bucket root because `repos/` holds repositories only (its
+  delimited listing finds them) and an owner is not a routing unit (D26). Owners stay implicit: a profile creates
+  nothing and is listed only while its owner has a repository. Surface: `GET|PUT|DELETE /{o}/{r}/api/description`,
+  `GET|PUT|DELETE /api[-browser]/v1/owners/{o}`, `?detail=1` on both owner listings (plain shapes unchanged);
+  read for GET, **admin** for every write, including `?description=` on create. One line of plain text,
+  bounded; strict on write, lenient on read. No in-process cache (principle IV); the per-item GETs of a detail
+  listing are the one multiplied cost (`docs/ROUNDTRIPS.md`). Git's own `description` file is not written.
 
 ## 5. Working rules
 

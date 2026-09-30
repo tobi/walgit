@@ -28,6 +28,9 @@ export type {
   OpEvent,
   RepoSummary,
   Me,
+  OwnerProfile,
+  RepoDetail,
+  RepoDescription,
 } from "../sdk/repos";
 import type { RefInfo, OpEvent, OpSpec, OpRecord, Tasks } from "../sdk/repos";
 export type { SettingsDescribe, SettingsValidation, SettingsHistory, SettingsField, Policy, PolicyValidation, PolicyDryRun, RepoSettings } from "../sdk/repos";
@@ -85,8 +88,12 @@ export const repoApi = (repo: string) => `/${enc(repo)}/api`;
 const enc = (s: string) => s.split("/").map(encodeURIComponent).join("/");
 
 export const api = {
-  owners: () => authRedirect(client.owners.list()),
-  repos: (owner: string) => authRedirect(client.owners.repos(owner)),
+  /** Owners with their profiles (display name, description) — the home page. */
+  owners: () => authRedirect(client.owners.listDetail()),
+  ownerProfile: (owner: string) => authRedirect(client.owners.profile.get(owner)),
+  /** One owner's repositories with their descriptions. */
+  repos: (owner: string) => authRedirect(client.owners.reposDetail(owner)),
+  description: (repo: string) => authRedirect(client.repo(repo).description.get()),
   refs: (repo: string) => authRedirect(client.repo(repo).refs()),
   refList: (repo: string, kind: "branches" | "tags", q: { q?: string; prefix?: string; after?: string; n?: number } = {}) =>
     authRedirect(kind === "branches" ? client.repo(repo).branches(q) : client.repo(repo).tags(q)),

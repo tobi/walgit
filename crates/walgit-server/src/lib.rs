@@ -43,6 +43,7 @@ pub mod instance;
 pub mod lfs;
 pub mod lfs_upstream;
 pub mod maintain;
+pub mod metadata;
 pub mod metrics;
 pub mod middleware;
 pub mod ops;
@@ -403,6 +404,15 @@ pub(crate) async fn dispatch_route(
                 policy::http_put(st, route, &headers, body.take().unwrap()).await
             }
             (&Method::DELETE, "policy") => policy::http_delete(st, route, &headers).await,
+            (&Method::GET, "description") => {
+                metadata::http_get_description(st, route, &headers).await
+            }
+            (&Method::PUT, "description") => {
+                metadata::http_put_description(st, route, &headers, body.take().unwrap()).await
+            }
+            (&Method::DELETE, "description") => {
+                metadata::http_delete_description(st, route, &headers).await
+            }
             (&Method::GET, "settings") => settings::http_get(st, route, &headers).await,
             (&Method::GET, "settings/effective") => {
                 settings::http_effective(st, route, &headers).await

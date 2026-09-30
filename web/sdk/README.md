@@ -43,11 +43,15 @@ const repos = createClient({ base: "https://git.example.com", token: process.env
 ```ts
 repos.me()                                   → { principal, write, anonymous }
 repos.owners.list()                          → ["acme", …]
+repos.owners.listDetail()                    → [{ name, display_name?, description? }, …]   (one store read per owner)
 repos.owners.repos("acme")                   → ["monorepo", …]
+repos.owners.reposDetail("acme")             → [{ name, description? }, …]                  (one store read per repo)
+repos.owners.profile.get("acme") / .put("acme", { display_name?, description? }) / .delete("acme")
+                                             → the owner's human-readable profile (writes: admin)
 repos.repo("acme/monorepo")                     → RepoClient (no request)
 
 r.get()                                      → { owner, name, full_name, head, branches, tags, clone_url, html_url, api_url }
-r.create()                                   → write permission
+r.create({ description? })                   → write permission (admin with a description)
 r.delete()                                   → admin permission
 r.refs()                                     → { head: {name, sha} | null }
 r.branches({ prefix, q, after, n })          → { refs: [{name, sha}], more }      (one page; tags likewise)
@@ -62,6 +66,7 @@ r.commit(sha)                                → { commit, stats, patch }
 r.overview()                                 → WAL overview (walgit-specific)
 r.tasks()  /  r.task(id, onEvent?)           → what the answering instance is doing; attach to a task stream
 r.ops.list()  /  r.ops.run(op, params, onEvent)
+r.description.get() / .put(text) / .delete() → { description? }: one line of plain text (writes: admin)
 r.policy.get() / .put(doc) / .delete()       → push policy (docs/POLICY.md)
 r.policy.validate(doc) / .dryRun(doc, last)  → validate or replay a policy against recent pushes
 r.settings.get() / .put(toml, message) / .delete()

@@ -201,6 +201,23 @@ export type Overview = Record<string, unknown> & {
   health: { status: "ok" | "degraded" | "error"; issues: string[]; deep: string };
   ops: { available: OpSpec[]; recent: OpRecord[] };
 };
+/** `GET /api/v1/owners/{owner}` and one row of `owners.listDetail()`: absent fields are omitted. */
+export interface OwnerProfile {
+  /** The owner id (the path segment). */
+  name: string;
+  display_name?: string;
+  description?: string;
+}
+/** One row of `owners.reposDetail(owner)`. */
+export interface RepoDetail {
+  /** Short repository name. */
+  name: string;
+  description?: string;
+}
+/** `GET /{owner}/{repo}/api/description`: `{}` when none is set. */
+export interface RepoDescription {
+  description?: string;
+}
 /** One `/policy` document (docs/POLICY.md). */
 export type Policy = Record<string, unknown>;
 
@@ -395,8 +412,26 @@ export class ReposClient {
   readonly owners = {
     /** Top-level namespaces. */
     list: (opts?: CallOptions) => this.json<string[]>("owners", opts),
+    /** Namespaces with their profiles (`?detail=1`: one store read per owner on the server). */
+    listDetail: (opts?: CallOptions) => this.json<OwnerProfile[]>("owners?detail=1", opts),
     /** Repositories under one owner (short names). */
     repos: (owner: string, opts?: CallOptions) => this.json<string[]>(`owners/${enc(owner)}/repos`, opts),
+    /** Repositories under one owner with their descriptions (`?detail=1`). */
+    reposDetail: (owner: string, opts?: CallOptions) => this.json<RepoDetail[]>(`owners/${enc(owner)}/repos?detail=1`, opts),
+    /** An owner's display name and description (read; `put`/`delete` need admin). */
+    profile: {
+      get: (owner: string, opts?: CallOptions) => this.json<OwnerProfile>(`owners/${enc(owner)}`, opts),
+      put: async (owner: string, profile: { display_name?: string; description?: string }, opts?: CallOptions): Promise<void> => {
+        await this.json<unknown>(`owners/${enc(owner)}`, opts, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(profile),
+        });
+      },
+      delete: async (owner: string, opts?: CallOptions): Promise<void> => {
+        await this.json<unknown>(`owners/${enc(owner)}`, opts, { method: "DELETE" });
+      },
+    },
   };
 
   /** A handle on `owner/name` (no request is made). */
@@ -599,9 +634,9 @@ export class RepoClient {
   get(opts?: CallOptions) {
     return this.client.json<RepoSummary>(this.p, opts);
   }
-  /** Create the repository (write permission). */
-  async create(opts?: CallOptions): Promise<void> {
-    await this.client.json<unknown>(this.p, opts, { method: "PUT" });
+  /** Create the repository (write permission; admin when `init.description` is given). */
+  async create(init: { description?: string } = {}, opts?: CallOptions): Promise<void> {
+    await this.client.json<unknown>(`${this.p}${qs(init)}`, opts, { method: "PUT" });
   }
   /** Delete the repository (admin permission). Irreversible. */
   async delete(opts?: CallOptions): Promise<void> {
@@ -682,6 +717,22 @@ export class RepoClient {
     /** Start (or attach to) a maintenance op and stream its events until done/error. */
     run: async (op: string, params: Record<string, string> = {}, onEvent: (ev: OpEvent) => void, opts?: CallOptions): Promise<void> => {
       await this.client.sse(`${this.p}/ops/${enc(op)}${qs(params)}`, { method: "POST" }, (ev) => onEvent(JSON.parse(ev.data) as OpEvent), opts);
+    },
+  };
+
+  readonly description = {
+    /** The human-readable description; `{}` when none is set. */
+    get: (opts?: CallOptions) => this.client.json<RepoDescription>(`${this.p}/description`, opts),
+    /** Replace it (admin): one line of plain text, at most 512 characters. */
+    put: async (description: string, opts?: CallOptions): Promise<void> => {
+      await this.client.json<unknown>(`${this.p}/description`, opts, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ description }),
+      });
+    },
+    delete: async (opts?: CallOptions): Promise<void> => {
+      await this.client.json<unknown>(`${this.p}/description`, opts, { method: "DELETE" });
     },
   };
 

@@ -248,6 +248,17 @@ h2 {
   align-items: center;
   gap: 6px;
 }
+.repo-desc {
+  margin: 4px 0 0;
+}
+/* The id beside a human name (owner display name, repo header): secondary, never hidden. */
+.id-aside {
+  margin-left: 8px;
+  font-weight: 400;
+}
+.page-lede {
+  margin: -8px 0 16px;
+}
 .tabs {
   display: flex;
   gap: 8px;

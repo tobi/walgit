@@ -47,6 +47,19 @@ pub mod keys {
     pub fn policy_key(owner: &str, name: &str) -> String {
         format!("{}{POLICY}", repo_prefix(owner, name))
     }
+    /// Per-repo human description (JSON). Not on the WAL; overwritten, never on a git path.
+    pub const DESCRIPTION: &str = "description.json";
+
+    pub fn description_key(owner: &str, name: &str) -> String {
+        format!("{}{DESCRIPTION}", repo_prefix(owner, name))
+    }
+    /// Bucket-root prefix of owner profiles (not under `repos/`: that prefix holds
+    /// repositories only, and its delimited listing is how repositories are found).
+    pub const OWNERS_DIR: &str = "owners/";
+    /// `owners/<owner>/profile.json` — the owner's display name and description (JSON).
+    pub fn owner_profile_key(owner: &str) -> String {
+        format!("{OWNERS_DIR}{owner}/profile.json")
+    }
 
     /// `log/<first_seq:016x>.pb`
     pub fn log_segment_key(first_seq: u64) -> String {
@@ -195,6 +208,11 @@ mod tests {
             "checkpoints/0000000000000001/checkpoint.pb"
         );
         assert_eq!(keys::lfs_key("abcdef"), "lfs/objects/ab/cd/abcdef");
+        assert_eq!(
+            keys::description_key("acme", "mono"),
+            "repos/acme/mono/description.json"
+        );
+        assert_eq!(keys::owner_profile_key("acme"), "owners/acme/profile.json");
         assert!(!keys::lfs_oid_ok("ab"));
         assert!(!keys::lfs_oid_ok("abcdef"));
         assert!(keys::lfs_oid_ok(&"a".repeat(64)));

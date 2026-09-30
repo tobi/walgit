@@ -13,7 +13,7 @@ walgit internals except the optional `overview`/`ops`/`tasks` endpoints.
 ```
 https://git.example.com/{owner}/{repo}/api/…           bearer lane   a bearer token or the same-origin session cookie
 https://git.example.com/{owner}/{repo}/api-browser/…   browser lane  credentials: "include" (other origins; the cross-origin cookie lane)
-https://git.example.com/api/v1                         non-repo      discovery, me, authenticate, owners (+ /api-browser/v1/me|authenticate for the browser lane)
+https://git.example.com/api/v1                         non-repo      discovery, me, authenticate, owners (+ /api-browser/v1/me|authenticate|owners* for the browser lane)
 https://git.example.com/repos.js                       the SDK       window.repos — permanent URL on every host
 ```
 Lanes differ by **credential handling** and CORS (D27): the bearer is a walgit access token (`/_auth/tokens`), a
@@ -31,7 +31,7 @@ resolve-then-fetch-by-sha flow of §2a).
 | Lane | Path | Who | Credentials |
 |---|---|---|---|
 | **bearer / same-origin** | `/{owner}/{repo}/api/…` (+ `/api/v1/…` for non-repo) | git tooling, CI, agents, scripts, and the bundled same-origin UI | `Authorization: Bearer <token>`, or the same-origin session cookie |
-| **browser** | `/{owner}/{repo}/api-browser/…` (+ `/api-browser/v1/me\|authenticate`) | other allowed origins loading `repos.js` | `fetch(…, {credentials: "include"})`; the session cookie from walgit's own sign-in (`/_auth/login`) |
+| **browser** | `/{owner}/{repo}/api-browser/…` (+ `/api-browser/v1/me\|authenticate\|owners*`) | other allowed origins loading `repos.js` | `fetch(…, {credentials: "include"})`; the session cookie from walgit's own sign-in (`/_auth/login`) |
 
 **The repository prefix comes first on every lane** — it is the only routing key (D26: one edge rule sends
 `/acme/monorepo*` to its host). Both lanes hit the same handlers; they differ by credential handling and CORS,
@@ -100,7 +100,7 @@ falls in the first:
 | Class | URLs | Headers |
 |---|---|---|
 | **Sha-addressed, immutable** | `tree/{sha}/…`, `blob/{sha}/…`, `commits?ref={sha}`, `commit/{sha}` where `{sha}` is a full 40-hex sha | `Cache-Control: private, max-age=31536000, immutable`. Content can never change; browsers never re-ask. |
-| **Ref-dependent** | `owners`, `owners/{o}`, `refs`, `refs/branches`, `refs/tags`, `resolve/…`, and any tree/blob/commits/commit addressed by a *name* | `Cache-Control: private, max-age=0, stale-while-revalidate=60` and, where there is a natural one, `ETag: "<resolved sha>"` with `If-None-Match` → `304`. |
+| **Ref-dependent** | `owners`, `owners/{o}`, `owners/{o}/repos` (with or without `?detail=1`), `description`, `refs`, `refs/branches`, `refs/tags`, `resolve/…`, and any tree/blob/commits/commit addressed by a *name* | `Cache-Control: private, max-age=0, stale-while-revalidate=60` and, where there is a natural one, `ETag: "<resolved sha>"` with `If-None-Match` → `304`. The metadata answers (`?detail=1` listings, `owners/{o}`, `description`) have no natural version and carry a digest of their body as `ETag`. |
 
 Flow per navigation: one ref-dependent call (`resolve`, SWR — paints
 instantly from cache, revalidates in the background; a `304` costs the
@@ -218,7 +218,7 @@ Responses echo `ref`, `sha` and `path` so the client never re-splits.
 
 ## 4. Endpoints
 
-### `GET /api/v1/owners`
+### `GET /api/v1/owners[?detail=1]`
 
 Top-level namespaces.
 
@@ -230,7 +230,19 @@ Sorted, `[]` if none. Must come from the authoritative repo list (walgit
 lists the object store, not local disk, so a cold node sees everything).
 Cache: SWR (§2a).
 
-### `GET /api/v1/owners/{owner}/repos`
+`?detail=1` answers the same owners, same order, as objects carrying each owner's profile
+(below); a field is absent when unset, never `null`:
+
+```json
+[{ "name": "3f2a9c1e", "display_name": "Payments", "description": "Ledger and settlement" }, { "name": "jane" }]
+```
+
+Owners stay **implicit** — derived from repository ids; a profile does not create one, and a
+profile whose owner has no repository is not listed. Cost: one small store read per listed owner,
+issued concurrently (`docs/ROUNDTRIPS.md`); the plain form costs nothing extra. Cache: SWR +
+`ETag` (body digest).
+
+### `GET /api/v1/owners/{owner}/repos[?detail=1]`
 
 Repositories under one owner, short names only.
 
@@ -239,6 +251,27 @@ Repositories under one owner, short names only.
 ```
 
 Sorted, `[]` for an unknown/empty owner (200, not 404). Cache: SWR.
+`?detail=1` → `[{ "name": "hello", "description": "…" }, { "name": "walgit" }]` (one store read
+per repository; SWR + body-digest `ETag`).
+
+### `GET|PUT|DELETE /api/v1/owners/{owner}`
+
+The owner's **profile**: the human-readable name for an owner whose id is opaque.
+
+```json
+{ "name": "3f2a9c1e", "display_name": "Payments", "description": "Ledger and settlement" }
+```
+
+`GET` (read) answers 200 for any valid owner name, with or without repositories or a profile
+(`{"name": …}` alone when none is set); `400` for a name no repository could have. `PUT` (admin)
+body `{"display_name"?, "description"?}` — at least one; `name` is accepted only when it equals the
+path (so a client can `PUT` back what it got; the id never changes) → `204`. `DELETE` (admin) →
+`204`. Each field is one line of plain text (no control characters, trimmed, non-empty):
+`display_name` ≤ 100, `description` ≤ 512 characters; unknown keys and non-strings are `400`,
+a body above 8 KiB `413`. Stored at `owners/<owner>/profile.json` in the bucket (not on the WAL).
+Writing a profile for an owner without repositories is allowed (an operator can name an owner
+before its first repository); it is listed once a repository exists. Cache: SWR + body-digest
+`ETag`. Also on the browser lane (`/api-browser/v1/owners/{owner}`, like every `owners*` route).
 
 ### `GET /api/v1/me`
 
@@ -262,7 +295,19 @@ Ref-level summary: head (`null` when unborn), O(1) ref counts from the ref
 index, URLs. `404` for an unknown repo. Cache: SWR + `ETag: "<head sha>"`.
 `PUT` creates the repository (write permission; `201`/`200`), `DELETE`
 removes it (admin permission) — the same handlers as `PUT|DELETE /{owner}/{repo}`.
-`GET|PUT|DELETE …/policy` is the push policy document (`docs/POLICY.md`).
+`PUT …?object_format=sha1|sha256&description=…` (percent-encoded): `description` is validated
+before anything is created (`400`, nothing created) and needs **admin**, like every description
+write — create alone stays a write operation. `GET|PUT|DELETE …/policy` is the push policy
+document (`docs/POLICY.md`).
+
+`GET|PUT|DELETE /{o}/{r}/api/description` is the repository's **description**
+(`repos/<o>/<r>/description.json`, not on the WAL, never read by git): `GET` (read) →
+`{"description": "…"}`, or `{}` when none is set; `404` for an unknown repository; SWR +
+body-digest `ETag`. `PUT` (admin) body `{"description": "…"}` → `204`; `DELETE` (admin) → `204`.
+The same rules as the owner profile's fields: one line of plain text, ≤ 512 characters, unknown
+keys `400`, body > 8 KiB `413`. Deleting the repository deletes it. Git's own `description` file
+is not written: the local repository is a disposable per-instance cache and nothing git serves
+reads it. CLI: `walgit repo describe <owner/name> [--set TEXT | --clear]`.
 
 `GET|PUT|DELETE /{o}/{r}/api/settings` (D24, 2026-08-21) is the repository's **settings in the WAL**: a TOML document
 restricted to `[refs]`, `[packfile_uri]`, `[maintenance]`, `[packs]` and `[upstream]`, merged over the
@@ -504,7 +549,8 @@ redelivers). Never cached, never served to the SPA.
   after a push is acknowledged, the next API call (any node) reflects it.
 - Writes on the JSON surface need a token with the matching permission:
   write for `PUT /{o}/{r}/api` (create) and `POST …/ops/{op}`, admin for
-  `DELETE /{o}/{r}/api`, `PUT|DELETE …/policy` and `PUT|DELETE …/settings`
+  `DELETE /{o}/{r}/api`, `PUT|DELETE …/policy`, `PUT|DELETE …/description` (and a create
+  carrying `?description=`), `PUT|DELETE /api/v1/owners/{o}` and `PUT|DELETE …/settings`
   (D24: write is push, not admin). Content moves over git
   (`git-receive-pack`) and LFS, never through JSON.
 
@@ -515,6 +561,10 @@ GET /api/v1                                     → 200 {name, version:1, base, 
 GET /api/v1/me                                  → 200 {principal,write,anonymous} | 401; no-store
 GET /api/v1/owners                              → 200 [..]   ([] when empty)
 GET /api/v1/owners/nobody/repos                 → 200 []
+GET /api/v1/owners?detail=1                     → 200 [{name, display_name?, description?}]; SWR + ETag
+GET /api/v1/owners/o/repos?detail=1             → 200 [{name, description?}]; SWR + ETag
+GET /api/v1/owners/o                            → 200 {name, display_name?, description?}; PUT|DELETE admin → 204
+GET /o/r/api/description                        → 200 {description?}; SWR + ETag; PUT|DELETE admin → 204
 GET /o/r/api                                    → 200 {owner,name,full_name,head,branches,tags,clone_url,html_url,api_url}; SWR + ETag "<head sha>"
 GET /o/r/api-browser/refs                           → same handlers (browser lane)
 OPTIONS /api/v1/… (Origin ∈ cors_origins)       → 204 + Access-Control-Allow-{Origin,Credentials,Methods,Headers}

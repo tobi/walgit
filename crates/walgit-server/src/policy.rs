@@ -700,7 +700,7 @@ pub async fn http_delete(
     Ok((StatusCode::NO_CONTENT, "").into_response())
 }
 
-async fn ensure_repo(st: &AppState, route: &RepoRoute) -> Result<(), ApiError> {
+pub(crate) async fn ensure_repo(st: &AppState, route: &RepoRoute) -> Result<(), ApiError> {
     st.registry.open(&route.id).await.map(|_| ()).map_err(|e| {
         if matches!(e, walgit_wal::WalError::NotFound) {
             ApiError::NotFound(format!("{}", route.id))

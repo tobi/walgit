@@ -236,6 +236,17 @@ enum RepoAction {
         /// `owner/name`.
         repo: String,
     },
+    /// Print, set or clear the human-readable description (`description.json` in the bucket).
+    Describe {
+        /// `owner/name`.
+        repo: String,
+        /// Replace the description (one line of plain text, at most 512 characters).
+        #[arg(long, conflicts_with = "clear")]
+        set: Option<String>,
+        /// Remove the description.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Per-repo push policy (`policy.json` in the bucket).
     Policy {
         #[command(subcommand)]

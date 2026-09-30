@@ -9,14 +9,28 @@ use crate::AppState;
 use crate::error::ApiError;
 use crate::repo::RepoRoute;
 
-/// `PUT /{owner}/{repo}` — create repo. 201 on new, 409 if it exists.
+/// `PUT /{owner}/{repo}[?object_format=sha1|sha256][&description=…]` — create repo. 201 on
+/// new, 409 if it exists. `description` (percent-encoded, `crate::metadata` rules) is
+/// validated before anything is created and written once the create succeeded. It needs
+/// **admin**, like every other description write: a create is not proof of a *new*
+/// repository (`Registry::create` answers `Ok` with the cached handle when this instance
+/// already has the repository open), so write permission alone must never be able to
+/// relabel an existing one. Without `description`, create stays a write operation.
 pub async fn create(
     st: &AppState,
     route: &RepoRoute,
     headers: &HeaderMap,
     query: &str,
 ) -> Result<Response, ApiError> {
-    let _principal = st.auth.require_write(headers).await.map_err(auth_err)?;
+    let labelled = query
+        .split('&')
+        .any(|part| part.starts_with("description="));
+    let _principal = if labelled {
+        st.auth.require_admin(headers).await
+    } else {
+        st.auth.require_write(headers).await
+    }
+    .map_err(auth_err)?;
     let format = match query
         .split('&')
         .find_map(|part| part.strip_prefix("object_format="))
@@ -30,8 +44,36 @@ pub async fn create(
         }
         None => ObjectFormat::from(st.cfg.git.object_format),
     };
+    let description = query
+        .split('&')
+        .find_map(|part| part.strip_prefix("description="))
+        .map(|v| {
+            crate::metadata::clean_text(
+                "description",
+                &crate::settings::percent_decode(v),
+                crate::metadata::DESCRIPTION_MAX_CHARS,
+            )
+            .map_err(ApiError::BadRequest)
+        })
+        .transpose()?;
     match st.registry.create(&route.id, format).await {
-        Ok(_h) => Ok((StatusCode::CREATED, "created").into_response()),
+        Ok(_h) => {
+            if let Some(description) = description {
+                let doc = crate::metadata::RepoDescription {
+                    description: Some(description),
+                };
+                // The repository exists now; say so truthfully if its label did not land.
+                crate::metadata::save_description(&st.store, &route.id, &doc)
+                    .await
+                    .map_err(|e| {
+                        ApiError::Internal(format!(
+                            "repository created, description not saved ({e}); PUT {}/api/description to retry",
+                            route.id
+                        ))
+                    })?;
+            }
+            Ok((StatusCode::CREATED, "created").into_response())
+        }
         Err(walgit_wal::WalError::AlreadyExists) => {
             Ok((StatusCode::CONFLICT, "already exists").into_response())
         }

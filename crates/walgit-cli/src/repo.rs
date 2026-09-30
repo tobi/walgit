@@ -1,4 +1,4 @@
-//! `walgit repo create|list|info` — repository management.
+//! `walgit repo create|list|info|describe` — repository management.
 
 use std::sync::Arc;
 
@@ -90,6 +90,7 @@ pub async fn run(action: RepoAction, cfg: &Arc<Config>) -> Result<()> {
                 );
             }
         }
+        RepoAction::Describe { repo, set, clear } => describe(&repo, set, clear, &store).await?,
         RepoAction::Policy { action } => policy(action, &store).await?,
         RepoAction::Settings { .. } => unreachable!(),
     }
@@ -115,6 +116,44 @@ async fn policy(action: PolicyAction, store: &walgit_store::DynStore) -> Result<
             let id = repo_id(&repo)?;
             policy::clear(store, &id).await?;
             info!(repo = %id, "policy cleared");
+        }
+    }
+    Ok(())
+}
+
+/// Straight against the bucket, like `policy`: the host that runs this is trusted with
+/// the store. Only an existing repository is labelled (one manifest HEAD), so a typo does
+/// not leave a stray object under a prefix nothing lists.
+async fn describe(
+    repo: &str,
+    set: Option<String>,
+    clear: bool,
+    store: &walgit_store::DynStore,
+) -> Result<()> {
+    use walgit_server::metadata;
+    let id = repo_id(repo)?;
+    if set.is_some() || clear {
+        let manifest = format!("{}{}", id.store_prefix(), walgit_proto::keys::MANIFEST);
+        if store.head(&manifest).await?.is_none() {
+            bail!("no repository {id}");
+        }
+    }
+    if let Some(text) = set {
+        let description =
+            metadata::clean_text("description", &text, metadata::DESCRIPTION_MAX_CHARS)
+                .map_err(anyhow::Error::msg)?;
+        let doc = metadata::RepoDescription {
+            description: Some(description),
+        };
+        metadata::save_description(store, &id, &doc).await?;
+        info!(repo = %id, "description saved");
+    } else if clear {
+        metadata::clear_description(store, &id).await?;
+        info!(repo = %id, "description cleared");
+    } else {
+        match metadata::load_description(store, &id).await?.description {
+            Some(d) => println!("{d}"),
+            None => println!("(none)"),
         }
     }
     Ok(())

@@ -9,7 +9,8 @@
 //! Same handlers; lanes differ by credential handling and CORS, never by a
 //! rewrite. Non-repo: `/api/v1` (discovery), `/api/v1/me`, `/api/v1/authenticate`
 //! (+ the `/api-browser/v1/me|authenticate` pair the SDK's popup uses),
-//! `/api/v1/owners*`. The SDK (`repos.js`, `web/sdk/`) maps this one to one.
+//! `/api[-browser]/v1/owners*` (listings, detail listings, owner profiles). The SDK
+//! (`repos.js`, `web/sdk/`) maps this one to one.
 
 use std::sync::Arc;
 
@@ -42,13 +43,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(&format!("{API_V1}/me"), get(me))
         .route(&format!("{API_V1}/authenticate"), get(authenticate))
         .route(&format!("{API_BROWSER}/v1/me"), get(me))
-        .route(&format!("{API_BROWSER}/v1/authenticate"), get(authenticate))
-        .route(&format!("{API_V1}/owners"), get(crate::web::api::owners))
-        .route(
-            &format!("{API_V1}/owners/{{owner}}/repos"),
-            get(crate::web::api::owner_repos),
-        );
-    // Repo admin under both lanes: summary/create/delete, policy, settings.
+        .route(&format!("{API_BROWSER}/v1/authenticate"), get(authenticate));
+    // Owners on both non-repo lanes: the SDK addresses `owners*` as `/api/v1/…` (bearer,
+    // same-origin) or `/api-browser/v1/…` (another origin, `credentials: "include"`).
+    for base in [API_V1.to_string(), format!("{API_BROWSER}/v1")] {
+        r = r
+            .route(&format!("{base}/owners"), get(crate::web::api::owners))
+            .route(
+                &format!("{base}/owners/{{owner}}"),
+                get(owner_profile).put(owner_profile).delete(owner_profile),
+            )
+            .route(
+                &format!("{base}/owners/{{owner}}/repos"),
+                get(crate::web::api::owner_repos),
+            );
+    }
+    // Repo admin under both lanes: summary/create/delete, policy, description, settings.
     for base in crate::web::api::REPO_API_BASES {
         r = r
             .route(base, get(repo_summary).put(repo_admin).delete(repo_admin))
@@ -57,6 +67,10 @@ pub fn router(state: Arc<AppState>) -> Router {
                 get(repo_admin).put(repo_admin).delete(repo_admin),
             )
             .route(&format!("{base}/policy/{{sub}}"), post(repo_admin_sub))
+            .route(
+                &format!("{base}/description"),
+                get(repo_admin).put(repo_admin).delete(repo_admin),
+            )
             .route(
                 &format!("{base}/settings"),
                 get(repo_admin).put(repo_admin).delete(repo_admin),
@@ -225,8 +239,9 @@ async fn discovery(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         },
         endpoints: vec![
             "GET  /api/v1/me",
-            "GET  /api/v1/owners",
-            "GET  /api/v1/owners/{owner}/repos",
+            "GET  /api/v1/owners[?detail=1]",
+            "GET|PUT|DELETE /api/v1/owners/{owner}   (profile: display_name, description)",
+            "GET  /api/v1/owners/{owner}/repos[?detail=1]",
             "GET  /api/v1/authenticate   (also /api-browser/v1/me|authenticate for the browser lane)",
             "-- repository routes live under the repository (D27): /{owner}/{repo}/api/… (bearer/session) and /{owner}/{repo}/api-browser/… (browser lane) --",
             "GET|PUT|DELETE /{owner}/{repo}/api",
@@ -241,6 +256,7 @@ async fn discovery(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respo
             "GET  /{owner}/{repo}/api/tasks[/{id}]",
             "GET  /{owner}/{repo}/api/ops",
             "POST /{owner}/{repo}/api/ops/{op}",
+            "GET|PUT|DELETE /{owner}/{repo}/api/description",
             "GET|PUT|DELETE /{owner}/{repo}/api/policy",
             "POST /{owner}/{repo}/api/policy/validate | dry-run?last=N",
             "GET|PUT|DELETE /{owner}/{repo}/api/settings",
@@ -364,6 +380,24 @@ async fn repo_summary(
         },
     )
     .await
+}
+
+/// `GET|PUT|DELETE /api[-browser]/v1/owners/{owner}` — the owner's profile
+/// (`crate::metadata`): read for GET, admin for PUT/DELETE.
+async fn owner_profile(
+    State(st): State<Arc<AppState>>,
+    Path(owner): Path<String>,
+    req: Request<Body>,
+) -> Response {
+    let headers = req.headers().clone();
+    let result = match *req.method() {
+        Method::PUT => {
+            crate::metadata::http_put_profile(&st, &owner, &headers, req.into_body()).await
+        }
+        Method::DELETE => crate::metadata::http_delete_profile(&st, &owner, &headers).await,
+        _ => crate::metadata::http_get_profile(&st, &owner, &headers).await,
+    };
+    result.unwrap_or_else(IntoResponse::into_response)
 }
 
 /// `GET|POST /{o}/{r}/api[-browser]/settings/{sub}` (effective | history | validate) and `POST …/policy/{sub}`.

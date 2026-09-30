@@ -90,8 +90,9 @@ export function ApiPage() {
           <tbody>
             <Row path="/api/v1" desc={<>Discovery: <code>{`{base, browser_base, sdk, auth, endpoints}`}</code>.</>} cache="—" />
             <Row path="/api/v1/me" desc={<><code>{`{principal, write, anonymous}`}</code> — who you are on this host.</>} cache="no-store" />
-            <Row path="/api/v1/owners" desc="Owners (namespaces), sorted." cache="SWR" />
-            <Row path="/api/v1/owners/{owner}/repos" desc="Repository names under one owner." cache="SWR" />
+            <Row path="/api/v1/owners[?detail=1]" desc={<>Owners (namespaces), sorted; <code>?detail=1</code>: <code>{`[{name,display_name?,description?}]`}</code>.</>} cache="SWR (detail: + ETag)" />
+            <Row path="/api/v1/owners/{owner}" desc={<>Owner profile <code>{`{name,display_name?,description?}`}</code> (<code>GET</code> read; <code>PUT</code>/<code>DELETE</code> admin).</>} cache="SWR + ETag" />
+            <Row path="/api/v1/owners/{owner}/repos[?detail=1]" desc={<>Repository names under one owner; <code>?detail=1</code>: <code>{`[{name,description?}]`}</code>.</>} cache="SWR (detail: + ETag)" />
             <Row
               path={`/${r}/api`}
               desc={<>Repo summary: <code>{`{owner,name,full_name,head,branches,tags,clone_url,html_url,api_url}`}</code> (O(1) ref counts). <code>PUT</code> creates (write), <code>DELETE</code> removes (admin).</>}
@@ -128,6 +129,7 @@ export function ApiPage() {
               desc={<><code>{`{commit,stats:[{path,additions,deletions}],patch}`}</code> — unified diff against the first parent; any revision accepted.</>}
               cache="full sha → immutable · else SWR + ETag"
             />
+            <Row path={`/${r}/api/description`} desc={<><code>{`{description?}`}</code> — one line of plain text (<code>GET</code> read; <code>PUT</code>/<code>DELETE</code> admin).</>} cache="SWR + ETag" />
             <Row path={`/${r}/api/policy`} desc={<>Push policy document (<code>GET</code> read; <code>PUT</code>/<code>DELETE</code> admin).</>} cache="no-store" />
             <Row
               path={`/${r}/api/settings`}

@@ -631,3 +631,391 @@ async fn policy_and_settings_writes_require_admin() -> TestResult {
     assert_eq!(st, 200, "{text}");
     Ok(())
 }
+
+/// Human-readable metadata (`crate::metadata`): a repository's description and an owner's
+/// profile — read with read, written only with admin (also at create), strict on write,
+/// absent fields omitted, and the owner listings' `?detail=1` beside unchanged plain shapes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descriptions_and_owner_profiles() -> TestResult {
+    use reqwest::Method;
+    async fn send(
+        server: &Server,
+        method: Method,
+        path: &str,
+        auth: &[(&str, &str)],
+        body: String,
+    ) -> anyhow::Result<(reqwest::StatusCode, String)> {
+        let mut r = reqwest::Client::new()
+            .request(method, format!("{}{path}", server.base_url))
+            .header("Accept", "application/json")
+            .body(body);
+        for (k, v) in auth {
+            r = r.header(*k, *v);
+        }
+        let resp = r.send().await?;
+        let status = resp.status();
+        Ok((status, resp.text().await?))
+    }
+    async fn get_json(server: &Server, path: &str, auth: &[(&str, &str)]) -> anyhow::Result<Value> {
+        let (st, text, _) = req(server, Method::GET, path, auth).await?;
+        anyhow::ensure!(st == 200, "GET {path} -> {st}: {text}");
+        Ok(serde_json::from_str(&text)?)
+    }
+    let token = |principal: &str, write: bool, admin: bool| walgit_config::StaticToken {
+        principal: principal.into(),
+        token: format!("{principal}-token"),
+        token_env: None,
+        write,
+        admin,
+    };
+    let tokens = vec![
+        token("reader", false, false),
+        token("writer", true, false),
+        token("admin", true, true),
+    ];
+    let server = Server::start_with_tweak(move |c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = false;
+        c.server.auth.tokens = tokens;
+    })
+    .await?;
+    let reader = [("Authorization", "Bearer reader-token")];
+    let writer = [("Authorization", "Bearer writer-token")];
+    let admin = [("Authorization", "Bearer admin-token")];
+    for repo in ["u1/alpha", "u1/beta", "u2/gamma"] {
+        assert_eq!(
+            req(&server, Method::PUT, &format!("/{repo}/api"), &writer)
+                .await?
+                .0,
+            201
+        );
+    }
+
+    // ---- repository description -------------------------------------------------------
+    assert_eq!(
+        req(&server, Method::GET, "/u1/alpha/api/description", &[])
+            .await?
+            .0,
+        401,
+        "reads need a credential"
+    );
+    assert_eq!(
+        get_json(&server, "/u1/alpha/api/description", &reader).await?,
+        serde_json::json!({})
+    );
+    let doc = r#"{"description":"  Alpha service  "}"#.to_string();
+    for who in [&reader, &writer] {
+        let (st, text) = send(
+            &server,
+            Method::PUT,
+            "/u1/alpha/api/description",
+            who,
+            doc.clone(),
+        )
+        .await?;
+        assert_eq!(st, 403, "{text}");
+        assert_eq!(
+            req(&server, Method::DELETE, "/u1/alpha/api/description", who)
+                .await?
+                .0,
+            403
+        );
+    }
+    let (st, text) = send(
+        &server,
+        Method::PUT,
+        "/u1/alpha/api/description",
+        &admin,
+        doc.clone(),
+    )
+    .await?;
+    assert_eq!(st, 204, "{text}");
+    let (st, text, h) = req(
+        &server,
+        Method::GET,
+        "/u1/alpha/api-browser/description",
+        &reader,
+    )
+    .await?;
+    assert_eq!(st, 200, "browser lane: {text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text)?,
+        serde_json::json!({"description": "Alpha service"})
+    );
+    let etag = hdr(&h, "etag");
+    assert!(etag.starts_with('"'), "digest ETag: {etag:?}");
+    assert!(hdr(&h, "cache-control").contains("stale-while-revalidate"));
+    let revalidate = [reader[0], ("If-None-Match", etag.as_str())];
+    assert_eq!(
+        req(
+            &server,
+            Method::GET,
+            "/u1/alpha/api/description",
+            &revalidate
+        )
+        .await?
+        .0,
+        304
+    );
+
+    let too_long = format!(r#"{{"description":"{}"}}"#, "x".repeat(513));
+    for bad in [
+        too_long,
+        r#"{"description":"two\nlines"}"#.to_string(),
+        r#"{"description":""}"#.to_string(),
+        r#"{"descripton":"typo"}"#.to_string(),
+        r#"{"description":5}"#.to_string(),
+    ] {
+        let (st, text) = send(
+            &server,
+            Method::PUT,
+            "/u1/alpha/api/description",
+            &admin,
+            bad.clone(),
+        )
+        .await?;
+        assert_eq!(st, 400, "{bad}: {text}");
+    }
+    let (st, _) = send(
+        &server,
+        Method::PUT,
+        "/u1/alpha/api/description",
+        &admin,
+        " ".repeat(9000),
+    )
+    .await?;
+    assert_eq!(st, 413, "body above the document bound");
+    let (st, _) = send(
+        &server,
+        Method::PUT,
+        "/u1/nope/api/description",
+        &admin,
+        doc.clone(),
+    )
+    .await?;
+    assert_eq!(
+        st, 404,
+        "no description for a repository that does not exist"
+    );
+    assert_eq!(
+        req(&server, Method::GET, "/u1/nope/api/description", &reader)
+            .await?
+            .0,
+        404
+    );
+
+    // ---- create with a description: admin only, validated before anything exists ---------
+    assert_eq!(
+        req(
+            &server,
+            Method::PUT,
+            "/u2/delta/api?description=Delta%20svc",
+            &writer
+        )
+        .await?
+        .0,
+        403,
+        "write permission creates, but does not label"
+    );
+    assert_eq!(
+        req(&server, Method::GET, "/u2/delta/api", &reader).await?.0,
+        404,
+        "refused create made nothing"
+    );
+    assert_eq!(
+        req(
+            &server,
+            Method::PUT,
+            "/u2/delta/api?object_format=sha1&description=Delta%20svc",
+            &admin
+        )
+        .await?
+        .0,
+        201
+    );
+    assert_eq!(
+        get_json(&server, "/u2/delta/api/description", &reader).await?,
+        serde_json::json!({"description": "Delta svc"})
+    );
+    assert_eq!(
+        req(
+            &server,
+            Method::PUT,
+            "/u2/eps/api?description=a%0Ab",
+            &admin
+        )
+        .await?
+        .0,
+        400
+    );
+    assert_eq!(
+        req(&server, Method::GET, "/u2/eps/api", &reader).await?.0,
+        404,
+        "invalid label, no repo"
+    );
+
+    // ---- owner profile -------------------------------------------------------------------
+    assert_eq!(
+        get_json(&server, "/api/v1/owners/u1", &reader).await?,
+        serde_json::json!({"name": "u1"})
+    );
+    let profile = r#"{"display_name":"Team One","description":"Owns alpha and beta"}"#.to_string();
+    for who in [&reader, &writer] {
+        let (st, _) = send(
+            &server,
+            Method::PUT,
+            "/api/v1/owners/u1",
+            who,
+            profile.clone(),
+        )
+        .await?;
+        assert_eq!(st, 403);
+        assert_eq!(
+            req(&server, Method::DELETE, "/api/v1/owners/u1", who)
+                .await?
+                .0,
+            403
+        );
+    }
+    let (st, text) = send(
+        &server,
+        Method::PUT,
+        "/api/v1/owners/u1",
+        &admin,
+        profile.clone(),
+    )
+    .await?;
+    assert_eq!(st, 204, "{text}");
+    let want = serde_json::json!({"name": "u1", "display_name": "Team One", "description": "Owns alpha and beta"});
+    assert_eq!(get_json(&server, "/api/v1/owners/u1", &reader).await?, want);
+    assert_eq!(
+        get_json(&server, "/api-browser/v1/owners/u1", &reader).await?,
+        want,
+        "browser lane"
+    );
+    for bad in [
+        r"{}",
+        r#"{"displayName":"x"}"#,
+        r#"{"name":"u2","display_name":"x"}"#,
+    ] {
+        let (st, text) = send(
+            &server,
+            Method::PUT,
+            "/api/v1/owners/u1",
+            &admin,
+            bad.to_string(),
+        )
+        .await?;
+        assert_eq!(st, 400, "{bad}: {text}");
+    }
+    assert_eq!(
+        req(&server, Method::GET, "/api/v1/owners/.hidden", &reader)
+            .await?
+            .0,
+        400
+    );
+    // A profile does not create an owner: written, but not listed until a repository exists.
+    let (st, _) = send(
+        &server,
+        Method::PUT,
+        "/api/v1/owners/ghost",
+        &admin,
+        r#"{"display_name":"Ghost"}"#.into(),
+    )
+    .await?;
+    assert_eq!(st, 204);
+
+    // ---- listings: plain shapes unchanged, detail beside them ------------------------------
+    assert_eq!(
+        get_json(&server, "/api/v1/owners", &reader).await?,
+        serde_json::json!(["u1", "u2"])
+    );
+    let (st, text, h) = req(&server, Method::GET, "/api/v1/owners?detail=1", &reader).await?;
+    assert_eq!(st, 200, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text)?,
+        serde_json::json!([
+            {"name": "u1", "display_name": "Team One", "description": "Owns alpha and beta"},
+            {"name": "u2"},
+        ])
+    );
+    let etag = hdr(&h, "etag");
+    let revalidate = [reader[0], ("If-None-Match", etag.as_str())];
+    assert_eq!(
+        req(&server, Method::GET, "/api/v1/owners?detail=1", &revalidate)
+            .await?
+            .0,
+        304
+    );
+    assert_eq!(
+        get_json(&server, "/api-browser/v1/owners?detail=1", &reader)
+            .await?
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "browser lane"
+    );
+    assert_eq!(
+        get_json(&server, "/api/v1/owners/u1/repos", &reader).await?,
+        serde_json::json!(["alpha", "beta"])
+    );
+    assert_eq!(
+        get_json(&server, "/api/v1/owners/u1/repos?detail=1", &reader).await?,
+        serde_json::json!([{"name": "alpha", "description": "Alpha service"}, {"name": "beta"}])
+    );
+    assert_eq!(
+        get_json(&server, "/api/v1/owners/nobody/repos?detail=1", &reader).await?,
+        serde_json::json!([])
+    );
+    assert_eq!(
+        req(&server, Method::GET, "/api/v1/owners?detail=yes", &reader)
+            .await?
+            .0,
+        400
+    );
+
+    // ---- clear, and a deleted repository takes its description with it ---------------------
+    assert_eq!(
+        req(&server, Method::DELETE, "/api/v1/owners/u1", &admin)
+            .await?
+            .0,
+        204
+    );
+    assert_eq!(
+        get_json(&server, "/api/v1/owners/u1", &reader).await?,
+        serde_json::json!({"name": "u1"})
+    );
+    assert_eq!(
+        req(&server, Method::DELETE, "/api/v1/owners/u1", &admin)
+            .await?
+            .0,
+        204,
+        "idempotent"
+    );
+    assert_eq!(
+        req(&server, Method::DELETE, "/u2/delta/api/description", &admin)
+            .await?
+            .0,
+        204
+    );
+    assert_eq!(
+        get_json(&server, "/u2/delta/api/description", &reader).await?,
+        serde_json::json!({})
+    );
+    assert_eq!(
+        req(&server, Method::DELETE, "/u1/alpha/api", &admin)
+            .await?
+            .0,
+        204
+    );
+    assert_eq!(
+        req(&server, Method::PUT, "/u1/alpha/api", &writer).await?.0,
+        201
+    );
+    assert_eq!(
+        get_json(&server, "/u1/alpha/api/description", &reader).await?,
+        serde_json::json!({}),
+        "repository deletion removes every object under its prefix, the description too"
+    );
+    Ok(())
+}

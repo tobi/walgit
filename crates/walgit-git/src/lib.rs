@@ -184,6 +184,13 @@ impl RepoId {
     }
 }
 
+/// An owner name alone, by the rule a [`RepoId`] applies to its first part. Owners are
+/// implicit (a prefix of repository ids), so this is for surfaces addressed by owner only
+/// (the owner profile) that must accept exactly the owners a repository could have.
+pub fn validate_owner(owner: &str) -> Result<(), GitError> {
+    validate_part(owner, "owner")
+}
+
 fn validate_part(s: &str, what: &str) -> Result<(), GitError> {
     if s.is_empty() || s.len() > 100 {
         return Err(GitError::InvalidInput(format!(

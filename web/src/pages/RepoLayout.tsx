@@ -1,6 +1,6 @@
 import { Suspense, createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Link, NavLink, Outlet, useLocation, useParams } from "react-router-dom";
-import { api, type Refs } from "../api";
+import { api, type Refs, type RepoDescription } from "../api";
 import { useData } from "../data";
 import { RouteBoundary, Skeleton } from "../components/Loading";
 import { CloneSetup } from "../components/CloneSetup";
@@ -83,6 +83,9 @@ export function RepoLayout() {
           </Link>
         </h1>
         <CloneMenu full={full} />
+        <Suspense fallback={null}>
+          <RepoDescriptionLine full={full} />
+        </Suspense>
         <nav className="tabs">
           <NavLink to={`/${full}`} className={() => (codeActive ? "tab active" : "tab")} end>
             Code
@@ -104,6 +107,13 @@ export function RepoLayout() {
       </RouteBoundary>
     </>
   );
+}
+
+/** The repository's description under its title; nothing when unset or unreadable (the
+ * header must never fail on a label — the body reports real errors). */
+function RepoDescriptionLine({ full }: { full: string }) {
+  const d = useData(`description:${full}`, () => api.description(full).catch((): RepoDescription => ({})));
+  return d.description ? <p className="repo-desc muted">{d.description}</p> : null;
 }
 
 function RepoBody({ owner, repo, full }: { owner: string; repo: string; full: string }) {

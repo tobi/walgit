@@ -33,7 +33,7 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
 pub struct RepoId { owner: String, name: String }
 // FromStr("owner/name" | "owner/name.git"), Display "owner/name". Validation: each part ASCII [A-Za-z0-9._-],
 // no leading '.', not "..", 1..=100 chars. fn owner(), name(), store_prefix() (walgit_proto::keys::repo_prefix),
-// local_dir(root:&Path)->PathBuf (= root/owner/name.git).
+// local_dir(root:&Path)->PathBuf (= root/owner/name.git). validate_owner(&str) applies the owner rule alone.
 pub enum ObjectFormat { Sha1, Sha256 } // From<walgit_config::ObjectFormat>, <-> gix_hash::Kind, as_str()
 
 /// Bare git repo on local disk in standard layout (objects/pack/*.{pack,idx}, loose refs + packed-refs, HEAD,

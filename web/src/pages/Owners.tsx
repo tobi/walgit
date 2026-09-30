@@ -17,10 +17,12 @@ export function Owners() {
       <Box>
         <ul className="list">
           {owners.map((o) => (
-            <li key={o}>
-              <Link to={`/${o}`} className="strong">
-                {o}
+            <li key={o.name}>
+              <Link to={`/${o.name}`} className="strong">
+                {o.display_name ?? o.name}
               </Link>
+              {o.display_name && <code className="muted small id-aside">{o.name}</code>}
+              {o.description && <div className="muted small">{o.description}</div>}
             </li>
           ))}
         </ul>
