@@ -66,12 +66,12 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::ConnectInfo;
 use axum::http::{Method, Request};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::{Extension, Router};
 use bytes::Bytes;
 use metrics_exporter_prometheus::PrometheusHandle;
 use walgit_store::DynStore;
@@ -89,7 +89,8 @@ pub struct AppState {
     /// HTTP requests in flight (counted until the response body is done); on the watchdog line.
     pub inflight: Arc<middleware::Inflight>,
     pub caches: cache::ServerCaches,
-    pub metrics_handle: Arc<PrometheusHandle>,
+    /// Prometheus recorder handle. Absent when `telemetry.metrics` is disabled.
+    pub metrics_handle: Option<Arc<PrometheusHandle>>,
     /// Read-through LFS upstream client (`upstream.lfs`).
     pub lfs_upstream: lfs_upstream::Upstream,
     /// Startup prewarm state (gates /readyz when configured).
@@ -112,7 +113,11 @@ impl AppState {
     ) -> anyhow::Result<Arc<Self>> {
         let registry = walgit_wal::Registry::new(store.clone(), cfg.clone());
         let bridge = bridge::Bridge::new(&cfg, registry.clone());
-        let metrics_handle = metrics::install()?;
+        let metrics_handle = if cfg.telemetry.metrics {
+            Some(metrics::install()?)
+        } else {
+            None
+        };
         let tls = tls::load(&cfg)?;
         if let Some(t) = &tls {
             tracing::info!(fingerprint = %t.fingerprint, mode = ?cfg.server.tls.mode, "TLS terminated in-process");
@@ -148,7 +153,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .gzip(true)
         .quality(tower_http::CompressionLevel::Fastest);
     // Nothing with content is public: the SPA shell/assets, installer, credential
-    // helper and metrics all sit behind `web::require_auth` (identity from a
+    // helper and enabled metrics all sit behind `web::require_auth` (identity from a
     // bearer token or a session cookie). The JSON API and git
     // endpoints do their own `require_read`/`require_write`; `/_auth/*` is the
     // login flow itself; `/services/public/*` is the installer a not-yet-signed-in
@@ -162,11 +167,26 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .with_state(())
                 .layer(web_compression.clone()),
         )
-        .route("/metrics", get(metrics::metrics_route))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             web::require_auth,
         ));
+    let metrics = if let Some(metrics_handle) = &state.metrics_handle {
+        Router::new()
+            .route("/metrics", get(metrics::metrics_route))
+            .layer(Extension(metrics_handle.clone()))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                web::require_auth,
+            ))
+    } else {
+        // Reserve the top-level name so the SPA's `/{owner}` route cannot turn a
+        // disabled scrape endpoint into a successful HTML response.
+        Router::new().route(
+            "/metrics",
+            get(|| async { axum::http::StatusCode::NOT_FOUND }),
+        )
+    };
 
     Router::new()
         .merge(
@@ -180,6 +200,7 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .layer(web_compression),
         )
         .merge(gated)
+        .merge(metrics)
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(health::readyz))
         // The SDK is a static artefact with no data in it; it must load from a
