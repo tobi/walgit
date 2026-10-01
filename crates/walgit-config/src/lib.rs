@@ -569,7 +569,6 @@ pub struct GitConfig {
     pub binary: PathBuf,
     pub upload_pack_engine: UploadPackEngine,
     pub allow_filter: bool,
-    pub allow_any_sha1_in_want: bool,
     /// Default object format for new repos.
     pub object_format: ObjectFormat,
     /// Maintain a split commit-graph chain per local repo: tier-2 packs that
@@ -927,7 +926,6 @@ impl Default for GitConfig {
             binary: PathBuf::from("git"),
             upload_pack_engine: UploadPackEngine::Auto,
             allow_filter: true,
-            allow_any_sha1_in_want: false,
             object_format: ObjectFormat::Sha1,
             commit_graph: true,
             commit_graph_changed_paths: false,

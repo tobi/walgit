@@ -330,7 +330,6 @@ async fn fsck_unit_records_missing_objects_and_repair_unit_fetches_them_from_ups
     let server = step!(
         "start",
         Server::start_with_tweak(|c| {
-            c.git.allow_any_sha1_in_want = true;
             c.maintenance.checkpoints = false;
             c.packs.enabled = false;
             c.maintenance.fsck_interval = std::time::Duration::from_hours(1);

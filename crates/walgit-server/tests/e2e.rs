@@ -1447,7 +1447,7 @@ async fn push_from_a_shallow_clone() -> TestResult {
 /// `allow-any-sha1-in-want`), plus `--depth` + filter together.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn partial_clone_tree_zero_and_depth_with_filter() -> TestResult {
-    let server = Server::start_with_tweak(|c| c.git.allow_any_sha1_in_want = true).await?;
+    let server = Server::start().await?;
     server.put_repo("t", "tree0").await?;
     let src = TestRepo::synthetic(5, 4)?;
     git_in(

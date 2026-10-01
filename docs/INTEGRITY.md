@@ -33,13 +33,17 @@ Due right after checkpoint when `fsck.pb` lists missing objects, `repaired_seq =
 **`upstream.git`** (D24 setting, `[upstream] git = "https://github.com/acme/monorepo.git"`, `token_env` shared with
 `upstream.lfs`, `docs/LFS.md`). Steps (`walgit_git::repair::fetch_objects_as_pack`): scratch bare repo under
 `cache.dir/repair/`, `git fetch --depth=1 <upstream> <oid>…` in batches of 500 (GitHub serves commit, tree **and
-blob** wants by SHA — verified 2026-08-21; walgit does with `git.allow_any_sha1_in_want`), `pack-objects` of exactly
+blob** wants by SHA — verified 2026-08-21; walgit enables arbitrary object wants for partial-clone lazy fetches), `pack-objects` of exactly
 the requested oids, verify every oid is in the resulting idx (a refused want is an error, never a silent hole),
 then `RepoHandle::add_pack(tier 0)` → one **COMPACT entry superseding nothing** (what `walgit wal add-pack … --tier
 0` did by hand for a large repository, seq 11). `fsck.pb.repaired_seq` is set so the next pass re-audits instead of repairing
 again. Counter `walgit_repair_objects_total{repo}`. Test: `tests/maintain.rs
 fsck_unit_records_missing_objects_and_repair_unit_fetches_them_from_upstream` (hole → audit → repair over HTTP from
 a second repository → re-audit clean → idle).
+
+This does not widen repository access: a principal with read access can already fetch any stored object by ID,
+including objects unreachable from an advertised ref. Removing `git.allow_any_sha1_in_want` only removes a
+non-functional configuration switch.
 
 ## 4. Runbook (what was done for a large repository, 2026-08-21 03:40Z)
 1. Enumerate: `git rev-list --objects --missing=print <advertised tips> --not <known-good tip>` on the complete copy
