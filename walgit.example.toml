@@ -7,9 +7,7 @@
 [server]
 listen = "127.0.0.1:8080"        # default; `mode = none` is refused unless this is loopback. Public bind: 0.0.0.0 with token/oidc.
 http2 = true                      # HTTP/2 (h2c when TLS is off, ALPN when on)
-max_concurrent_requests = 512     # global cap on in-flight git requests
 max_concurrent_per_repo = 64      # per-repo cap (upload-pack / receive-pack)
-request_timeout = "1h"
 drain_timeout = "20s"             # after SIGTERM, phase 2: how long in-flight requests may finish once /readyz is 503
                                   # and new fetch/push/LFS are refused (503 + Retry-After). The running maintenance unit
                                   # is interrupted at once in phase 1 while serving continues.

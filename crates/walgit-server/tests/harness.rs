@@ -77,7 +77,6 @@ impl Server {
         cfg.cache.max_bytes = ByteSize::gib(2);
         cfg.server.listen = "127.0.0.1:0".parse().unwrap();
         cfg.server.max_concurrent_per_repo = 8;
-        cfg.server.request_timeout = std::time::Duration::from_mins(10);
         cfg.server.max_push_bytes = ByteSize::gib(2);
         cfg.wal.fsck_objects = true;
         cfg.wal.check_connectivity = true;

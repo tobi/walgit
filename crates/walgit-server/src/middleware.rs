@@ -1,7 +1,5 @@
-//! HTTP middleware: request id + tracing span. Request timeout, body limit and
-//! tracing layers are applied in [`crate::router`] via `tower-http`. Per-repo
-//! concurrency limiting lives in the handlers (they hold a repo-keyed semaphore
-//! for the duration of the git operation).
+//! HTTP middleware: request id + tracing span and per-repository concurrency
+//! limits. Per-repository permits live in handlers for the full Git operation.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

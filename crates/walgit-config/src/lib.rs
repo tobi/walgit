@@ -41,11 +41,8 @@ pub struct Config {
 pub struct ServerConfig {
     pub listen: SocketAddr,
     pub http2: bool,
-    pub max_concurrent_requests: usize,
     /// Per-repo cap on concurrent upload-pack/receive-pack processes.
     pub max_concurrent_per_repo: usize,
-    #[serde(with = "humantime_serde")]
-    pub request_timeout: Duration,
     /// Graceful drain after SIGTERM: new object work (fetch/push/LFS) is
     /// refused with 503 + Retry-After and `/readyz` turns 503 at once; in-flight
     /// requests and the running maintenance unit get this long to finish
@@ -797,9 +794,7 @@ impl Default for ServerConfig {
         ServerConfig {
             listen: std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
             http2: true,
-            max_concurrent_requests: 512,
             max_concurrent_per_repo: 64,
-            request_timeout: Duration::from_hours(1),
             drain_timeout: Duration::from_secs(20),
             max_push_bytes: ByteSize::gib(64),
             roles: vec![],
@@ -1527,6 +1522,17 @@ mod tests {
         base.store.bucket = "b".into();
         assert!(base.with_settings("[bundles]\nenabled = false\n").is_err());
         assert!(!base.public_settings_toml().unwrap().contains("[bundles]"));
+    }
+
+    #[test]
+    fn removed_global_request_limit_configuration_is_rejected() {
+        for input in [
+            "[server]\nmax_concurrent_requests = 512\n",
+            "[server]\nrequest_timeout = \"1h\"\n",
+        ] {
+            assert!(Config::parse(input).is_err(), "{input}");
+            assert!(Config::default().with_settings(input).is_err(), "{input}");
+        }
     }
 
     #[test]
