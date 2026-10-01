@@ -87,6 +87,11 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 - Open at the application (no credential): `/healthz`, `/readyz`, `/repos.js`, `/repos.mjs`, `/_auth/*` (the
   sign-in flow itself) and **`/services/public/*`** (data-free; today `install.sh` + `ca.pem`; everything else
   under it 404; never reads repo data or takes a bearer — test `public_lane_serves_only_the_installer_without_auth`).
+- Git authentication help identifies an OIDC provider by `server.auth.provider_name` when set, otherwise by
+  the configured issuer URL. The name is display-only: no vendor guessing, discovery request or change to
+  credential validation is part of rendering an error. Static-token mode names no external provider.
+  Permission denials direct users to the administrator; verifier outages ask them to retry shortly.
+  Neither includes sign-in or client setup instructions.
 - **The server answers an invalid/expired credential with a real 401** — that is what makes git `erase` it from
   its helpers and ask again; the friendly 200 + in-band ERR is reserved for failures a retry cannot fix (account
   not allowed, verifier down). A 200 leaves git re-storing a dead token for its cache's lifetime.

@@ -2170,6 +2170,203 @@ async fn public_lane_serves_only_the_installer_without_auth() -> TestResult {
     Ok(())
 }
 
+async fn auth_help_server(
+    mode: walgit_config::AuthMode,
+    browser_tokens: bool,
+    provider_name: Option<&str>,
+) -> anyhow::Result<Server> {
+    use walgit_config::{AuthMode, StaticToken};
+
+    Server::start_with_tweak(|c| {
+        c.server.auth.mode = mode;
+        c.server.auth.provider_name = provider_name.map(str::to_string);
+        c.server.auth.anonymous_read = false;
+        c.server.auth.tokens = vec![StaticToken {
+            token: "read-only".into(),
+            principal: "reader".into(),
+            write: false,
+            token_env: None,
+            admin: false,
+        }];
+        if mode == AuthMode::Oidc {
+            c.server.auth.issuer = "https://login.example.com".into();
+            c.server.auth.allowed_domains = vec!["example.com".into()];
+            c.server.auth.audiences = vec!["git".into()];
+            if browser_tokens {
+                c.server.auth.oauth_client_id = Some("git".into());
+                c.server.auth.oauth_client_secret = Some("client-secret".into());
+                c.server.auth.session_secret = Some("0123456789abcdef0123456789abcdef".into());
+            }
+        }
+    })
+    .await
+}
+
+/// Access-denied help names the provider without suggesting that setup fixes permissions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auth_help_gives_error_specific_guidance() -> TestResult {
+    use walgit_config::AuthMode;
+
+    for (mode, browser_tokens, provider_name) in [
+        (AuthMode::Token, false, Some("Unused provider")),
+        (AuthMode::Oidc, false, None),
+        (AuthMode::Oidc, true, None),
+        (AuthMode::Oidc, true, Some("  Acme SSO  ")),
+    ] {
+        let server = auth_help_server(mode, browser_tokens, provider_name).await?;
+
+        let url = format!(
+            "{}/info/refs?service=git-receive-pack",
+            server.repo_url("t", "r")
+        );
+        let response = reqwest::Client::new()
+            .get(&url)
+            .header("User-Agent", "git/2.54.0")
+            .bearer_auth("read-only")
+            .send()
+            .await?;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/x-git-receive-pack-advertisement"
+        );
+        let body = response.text().await?;
+        assert!(body.contains("ERR walgit: permission denied for"), "{body}");
+        assert!(
+            body.contains("not allowed to perform this operation"),
+            "{body}"
+        );
+        assert!(body.contains("Contact the server administrator"), "{body}");
+        assert!(!body.contains("Google Identity-Aware Proxy"), "{body}");
+        if mode == AuthMode::Oidc {
+            let name = provider_name.map_or("https://login.example.com", str::trim);
+            assert!(
+                body.contains(&format!("Identity provider: {name}.")),
+                "{body}"
+            );
+        } else {
+            assert!(!body.contains("OpenID Connect"), "{body}");
+            assert!(!body.contains("Unused provider"), "{body}");
+        }
+        assert!(!body.contains("Sign in"), "{body}");
+        assert!(!body.contains("Tokens:"), "{body}");
+        assert!(!body.contains("/_auth/tokens"), "{body}");
+        assert!(!body.contains("install.sh"), "{body}");
+
+        // Missing/invalid credentials still get a real 401 so Git can ask its helpers again.
+        let read_url = format!(
+            "{}/info/refs?service=git-upload-pack",
+            server.repo_url("t", "r")
+        );
+        for password in [None, Some("invalid")] {
+            let mut request = reqwest::Client::new()
+                .get(&read_url)
+                .header("User-Agent", "git/2.54.0");
+            if let Some(password) = password {
+                request = request.basic_auth("git", Some(password));
+            }
+            assert_eq!(request.send().await?.status(), 401);
+        }
+    }
+    Ok(())
+}
+
+/// A correctly signed access token still obeys the OIDC email allowlist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auth_help_identifies_provider_for_disallowed_oidc_email() -> TestResult {
+    for provider_name in [None, Some("  Acme SSO  ")] {
+        let server = auth_help_server(walgit_config::AuthMode::Oidc, true, provider_name).await?;
+        let token = server
+            .state
+            .auth
+            .access_token("reader@other.example")
+            .unwrap();
+        assert!(token.starts_with("wgt_"));
+        assert!(server.state.auth.access_token_claims(&token).is_some());
+        let url = format!(
+            "{}/info/refs?service=git-upload-pack",
+            server.repo_url("t", "r")
+        );
+        let client = reqwest::Client::new();
+        // A non-Git client confirms this is authorization failure, not an invalid token.
+        assert_eq!(
+            client.get(&url).bearer_auth(&token).send().await?.status(),
+            403
+        );
+        let response = client
+            .get(&url)
+            .header("User-Agent", "git/2.54.0")
+            .bearer_auth(&token)
+            .send()
+            .await?;
+        assert_eq!(response.status(), 200);
+        let body = response.text().await?;
+        assert!(body.contains("ERR walgit: permission denied for"), "{body}");
+        assert!(body.contains("Contact the server administrator."), "{body}");
+        let provider = provider_name.map_or("https://login.example.com", str::trim);
+        assert!(
+            body.contains(&format!("Identity provider: {provider}.")),
+            "{body}"
+        );
+        assert!(!body.contains("Sign in"), "{body}");
+        assert!(!body.contains("install.sh"), "{body}");
+    }
+    Ok(())
+}
+
+/// A verifier outage calls for retrying, not replacing credentials or repeating setup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auth_help_verifier_outage_asks_for_retry() -> TestResult {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let issuer = format!("https://{}", listener.local_addr()?);
+    let task = tokio::spawn(async move {
+        // Simulate an unavailable HTTPS issuer by closing each connection before TLS.
+        while let Ok((connection, _)) = listener.accept().await {
+            drop(connection);
+        }
+    });
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Oidc;
+        c.server.auth.anonymous_read = false;
+        c.server.auth.issuer = issuer.clone();
+        c.server.auth.allowed_domains = vec!["example.com".into()];
+        c.server.auth.audiences = vec!["git".into()];
+    })
+    .await?;
+    // Syntactically valid RS256 header; discovery fails before signature verification.
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{}/info/refs?service=git-upload-pack",
+            server.repo_url("t", "r")
+        ))
+        .header("User-Agent", "git/2.54.0")
+        .bearer_auth("eyJhbGciOiJSUzI1NiJ9.e30.AA")
+        .send()
+        .await?;
+    task.abort();
+    assert_eq!(response.status(), 200);
+    let body = response.text().await?;
+    assert!(
+        body.contains("ERR walgit: authentication is temporarily unavailable"),
+        "{body}"
+    );
+    assert!(body.contains("Try again shortly."), "{body}");
+    assert!(
+        body.contains(&format!("Identity provider: {issuer}.")),
+        "{body}"
+    );
+    for misleading in [
+        "Sign in",
+        "Tokens:",
+        "install.sh",
+        "replace",
+        "permission denied",
+    ] {
+        assert!(!body.contains(misleading), "{body}");
+    }
+    Ok(())
+}
+
 /// A stale credential in git's cache (an expired or rotated token) must cost exactly one failed
 /// command: the server answers the dead token with a real 401, git `erase`s it from its helpers,
 /// and the next command asks the helpers again (a fresh token) and succeeds. A 200 + in-band ERR

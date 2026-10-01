@@ -54,15 +54,12 @@ pub async fn info_refs(
         // 200 + ERR answer made git keep — and re-`store` — a dead cached token for the cache's
         // whole lifetime (rig, 2026-08-22: every clone failed for 50 minutes).
         let has_creds = headers.contains_key(axum::http::header::AUTHORIZATION);
-        let retry_cannot_help = matches!(
-            e,
-            crate::auth::AuthError::Forbidden | crate::auth::AuthError::Unavailable
-        );
-        if is_git_client(headers) && !service_param.is_empty() && has_creds && retry_cannot_help {
-            return Ok(git_err_response(
-                &service_param,
-                &auth_help_message(st, headers, &e),
-            ));
+        if is_git_client(headers)
+            && !service_param.is_empty()
+            && has_creds
+            && let Some(message) = auth_help_message(st, headers, &e)
+        {
+            return Ok(git_err_response(&service_param, &message));
         }
         return Err(auth_err(e));
     }
@@ -1443,35 +1440,38 @@ pub(crate) fn request_base_url(st: &AppState, headers: &HeaderMap) -> String {
     }
 }
 
-/// One-time client setup text for `base_url` (web UI overview + auth errors).
-pub(crate) fn client_setup(st: &AppState, base_url: &str) -> String {
-    crate::setup::recipes(&st.cfg, base_url, None).setup_text
-}
-
-/// Human-readable instructions for authenticating a git client against this host.
+/// Guidance for failures that refreshing credentials cannot fix. Invalid or missing
+/// credentials have no in-band message so the caller preserves the HTTP 401 response.
 pub(crate) fn auth_help_message(
     st: &AppState,
     headers: &HeaderMap,
     e: &crate::auth::AuthError,
-) -> String {
+) -> Option<String> {
     let base = request_base_url(st, headers);
     let host = base
         .trim_start_matches("https://")
         .trim_start_matches("http://")
         .to_string();
-    let why = match e {
-        crate::auth::AuthError::Forbidden => "your identity is not allowed to access this host",
-        crate::auth::AuthError::Unavailable => {
-            "the token verifier is temporarily unavailable; retry"
-        }
-        _ => "a valid bearer token is required; refresh or replace an expired token",
+    let auth = &st.cfg.server.auth;
+    let provider = if auth.mode == walgit_config::AuthMode::Oidc {
+        let name = auth
+            .provider_name
+            .as_deref()
+            .map_or(auth.issuer.as_str(), str::trim);
+        format!("Identity provider: {name}.\n")
+    } else {
+        String::new()
     };
-    format!(
-        "walgit: authentication failed: {why}.\n\
-         To authenticate git for {host} (Google Identity-Aware Proxy):\n\
-         \n{}",
-        client_setup(st, &base)
-    )
+    match e {
+        crate::auth::AuthError::Forbidden => Some(format!(
+            "walgit: permission denied for {host}. Your identity is not allowed to perform this operation.\n\
+             Contact the server administrator.\n{provider}"
+        )),
+        crate::auth::AuthError::Unavailable => Some(format!(
+            "walgit: authentication is temporarily unavailable for {host}. Try again shortly.\n{provider}"
+        )),
+        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => None,
+    }
 }
 
 /// Message for a repository whose pack set cannot live on this instance.
