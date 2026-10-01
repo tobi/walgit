@@ -194,19 +194,16 @@ impl Registry {
     }
 
     /// CAS-create manifest.pb (`PutMode::Create`). Err(AlreadyExists) on 412.
+    /// The Create PUT is the only authority, warm handle or not: a cached handle
+    /// is not evidence the manifest still exists (another host may have deleted
+    /// it) and must not turn a second create into a success.
     pub async fn create(
         &self,
         id: &RepoId,
         format: ObjectFormat,
     ) -> Result<Arc<RepoHandle>, WalError> {
-        if let Some(h) = self.repos.get(id) {
-            return Ok(h.clone());
-        }
         let gate = self.opening.entry(id.clone()).or_default().clone();
         let _g = gate.lock().await;
-        if let Some(h) = self.repos.get(id) {
-            return Ok(h.clone());
-        }
 
         let prefix = id.store_prefix();
         let prefixed = Prefixed::new(self.store.clone(), prefix);
@@ -272,7 +269,8 @@ impl Registry {
         }
     }
 
-    /// Open or create.
+    /// Open or create. Losing a create race (another request or host created it
+    /// between our 404 and our Create) is success: open what the winner made.
     pub async fn open_or_create(
         &self,
         id: &RepoId,
@@ -280,7 +278,10 @@ impl Registry {
     ) -> Result<Arc<RepoHandle>, WalError> {
         match self.open(id).await {
             Ok(h) => Ok(h),
-            Err(WalError::NotFound) => self.create(id, format).await,
+            Err(WalError::NotFound) => match self.create(id, format).await {
+                Err(WalError::AlreadyExists) => self.open(id).await,
+                other => other,
+            },
             Err(e) => Err(e),
         }
     }

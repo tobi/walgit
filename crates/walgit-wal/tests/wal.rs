@@ -316,6 +316,74 @@ async fn test_two_registries_cross_sync() {
     );
 }
 
+/// A second create is `AlreadyExists` whether this registry holds the handle
+/// (warm) or never saw the repository (cold): the Create PUT decides, not the map.
+#[tokio::test]
+async fn create_of_an_existing_repository_is_already_exists_warm_or_cold() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let warm = Registry::new(
+        store.clone(),
+        Arc::new(make_config(&cache.path().join("a"), 0)),
+    );
+    let cold = Registry::new(
+        store.clone(),
+        Arc::new(make_config(&cache.path().join("b"), 0)),
+    );
+    let id = repo_id("test", "twice");
+
+    warm.create(&id, ObjectFormat::Sha1).await.unwrap();
+    for registry in [&warm, &cold] {
+        assert!(matches!(
+            registry.create(&id, ObjectFormat::Sha1).await,
+            Err(walgit_wal::WalError::AlreadyExists)
+        ));
+    }
+    // The losing creates changed nothing: both still open the one repository.
+    assert_eq!(warm.open(&id).await.unwrap().manifest().revision, 1);
+    assert_eq!(cold.open(&id).await.unwrap().manifest().revision, 1);
+}
+
+/// Concurrent creates of one name — on one registry and across two — have
+/// exactly one winner; `open_or_create` (auto-create on push) treats losing
+/// that race as success and opens the winner's repository.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_creates_have_one_winner_and_open_or_create_joins_it() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let a = Registry::new(
+        store.clone(),
+        Arc::new(make_config(&cache.path().join("a"), 0)),
+    );
+    let b = Registry::new(
+        store.clone(),
+        Arc::new(make_config(&cache.path().join("b"), 0)),
+    );
+
+    for (n, (x, y)) in [(&a, &a), (&a, &b)].into_iter().enumerate() {
+        let id = repo_id("race", &format!("create{n}"));
+        let (rx, ry) = tokio::join!(
+            x.create(&id, ObjectFormat::Sha1),
+            y.create(&id, ObjectFormat::Sha1)
+        );
+        let won = [rx.is_ok(), ry.is_ok()];
+        assert_eq!(won.iter().filter(|w| **w).count(), 1, "{n}: one winner");
+        for r in [rx, ry] {
+            if let Err(e) = r {
+                assert!(matches!(e, walgit_wal::WalError::AlreadyExists), "{n}: {e}");
+            }
+        }
+
+        let id = repo_id("race", &format!("auto{n}"));
+        let (hx, hy) = tokio::join!(
+            x.open_or_create(&id, ObjectFormat::Sha1),
+            y.open_or_create(&id, ObjectFormat::Sha1)
+        );
+        assert_eq!(hx.unwrap().manifest().revision, 1, "{n}");
+        assert_eq!(hy.unwrap().manifest().revision, 1, "{n}");
+    }
+}
+
 #[tokio::test]
 async fn test_concurrent_different_refs() {
     let cache = tempfile::tempdir().unwrap();

@@ -54,6 +54,7 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 | Lost CAS response resolution | fresh manifest GET; only if the exact segment descriptor is listed, GET and compare the claimed log bytes | normally +1 GET on this failure path compared with key/sequence-only resolution; no added successful-push requests. Missing/folded evidence remains unknown. Per-attempt nonce and actual frame sizes are computed locally. | `publish.rs::cas_landed` |
 | Settings publish (D24) | refs sync (conditional GET) → log slot PUT → manifest CAS; readers pay nothing extra (settings ride inline on the manifest) | 3 rounds; read: 0 | `publish.rs::publish_settings_impl` |
 | Lease acquire | 1 GET → 1 CAS put (or 1 Create when absent) | 2 | `coord.rs::try_acquire` |
+| Repository create (`PUT /{o}/{r}`, `walgit repo create`, auto-create on push) | 1 manifest Create PUT; its 412 *is* "exists" (409), whether this instance holds a handle or not; auto-create's lost race adds the open it would have done anyway | 1 (was 0 for a warm handle, which answered 201 for an existing repository) | `registry.rs::create`, `open_or_create` |
 | Publish, local commit (2026-08-23) | unchanged in round trips: after the manifest CAS the ref txns are applied to the local copy **before** the new manifest version is advertised, both under `sync_mutex` (the refs phase of every sync); the reverse order let a reader cache the old refs under the new version, and without the lock a concurrent sync replayed the same entry (two `update-ref`, a lock collision). A landed CAS is answered `ok` whatever the local apply does — the next sync replays (one conditional GET that then returns 200, no extra write). | 0 extra | `publish.rs::process_batch` |
 | Repository listing (`/api/v1/owners*`, `/services/api/owners*`, maintainer/bridge passes) | 0 within `LIST_TTL` (30 s, per instance); else delimited `repos/` → (delimited `repos/<o>/` ∥ owners) → (HEAD `manifest.pb` ∥ repos): 3 rounds | 1 + owners + repos | `registry.rs::list` |
 | Bundle removal (2026-09-11) | v2 capabilities and narrated fetch: removed optional list GET (1 → 0 extra); maintenance no longer reads/CASes a bundle list; direct import no longer composes a wrapper or reads/CASes a bundle list | no new store requests; checkpoint and push budgets unchanged | `smart.rs`, `maintain.rs`, `import_direct.rs` |
@@ -61,7 +62,8 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 | Orphan log slot (failure path only) | +1 fresh manifest GET, +HEAD per probe, +Create at next seq | — | `publish.rs::claim_log_slot` |
 
 `healthy_request_round_trip_budgets` in `crates/walgit-server/tests/sim.rs` pins the healthy MemoryStore
-counts at push **5**, warm refs **1**, cold refs with one tail segment **2**, and checkpoint **4**. Cold open used to spend an
+counts at push **5**, warm refs **1**, cold refs with one tail segment **2**, checkpoint **4**, and create of an
+existing repository **1** (warm and cold). Cold open used to spend an
 extra unconditional manifest GET (3 requests, 3 sequential rounds); it now applies the manifest it already
 fetched directly (2 requests, 2 rounds). `claim_log_slot`, `cas_landed`, and `put_immutable_create` add probes
 only after Create/CAS failure, so the measured happy-path counts remain unchanged.

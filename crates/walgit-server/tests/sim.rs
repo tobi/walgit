@@ -1597,8 +1597,29 @@ async fn healthy_request_round_trip_budgets() -> Result<()> {
         cp.as_of.is_some() && cp.first_state_at.is_some(),
         "provenance times carried without a log read: {cp:?}"
     );
+    // Create of an existing repository: the Create PUT's 412 is the answer, warm handle or
+    // cold, with no GET/HEAD in front of it — 1 request each.
+    let mut create_ops = Vec::new();
+    for i in [0, cold] {
+        let before = c.instances[i].link.stats().ops.load(Ordering::Relaxed);
+        let again = c.instances[i]
+            .registry
+            .create(&c.id, ObjectFormat::Sha1)
+            .await;
+        let ops = c.instances[i].link.stats().ops.load(Ordering::Relaxed) - before;
+        ensure!(
+            matches!(again, Err(WalError::AlreadyExists)),
+            "create of an existing repository must be AlreadyExists, got {:?}",
+            again.map(|_| ())
+        );
+        ensure!(
+            ops == 1,
+            "create of an existing repository used {ops} requests, budget 1"
+        );
+        create_ops.push(ops);
+    }
     eprintln!(
-        "healthy request counts: push={push_ops}, warm_refs={warm_ops}, cold_refs={cold_ops}, checkpoint={cp_ops}"
+        "healthy request counts: push={push_ops}, warm_refs={warm_ops}, cold_refs={cold_ops}, checkpoint={cp_ops}, create_existing={create_ops:?}"
     );
     Ok(())
 }

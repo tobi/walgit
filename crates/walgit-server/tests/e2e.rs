@@ -298,6 +298,66 @@ async fn admin_create_list_delete() -> TestResult {
     Ok(())
 }
 
+/// `PUT /{owner}/{repo}` answers from the bucket: 201 once, then 409 — on the
+/// instance holding the handle (warm) and on one that never opened it (cold);
+/// concurrent creates of one name have one 201 and one 409, on one instance
+/// and across two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_answers_409_for_an_existing_repository() -> TestResult {
+    let (a, b) = Server::start_pair().await?;
+    let client = reqwest::Client::new();
+    let put = |s: &Server, repo: &str| client.put(format!("{}/t/{repo}", s.base_url)).send();
+    assert_eq!(put(&a, "r").await?.status(), 201);
+    assert_eq!(put(&a, "r").await?.status(), 409, "warm handle");
+    assert_eq!(put(&b, "r").await?.status(), 409, "cold instance");
+    // Deleted on B while A still holds a handle: the bucket, not A's map, answers.
+    assert_eq!(
+        client
+            .delete(format!("{}/t/r", b.base_url))
+            .send()
+            .await?
+            .status(),
+        204
+    );
+    assert_eq!(
+        put(&a, "r").await?.status(),
+        201,
+        "re-create after a delete elsewhere"
+    );
+
+    for (n, (x, y)) in [(&a, &a), (&a, &b)].into_iter().enumerate() {
+        let repo = format!("race{n}");
+        let (rx, ry) = tokio::join!(put(x, &repo), put(y, &repo));
+        let mut codes = [rx?.status().as_u16(), ry?.status().as_u16()];
+        codes.sort_unstable();
+        assert_eq!(codes, [201, 409], "{repo}");
+    }
+    Ok(())
+}
+
+/// `auto_create_on_push`: a push to a missing name creates it (its internal
+/// create treats "exists" as fine), and a create after that is a 409.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_create_on_push_creates_the_repository() -> TestResult {
+    let server = Server::start_with_tweak(|c| c.server.auto_create_on_push = true).await?;
+    let src = TestRepo::synthetic(1, 1)?;
+    for refspec in ["HEAD:refs/heads/main", "HEAD:refs/heads/second"] {
+        git_in(&src, &["push", &server.repo_url("t", "auto"), refspec])?;
+    }
+    let refs = server.ls_remote("t", "auto").await?;
+    assert!(
+        refs.contains("refs/heads/main") && refs.contains("refs/heads/second"),
+        "{refs}"
+    );
+    let status = reqwest::Client::new()
+        .put(format!("{}/t/auto", server.base_url))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, 409);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_clones_and_pushes_with_telemetry() -> TestResult {
     // Regression: tracing spans entered across .await under a multi-threaded
