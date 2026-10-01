@@ -235,6 +235,7 @@ pub struct StoreConfig {
     pub prefix: String,
     pub gcs: GcsConfig,
     pub s3: S3Config,
+    /// Extra attempts for transient backend failures and interrupted reads; zero disables retries.
     pub max_retries: u32,
     /// Objects larger than this use resumable/multipart upload.
     pub multipart_threshold: ByteSize,

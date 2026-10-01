@@ -67,7 +67,7 @@ anonymous_read = true             # must be false in oidc mode
 backend = "s3"                    # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "memory" (tests)
 bucket = "walgit"
 prefix = ""                       # global key prefix inside the bucket
-max_retries = 8                   # retries on retryable store errors (jittered backoff)
+max_retries = 8                   # extra attempts for transient reads only (jittered backoff; writes/deletes are single-attempt; 0 disables)
 multipart_threshold = "64MiB"     # PUTs above this use multipart/resumable uploads
 multipart_part_size = "32MiB"
 

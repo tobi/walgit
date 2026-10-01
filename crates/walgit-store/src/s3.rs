@@ -58,12 +58,17 @@ use crate::{
 
 /// S3-compatible object store.
 pub struct S3Store {
+    /// Mutations are deliberately single-attempt: retrying a conditional write
+    /// can turn a landed CAS with a lost response into a false 412.
     client: S3Client,
+    /// Idempotent metadata reads use the configured retry budget.
+    read_client: S3Client,
     bucket: String,
     /// reqwest client for streaming GETs via presigned URLs.
     http: reqwest::Client,
     multipart_threshold: u64,
     multipart_part_size: u64,
+    max_retries: u32,
 }
 
 impl S3Store {
@@ -88,25 +93,37 @@ impl S3Store {
         );
         let region = aws_sdk_s3::config::Region::new(cfg.s3.region.clone());
 
-        let mut s3_config = aws_sdk_s3::Config::builder()
-            .region(region)
-            .credentials_provider(creds)
-            .force_path_style(cfg.s3.force_path_style)
-            .behavior_version_latest();
+        let build_config = |retry_config| {
+            let mut s3_config = aws_sdk_s3::Config::builder()
+                .region(region.clone())
+                .credentials_provider(creds.clone())
+                .force_path_style(cfg.s3.force_path_style)
+                .retry_config(retry_config)
+                .behavior_version_latest();
 
-        if !cfg.s3.endpoint.is_empty() {
-            s3_config = s3_config.endpoint_url(&cfg.s3.endpoint);
-        }
+            if !cfg.s3.endpoint.is_empty() {
+                s3_config = s3_config.endpoint_url(&cfg.s3.endpoint);
+            }
+            s3_config.build()
+        };
 
-        let client = S3Client::from_conf(s3_config.build());
+        let client = S3Client::from_conf(build_config(
+            aws_sdk_s3::config::retry::RetryConfig::disabled(),
+        ));
+        let read_client = S3Client::from_conf(build_config(
+            aws_sdk_s3::config::retry::RetryConfig::standard()
+                .with_max_attempts(cfg.max_retries.saturating_add(1)),
+        ));
         let http = reqwest::Client::builder().build()?;
 
         Ok(S3Store {
             client,
+            read_client,
             bucket: cfg.bucket.clone(),
             http,
             multipart_threshold: cfg.multipart_threshold.as_u64(),
             multipart_part_size: cfg.multipart_part_size.as_u64(),
+            max_retries: cfg.max_retries,
         })
     }
 
@@ -138,14 +155,42 @@ impl S3Store {
             .await
             .map_err(|e| StoreError::other(anyhow::anyhow!("presigning get: {e}")))?;
 
-        let mut req = self.http.get(presigned.uri());
-        for (name, value) in presigned.headers() {
-            req = req.header(name, value);
+        let mut attempt = 0u32;
+        loop {
+            let mut req = self.http.get(presigned.uri());
+            for (name, value) in presigned.headers() {
+                req = req.header(name, value);
+            }
+            match req.send().await {
+                Ok(response)
+                    if matches!(response.status().as_u16(), 429 | 500..=599)
+                        && attempt < self.max_retries =>
+                {
+                    tracing::warn!(
+                        key,
+                        attempt,
+                        status = %response.status(),
+                        "retrying transient s3 get"
+                    );
+                }
+                Ok(response) => return Ok(response),
+                Err(error) if attempt < self.max_retries => {
+                    tracing::warn!(key, attempt, %error, "retrying failed s3 get");
+                }
+                Err(error) => {
+                    return Err(StoreError::retryable(anyhow::anyhow!(
+                        "s3 get http: {error}"
+                    )));
+                }
+            }
+            let delay = util::backoff(
+                attempt,
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_secs(2),
+            );
+            attempt += 1;
+            tokio::time::sleep(delay).await;
         }
-
-        req.send()
-            .await
-            .map_err(|e| StoreError::retryable(anyhow::anyhow!("s3 get http: {e}")))
     }
 
     fn get_result_from_response(key: &str, resp: reqwest::Response) -> Result<GetResult> {
@@ -337,7 +382,7 @@ impl ObjectStore for S3Store {
 
     async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
         let resp = self
-            .client
+            .read_client
             .head_object()
             .bucket(&self.bucket)
             .key(key)
@@ -476,7 +521,7 @@ impl ObjectStore for S3Store {
         prefix: &str,
         start_after: Option<&str>,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
-        let client = self.client.clone();
+        let client = self.read_client.clone();
         let bucket = self.bucket.clone();
         let prefix = prefix.to_owned();
         let start_after = start_after.map(std::borrow::ToOwned::to_owned);
@@ -556,7 +601,7 @@ impl ObjectStore for S3Store {
         let mut continuation_token: Option<String> = None;
         loop {
             let mut builder = self
-                .client
+                .read_client
                 .list_objects_v2()
                 .bucket(&self.bucket)
                 .prefix(prefix)
@@ -1007,18 +1052,29 @@ mod tests {
     use aws_sdk_s3::error::SdkError;
     use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error;
     use aws_sdk_s3::operation::put_object::PutObjectError;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A fake S3 that answers every request with one status and error code.
     /// Bound on an ephemeral port; the accept loop dies with the test runtime.
     async fn fake_s3(status: u16, code: &'static str) -> S3Client {
+        let (endpoint, _) = counting_fake_s3(status, code).await;
+        client_for(&endpoint)
+    }
+
+    async fn counting_fake_s3(status: u16, code: &'static str) -> (String, Arc<AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
+                let seen = seen.clone();
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 8192];
                     let _ = sock.read(&mut buf).await;
+                    seen.fetch_add(1, Ordering::SeqCst);
                     let body = format!(
                         "<?xml version=\"1.0\"?><Error><Code>{code}</Code><Message>fake</Message></Error>"
                     );
@@ -1031,21 +1087,71 @@ mod tests {
                 });
             }
         });
-        client_for(&format!("http://127.0.0.1:{port}"))
+        (format!("http://127.0.0.1:{port}"), attempts)
     }
 
     /// SDK retries are disabled so each test observes exactly the error the
     /// service produced; walgit's own retry layer is what these tests cover.
     fn client_for(endpoint: &str) -> S3Client {
+        client_for_attempts(endpoint, 1)
+    }
+
+    fn client_for_attempts(endpoint: &str, max_attempts: u32) -> S3Client {
         let conf = aws_sdk_s3::config::Config::builder()
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
             .credentials_provider(static_credentials("test", "test", None))
             .endpoint_url(endpoint)
             .force_path_style(true)
-            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .retry_config(
+                aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(max_attempts),
+            )
             .behavior_version_latest()
             .build();
         S3Client::from_conf(conf)
+    }
+
+    fn store_for_attempts(endpoint: &str, max_retries: u32) -> S3Store {
+        S3Store {
+            client: client_for_attempts(endpoint, 1),
+            read_client: client_for_attempts(endpoint, max_retries.saturating_add(1)),
+            bucket: "b".into(),
+            http: reqwest::Client::new(),
+            multipart_threshold: u64::MAX,
+            multipart_part_size: 8 * 1024 * 1024,
+            max_retries,
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_retry_but_mutations_make_one_attempt() {
+        let (endpoint, attempts) = counting_fake_s3(503, "SlowDown").await;
+        let store = store_for_attempts(&endpoint, 2);
+
+        assert!(store.head("k").await.unwrap_err().is_retryable());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+        attempts.store(0, Ordering::SeqCst);
+        assert!(
+            store
+                .put(
+                    "k",
+                    PutBody::Bytes(bytes::Bytes::from_static(b"x")),
+                    PutMode::Create.into(),
+                )
+                .await
+                .unwrap_err()
+                .is_retryable()
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        attempts.store(0, Ordering::SeqCst);
+        assert!(store.delete("k", None).await.unwrap_err().is_retryable());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        let zero = store_for_attempts(&endpoint, 0);
+        attempts.store(0, Ordering::SeqCst);
+        assert!(zero.head("k").await.unwrap_err().is_retryable());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     async fn put_error(client: &S3Client) -> SdkError<PutObjectError> {

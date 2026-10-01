@@ -12,6 +12,7 @@ use futures::StreamExt;
 
 use google_cloud_auth::credentials::Builder as AuthBuilder;
 use google_cloud_gax::error::rpc::Code;
+use google_cloud_gax::retry_policy::{NeverRetry, RetryPolicyExt};
 use google_cloud_storage::builder::storage::SignedUrlBuilder;
 use google_cloud_storage::client::{Storage, StorageControl};
 use google_cloud_storage::model_ext::ReadRange;
@@ -37,7 +38,6 @@ const LIST_PAGE_SIZE: i32 = 1000;
 /// (503) or retries. Metadata/control calls are quick (p99 ~80 ms); body reads
 /// and uploads get time proportional to their size.
 /// Mid-stream resumes per bulk read before the error is surfaced.
-const BULK_RESUME_ATTEMPTS: u32 = 5;
 const META_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 const READ_OPEN_DEADLINE: std::time::Duration = std::time::Duration::from_mins(1);
 /// Per chunk of a streaming body read (not the whole stream).
@@ -45,8 +45,6 @@ const READ_CHUNK_DEADLINE: std::time::Duration = std::time::Duration::from_mins(
 const PUT_MIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 /// Uploads get this many bytes per second on top of `PUT_MIN_DEADLINE` (1 MiB/s floor).
 const PUT_BYTES_PER_SEC: u64 = 1024 * 1024;
-/// Idempotent metadata reads that time out are retried once after a short jittered pause.
-const READ_RETRIES: u32 = 1;
 
 fn put_deadline(bytes: u64) -> std::time::Duration {
     PUT_MIN_DEADLINE + std::time::Duration::from_secs(bytes / PUT_BYTES_PER_SEC)
@@ -66,8 +64,8 @@ fn deadline_error(op: &str, key: &str, deadline: std::time::Duration) -> StoreEr
 
 /// Run a GCS call under `deadline`; the client error keeps its meaning through
 /// `map_error` (`NotFound` / `PreconditionFailed` / `NotModified`), a timeout becomes
-/// [`deadline_error`]. `retries` extra attempts are made only when the deadline
-/// fired (the call is idempotent for every caller that passes > 0).
+/// [`deadline_error`]. `retries` extra attempts are made for deadlines and
+/// transient service errors (the call is idempotent for every caller that passes > 0).
 async fn call<T, F, Fut>(
     op: &'static str,
     key: &str,
@@ -83,6 +81,9 @@ where
     loop {
         match tokio::time::timeout(deadline, make()).await {
             Ok(Ok(v)) => return Ok(v),
+            Ok(Err(e)) if is_retryable(&e) && attempt < retries => {
+                tracing::warn!(op, key, attempt, error = %e, "retrying transient gcs error");
+            }
             Ok(Err(e)) => return Err(GcsCallError::Gcs(e)),
             Err(_) => {
                 if attempt >= retries {
@@ -95,17 +96,15 @@ where
                     deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
                     "gcs call exceeded deadline, retrying"
                 );
-                attempt += 1;
-                let jitter = 100
-                    + u64::from(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.subsec_nanos())
-                            % 400,
-                    );
-                tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
             }
         }
+        let delay = crate::util::backoff(
+            attempt,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(2),
+        );
+        attempt += 1;
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -159,6 +158,7 @@ pub struct GcsStore {
     bucket_resource: String, // "projects/_/buckets/{bucket}"
     signing_signer: Option<google_cloud_auth::signer::Signer>,
     signing_service_account: Option<String>,
+    max_retries: u32,
 }
 
 impl GcsStore {
@@ -186,6 +186,7 @@ impl GcsStore {
 
         let storage = Storage::builder()
             .with_endpoint(endpoint.clone())
+            .with_retry_policy(NeverRetry)
             .build()
             .await?;
         let mut bulk = Vec::new();
@@ -194,6 +195,7 @@ impl GcsStore {
             bulk.push(
                 Storage::builder()
                     .with_endpoint(endpoint.clone())
+                    .with_retry_policy(NeverRetry)
                     .build()
                     .await?,
             );
@@ -211,6 +213,7 @@ impl GcsStore {
 
         let control = StorageControl::builder()
             .with_endpoint(endpoint)
+            .with_retry_policy(NeverRetry)
             .build()
             .await?;
 
@@ -234,6 +237,7 @@ impl GcsStore {
             bucket_resource,
             signing_signer,
             signing_service_account: cfg.gcs.signing_service_account.clone(),
+            max_retries: cfg.max_retries,
         })
     }
 
@@ -266,6 +270,7 @@ impl GcsStore {
             permits: self.bulk_permits.clone(),
             endpoint: std::env::var("WALGIT_GCS_HTTP_ENDPOINT")
                 .unwrap_or_else(|_| "https://storage.googleapis.com".into()),
+            max_retries: self.max_retries,
         }
     }
 
@@ -335,7 +340,7 @@ impl GcsStore {
         let req = google_cloud_storage::model::GetObjectRequest::new()
             .set_bucket(self.bucket_resource.clone())
             .set_object(key.to_owned());
-        match call("head", key, META_DEADLINE, READ_RETRIES, || {
+        match call("head", key, META_DEADLINE, self.max_retries, || {
             self.control.get_object().with_request(req.clone()).send()
         })
         .await
@@ -352,8 +357,8 @@ impl GcsStore {
     /// response body", a chunk deadline — prod 2026-08-21 ×6, aborting a
     /// history-pack install) the wrapper re-issues the request for the bytes
     /// not yet delivered (`Range: bytes=<pos>-<end>`, pinned to the same
-    /// generation so a rewritten object can never be spliced), up to
-    /// `BULK_RESUME_ATTEMPTS` times with jittered backoff.
+    /// generation so a rewritten object can never be spliced), up to the
+    /// configured `store.max_retries` with jittered backoff.
     /// `walgit_remote_chunk_retries_total` counts the resumes.
     async fn bulk_http_read(
         &self,
@@ -402,7 +407,7 @@ impl BulkHttp {
                             return Some((Ok(b), (st, this, key)));
                         }
                         None => {
-                            if end > 0 && st.pos < end && st.attempts < BULK_RESUME_ATTEMPTS {
+                            if end > 0 && st.pos < end && st.attempts < this.max_retries {
                                 // Short body without an error: resume too.
                                 tracing::warn!(key = %key, pos = st.pos, end, "gcs bulk read ended early; resuming");
                             } else {
@@ -410,7 +415,7 @@ impl BulkHttp {
                             }
                         }
                         Some(Err(e)) => {
-                            if st.attempts >= BULK_RESUME_ATTEMPTS || st.pos >= end {
+                            if st.attempts >= this.max_retries || st.pos >= end {
                                 return Some((Err(e), (st, this, key)));
                             }
                             tracing::warn!(key = %key, pos = st.pos, end, attempt = st.attempts + 1, error = %e, "gcs bulk read failed mid-stream; resuming from the bytes received");
@@ -425,7 +430,7 @@ impl BulkHttp {
                     match this.open(&key, Some(st.pos..end), generation).await {
                         Ok((_, _, s)) => st.inner = s,
                         Err(e) => {
-                            if st.attempts >= BULK_RESUME_ATTEMPTS {
+                            if st.attempts >= this.max_retries {
                                 return Some((Err(e), (st, this, key)));
                             }
                             // Try again after the next backoff (loop: inner is exhausted → None arm).
@@ -451,12 +456,13 @@ pub(crate) struct BulkHttp {
     /// JSON API endpoint (`https://storage.googleapis.com`; tests point it at
     /// a local server that cuts bodies).
     endpoint: String,
+    max_retries: u32,
 }
 
 impl BulkHttp {
     /// Test constructor: no credentials, any endpoint.
     #[cfg(test)]
-    pub(crate) fn for_tests(endpoint: String, bucket: String) -> Self {
+    pub(crate) fn for_tests(endpoint: String, bucket: String, max_retries: u32) -> Self {
         BulkHttp {
             clients: vec![reqwest::Client::new()],
             next: std::sync::Arc::default(),
@@ -464,6 +470,7 @@ impl BulkHttp {
             bucket,
             permits: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
             endpoint,
+            max_retries,
         }
     }
 
@@ -687,7 +694,7 @@ impl ObjectStore for GcsStore {
                     .set_object(key.to_owned())
                     .set_if_generation_not_match(generation);
 
-                let result = match call("get", key, META_DEADLINE, READ_RETRIES, || {
+                let result = match call("get", key, META_DEADLINE, self.max_retries, || {
                     self.control.get_object().with_request(req.clone()).send()
                 })
                 .await
@@ -738,7 +745,12 @@ impl ObjectStore for GcsStore {
             return Ok(GetResult::Object { meta, body });
         }
         let (client, permit) = self.data_client(key, opts.range.is_some()).await;
-        let mut builder = client.read_object(self.bucket_resource.clone(), key.to_owned());
+        let mut builder = client
+            .read_object(self.bucket_resource.clone(), key.to_owned())
+            .with_retry_policy(
+                google_cloud_storage::retry_policy::RetryableErrors
+                    .with_attempt_limit(self.max_retries.saturating_add(1)),
+            );
 
         if let Some(v) = &opts.if_match {
             if let Some(generation) = parse_generation(v) {
@@ -777,7 +789,7 @@ impl ObjectStore for GcsStore {
         let req = google_cloud_storage::model::GetObjectRequest::new()
             .set_bucket(self.bucket_resource.clone())
             .set_object(key.to_owned());
-        match call("head", key, META_DEADLINE, READ_RETRIES, || {
+        match call("head", key, META_DEADLINE, self.max_retries, || {
             self.control.get_object().with_request(req.clone()).send()
         })
         .await
@@ -914,6 +926,7 @@ impl ObjectStore for GcsStore {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ObjectMeta>>(32);
         let control = self.control.clone();
         let bucket_resource = self.bucket_resource.clone();
+        let max_retries = self.max_retries;
         let prefix = prefix.to_owned();
         let start_after = start_after.map(std::borrow::ToOwned::to_owned);
 
@@ -938,7 +951,7 @@ impl ObjectStore for GcsStore {
                 }
 
                 let list_key = format!("{prefix}/list");
-                let resp = match call("list", &list_key, META_DEADLINE, READ_RETRIES, || {
+                let resp = match call("list", &list_key, META_DEADLINE, max_retries, || {
                     control.list_objects().with_request(req.clone()).send()
                 })
                 .await
@@ -991,7 +1004,7 @@ impl ObjectStore for GcsStore {
                 "list_prefixes",
                 &list_key,
                 META_DEADLINE,
-                READ_RETRIES,
+                self.max_retries,
                 || self.control.list_objects().with_request(req.clone()).send(),
             )
             .await
@@ -1226,6 +1239,63 @@ fn map_error(key: &str, e: google_cloud_storage::Error) -> StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn metadata_read_retry_budget_is_extra_attempts() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = attempts.clone();
+        let result = call(
+            "head",
+            "k",
+            std::time::Duration::from_secs(1),
+            2,
+            move || {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err::<(), _>(google_cloud_gax::error::Error::service(
+                        google_cloud_gax::error::rpc::Status::default()
+                            .set_code(Code::Unavailable)
+                            .set_message("503"),
+                    ))
+                }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "initial read plus two configured retries"
+        );
+
+        attempts.store(0, std::sync::atomic::Ordering::SeqCst);
+        let seen = attempts.clone();
+        let result = call(
+            "delete",
+            "k",
+            std::time::Duration::from_secs(1),
+            0,
+            move || {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err::<(), _>(google_cloud_gax::error::Error::service(
+                        google_cloud_gax::error::rpc::Status::default()
+                            .set_code(Code::Unavailable)
+                            .set_message("503"),
+                    ))
+                }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a zero retry budget makes exactly one attempt"
+        );
+    }
 
     #[test]
     fn gen_version_formats_decimal() {
@@ -1582,7 +1652,7 @@ mod resume_tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let bulk = BulkHttp::for_tests(format!("http://{addr}"), "b".into());
+        let bulk = BulkHttp::for_tests(format!("http://{addr}"), "b".into(), 2);
         let (size, generation, mut body) = bulk.read("k", None, None).await.unwrap();
         assert_eq!((size, generation), (3000, Some(7)));
         let mut got = Vec::new();
