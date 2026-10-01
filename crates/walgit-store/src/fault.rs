@@ -19,6 +19,7 @@
 //! Fault kinds (see [`FaultPlan`]): latency, transient error *before* the op
 //! (nothing applied), transient error *after* a mutation (applied, response
 //! lost — the one that breaks "PUT then CAS" protocols), spurious CAS failure,
+//! a CAS answered 412 after it applied (a client library retrying a write that landed),
 //! stale 304, truncated bodies, hanging futures, black hole, missing objects,
 //! and panics (a process crash in the middle of a protocol step).
 //!
@@ -58,6 +59,10 @@ pub struct FaultPlan {
     pub p_err_after: f64,
     /// Conditional PUT/DELETE answers `PreconditionFailed` without applying.
     pub p_cas_fail: f64,
+    /// Conditional mutation applied, then `PreconditionFailed` returned: what a client library's
+    /// own retry of a write that landed (first reply lost) answers. S3's SDK retries in standard
+    /// mode; GCS retries uploads that carry a precondition as idempotent.
+    pub p_cas_fail_after: f64,
     /// `get` with `if_none_match` answers `NotModified` regardless of the
     /// real version (a replica that never sees anyone else's writes).
     pub p_stale_304: f64,
@@ -121,6 +126,7 @@ pub struct Stats {
     pub err_before: AtomicU64,
     pub err_after: AtomicU64,
     pub cas_fail: AtomicU64,
+    pub cas_fail_after: AtomicU64,
     pub stale_304: AtomicU64,
     pub truncate: AtomicU64,
     pub hang: AtomicU64,
@@ -133,6 +139,7 @@ impl Stats {
         self.err_before.load(Ordering::Relaxed)
             + self.err_after.load(Ordering::Relaxed)
             + self.cas_fail.load(Ordering::Relaxed)
+            + self.cas_fail_after.load(Ordering::Relaxed)
             + self.stale_304.load(Ordering::Relaxed)
             + self.truncate.load(Ordering::Relaxed)
             + self.hang.load(Ordering::Relaxed)
@@ -141,11 +148,12 @@ impl Stats {
     }
     pub fn summary(&self) -> String {
         format!(
-            "ops={} err_before={} err_after={} cas_fail={} stale_304={} truncate={} hang={} denied={} panics={}",
+            "ops={} err_before={} err_after={} cas_fail={} cas_fail_after={} stale_304={} truncate={} hang={} denied={} panics={}",
             self.ops.load(Ordering::Relaxed),
             self.err_before.load(Ordering::Relaxed),
             self.err_after.load(Ordering::Relaxed),
             self.cas_fail.load(Ordering::Relaxed),
+            self.cas_fail_after.load(Ordering::Relaxed),
             self.stale_304.load(Ordering::Relaxed),
             self.truncate.load(Ordering::Relaxed),
             self.hang.load(Ordering::Relaxed),
@@ -214,6 +222,7 @@ enum Decision {
     ErrBefore,
     ErrAfter,
     CasFail,
+    CasFailAfter,
     Stale,
     Truncate(usize),
     Hang,
@@ -375,6 +384,10 @@ impl FaultStore {
         } else if mutation && conditional && roll[2] < plan.p_cas_fail {
             self.stats.cas_fail.fetch_add(1, Ordering::Relaxed);
             Decision::CasFail
+        } else if mutation && conditional && roll[2] < plan.p_cas_fail + plan.p_cas_fail_after {
+            // Shares the CAS roll: a plan without this fault keeps every seeded sequence.
+            self.stats.cas_fail_after.fetch_add(1, Ordering::Relaxed);
+            Decision::CasFailAfter
         } else if mutation && roll[3] < plan.p_err_after {
             self.stats.err_after.fetch_add(1, Ordering::Relaxed);
             Decision::ErrAfter
@@ -393,6 +406,7 @@ impl FaultStore {
                 Decision::ErrBefore => "err-before",
                 Decision::CasFail => "cas-fail",
                 Decision::ErrAfter => "err-after",
+                Decision::CasFailAfter => "cas-fail-after (applied)",
                 Decision::Stale => "stale-304",
                 Decision::Truncate(_) => "truncate",
                 _ => "?",
@@ -493,6 +507,13 @@ impl ObjectStore for FaultStore {
                 let _ = self.inner.put(key, body, opts).await?;
                 Err(self.retryable("put", key, "after (applied)"))
             }
+            Decision::CasFailAfter => {
+                let _ = self.inner.put(key, body, opts).await?;
+                Err(StoreError::PreconditionFailed {
+                    key: key.into(),
+                    current: None,
+                })
+            }
             _ => self.inner.put(key, body, opts).await,
         }
     }
@@ -509,6 +530,13 @@ impl ObjectStore for FaultStore {
             Decision::ErrAfter => {
                 self.inner.delete(key, if_version).await?;
                 Err(self.retryable("delete", key, "after (applied)"))
+            }
+            Decision::CasFailAfter => {
+                self.inner.delete(key, if_version).await?;
+                Err(StoreError::PreconditionFailed {
+                    key: key.into(),
+                    current: None,
+                })
             }
             _ => self.inner.delete(key, if_version).await,
         }
@@ -572,6 +600,13 @@ impl ObjectStore for FaultStore {
                 let _ = self.inner.compose(dest, sources, opts).await?;
                 Err(self.retryable("compose", dest, "after (applied)"))
             }
+            Decision::CasFailAfter => {
+                let _ = self.inner.compose(dest, sources, opts).await?;
+                Err(StoreError::PreconditionFailed {
+                    key: dest.into(),
+                    current: None,
+                })
+            }
             _ => self.inner.compose(dest, sources, opts).await,
         }
     }
@@ -623,7 +658,7 @@ impl FaultStore {
                 }
                 r @ GetResult::NotModified { .. } => Ok(r),
             },
-            Decision::Proceed | Decision::ErrAfter | Decision::CasFail => {
+            Decision::Proceed | Decision::ErrAfter | Decision::CasFail | Decision::CasFailAfter => {
                 self.inner.get(key, opts).await
             }
         }

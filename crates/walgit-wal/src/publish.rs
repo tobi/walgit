@@ -748,7 +748,26 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
         // lost the response. Look before deciding.
         let committed: Option<(Manifest, walgit_store::Version)> = match cas {
             Ok(meta) => Some((updated, meta.version)),
-            Err(StoreError::PreconditionFailed { .. }) => None,
+            // A client library that retries a CAS whose first reply was lost gets 412 from our own
+            // landed write (S3's SDK in standard mode; GCS for uploads with a precondition). Look
+            // before dropping the segment the committed manifest may already list.
+            Err(StoreError::PreconditionFailed { .. }) => {
+                match cas_landed(&handle.store, &slot)
+                    .instrument(span.clone())
+                    .await
+                {
+                    Ok(Some((fresh, version))) => {
+                        tracing::warn!(repo = %handle.id, seq = last_seq, "manifest CAS answered 412 but landed");
+                        Some((fresh, version))
+                    }
+                    Ok(None) => None,
+                    Err(e) => {
+                        let msg =
+                            format!("manifest CAS answered 412 and re-reading it failed: {e}");
+                        return finish_with_error_msg(batch, &valid_indices, &msg, e);
+                    }
+                }
+            }
             Err(e) => match cas_landed(&handle.store, &slot)
                 .instrument(span.clone())
                 .await
@@ -1180,7 +1199,17 @@ pub(crate) async fn publish_compact_classified(
             .await;
         let committed = match cas {
             Ok(meta) => Some((updated, meta.version)),
-            Err(StoreError::PreconditionFailed { .. }) => None,
+            // A 412 can be our own landed write answering a client library's retry (see
+            // `process_batch`): look before dropping the segment.
+            Err(StoreError::PreconditionFailed { .. }) => {
+                match cas_landed(&handle.store, &slot).await? {
+                    Some((fresh, version)) => {
+                        tracing::warn!(repo = %handle.id, seq, "compact manifest CAS answered 412 but landed");
+                        Some((fresh, version))
+                    }
+                    None => None,
+                }
+            }
             Err(e) => match cas_landed(&handle.store, &slot).await {
                 Ok(Some((fresh, version))) => {
                     tracing::warn!(repo = %handle.id, seq, "compact manifest CAS errored but landed: {e}");
@@ -1501,6 +1530,14 @@ pub(crate) async fn publish_settings_impl(
                 return Ok(revision);
             }
             Err(StoreError::PreconditionFailed { .. }) => {
+                // A 412 can be our own landed write answering a client library's retry (see
+                // `process_batch`). Committed: leave the segment and let the next sync adopt it.
+                if cas_landed(&handle.store, &slot).await?.is_some() {
+                    handle.manifest_version.lock().take();
+                    sweep_burned(&handle.store, &slot).await;
+                    tracing::warn!(repo = %handle.id, seq, revision, "settings CAS answered 412 but landed");
+                    return Ok(revision);
+                }
                 drop_own_slot(&handle.store, &slot).await;
                 attempts += 1;
                 if attempts >= max_retries {

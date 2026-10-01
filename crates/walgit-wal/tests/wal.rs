@@ -2910,6 +2910,122 @@ async fn lost_cas_reply_is_resolved_or_unknown_without_losing_the_commit() {
     assert_eq!(handle.read_log(1, None).await.unwrap().len(), 3);
 }
 
+/// A client library that retries a conditional write whose first reply was lost gets 412 from its
+/// own landed write. No publisher may read that as a lost race and delete the segment the committed
+/// manifest now lists: not a push, a compaction or a settings change.
+#[tokio::test]
+async fn a_landed_cas_answered_412_keeps_the_commit() {
+    use prost::Message;
+    use walgit_store::ObjectStoreExt;
+    use walgit_store::fault::{FaultPlan, FaultStore};
+    let landed_412 = || FaultPlan {
+        p_cas_fail_after: 1.0,
+        only_keys: Some(vec!["manifest.pb".into()]),
+        ..Default::default()
+    };
+    let cache = tempfile::tempdir().unwrap();
+    let truth = MemoryStore::shared();
+    let link = FaultStore::new(truth.clone(), "landed-412", 1);
+    let registry = Registry::new(link.clone(), Arc::new(make_config(cache.path(), 0)));
+    let id = repo_id("o", "landed");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    // Every segment the manifest lists exists, and a fresh instance syncs to `tip`.
+    let intact = |what: &'static str, tip: String| {
+        let truth = truth.clone();
+        let id = id.clone();
+        async move {
+            let mkey = format!("{}{}", id.store_prefix(), walgit_proto::keys::MANIFEST);
+            let (_, bytes) = truth.get_bytes(&mkey).await.unwrap().unwrap();
+            let manifest = walgit_proto::v1::Manifest::decode(bytes.as_ref()).unwrap();
+            for segment in &manifest.log_segments {
+                let key = format!("{}{}", id.store_prefix(), segment.key);
+                assert!(
+                    truth.get_bytes(&key).await.unwrap().is_some(),
+                    "{what}: manifest lists {} but it is gone",
+                    segment.key
+                );
+            }
+            let reader_cache = tempfile::tempdir().unwrap();
+            let reader = Registry::new(truth, Arc::new(make_config(reader_cache.path(), 0)))
+                .open(&id)
+                .await
+                .unwrap();
+            drop(reader.sync_refs().await.unwrap());
+            assert_eq!(
+                reader.local().ref_view().unwrap().get("refs/heads/main"),
+                Some(tip),
+                "{what}"
+            );
+        }
+    };
+
+    let work = WorkRepo::new();
+    let first = work.commit("first", "content");
+    let pack = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    link.set(landed_412());
+    let pushed = handle
+        .publish_push(
+            Some(pack),
+            make_txn(vec![("refs/heads/main", "", &first)]),
+            HashMap::new(),
+        )
+        .await;
+    link.heal();
+    intact("push", first.clone()).await;
+    assert!(
+        pushed
+            .unwrap()
+            .per_ref
+            .iter()
+            .all(|(_, status)| status.is_ok()),
+        "a durable push must be acknowledged"
+    );
+
+    let second = work.commit("second", "more");
+    let pack = ingest_pack_data(&handle, work.create_incremental_pack(&second, &first))
+        .await
+        .unwrap();
+    handle
+        .publish_push(
+            Some(pack),
+            make_txn(vec![("refs/heads/main", &first, &second)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let repack = handle
+        .local()
+        .repack(walgit_git::RepackOptions {
+            mode: walgit_git::RepackMode::Full,
+            write_bitmap: false,
+            write_midx: false,
+            keep: vec![],
+        })
+        .await
+        .unwrap();
+    link.set(landed_412());
+    let compacted = handle
+        .publish_compact(repack.new_packs[0].clone(), repack.removed.clone(), 2)
+        .await;
+    link.heal();
+    intact("compaction", second.clone()).await;
+    assert!(
+        compacted.is_ok(),
+        "a durable compaction must be acknowledged"
+    );
+
+    link.set(landed_412());
+    let settings = handle
+        .publish_settings("[packs]\nenabled = false\n", "test", "landed 412")
+        .await;
+    link.heal();
+    intact("settings", second).await;
+    assert!(
+        settings.is_ok(),
+        "a durable settings change must be acknowledged"
+    );
+}
+
 #[tokio::test]
 async fn readiness_carries_only_proven_inventory_and_rechecks_revision_only_restart() {
     let writer_cache = tempfile::tempdir().unwrap();
