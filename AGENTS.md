@@ -487,6 +487,14 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   and candidate external-boundary proof remain separate obligations; local loose objects and retired
   download membership cannot justify retirement. See the cost and remaining-evidence rows in the linked docs.
 
+- **D50 (2026-10-01): `WALGIT__` overrides fail closed.** An environment override this build cannot
+  apply (malformed name, unknown section or key, wrong type) is a startup and `config check` error that
+  names each variable and the nearest known key; nothing of the batch is applied. This supersedes the
+  warn-and-ignore loader (2026-08-21: a key newer than one host's image crash-looped it): a host running
+  on a default it was told to change is the worse failure, and the file already refuses unknown keys.
+  Roll the image before the env that needs it; gate the rollout on `walgit config check --env-file`
+  run by the binary that will serve.
+
 ## 5. Working rules
 
 - **No backwards compatibility (pre-1.0, banner at top):** change the shape and delete the old one in the same

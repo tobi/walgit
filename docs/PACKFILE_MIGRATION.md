@@ -24,9 +24,9 @@ this plan is not a test receipt.
 ## Host configuration
 
 Remove `[bundles]` and every `[[bundles.strategy]]` table, `server.roles` entries named `bundle`, and
-`cache.bundle_list_entries`. The new parser rejects these removed host shapes. Environment override loaders
-that warn and ignore unknown keys are not migration tools: remove corresponding `WALGIT__BUNDLES__*` and
-cache overrides from the host's deployment configuration as well.
+`cache.bundle_list_entries`. The new parser rejects these removed host shapes, and so does the environment
+override loader: remove corresponding `WALGIT__BUNDLES__*` and cache overrides from the host's deployment
+configuration as well.
 
 The lifecycle layer replaces `[compaction]` with `[packs]`; old host keys and newly submitted old settings
 are rejected. The ordinary `compact` role remains. LFS `serve_via = "proxy"` or `"signed_url"` is unchanged.

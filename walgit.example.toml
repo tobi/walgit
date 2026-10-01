@@ -2,7 +2,8 @@
 #
 # Start from walgit.standalone.toml for a first run; come here when you need a key.
 # Every key can also be set from the environment: WALGIT__SECTION__KEY=value (TOML value syntax).
-# Validate with: walgit --config walgit.toml config check
+# An override this build cannot apply (unknown key, wrong type) is a startup error, like an unknown key here.
+# Validate with: walgit --config walgit.toml config check [--env-file host.env]
 
 [server]
 listen = "127.0.0.1:8080"        # default; `mode = none` is refused unless this is loopback. Public bind: 0.0.0.0 with token/oidc.
@@ -72,11 +73,12 @@ multipart_threshold = "64MiB"     # PUTs above this use multipart/resumable uplo
 multipart_part_size = "32MiB"
 
 [store.s3]
-endpoint = "https://s3.us-east-1.amazonaws.com"   # or http://127.0.0.1:9000 for rustfs/MinIO
+endpoint = "http://127.0.0.1:9000"       # the local rustfs/MinIO rig; AWS: "https://s3.<region>.amazonaws.com"
 region = "us-east-1"
 access_key_env = "AWS_ACCESS_KEY_ID"     # env var names read at runtime; AWS_SESSION_TOKEN is also honored when set
 secret_key_env = "AWS_SECRET_ACCESS_KEY"
-force_path_style = false          # true for most self-hosted S3 implementations
+force_path_style = true           # path-style `endpoint/bucket/key`, what rustfs/MinIO/Ceph need; on AWS set false
+                                  # for virtual-hosted `bucket.endpoint/key`, AWS's addressing
 
 [store.gcs]
 endpoint = "https://storage.googleapis.com"  # gRPC endpoint; credentials = Application Default Credentials

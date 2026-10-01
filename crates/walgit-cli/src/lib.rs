@@ -376,15 +376,12 @@ enum ConfigAction {
     /// Parse and validate the config file; print OK or the error.
     Check {
         /// Also apply `WALGIT__*` overrides from these env files (KEY=VALUE
-        /// lines; `#` comments) on top of the process env, report every key
-        /// this build ignores, and exit 3 when `--strict` and any was ignored.
+        /// lines; `#` comments) on top of the process env; an override this
+        /// build cannot apply fails the check exactly as it fails startup.
         /// Useful in a process supervisor's pre-start check to validate an env
         /// file against the binary that will actually run.
         #[arg(long = "env-file")]
         env_files: Vec<std::path::PathBuf>,
-        /// Exit 3 if any override was ignored (unknown in this build).
-        #[arg(long)]
-        strict: bool,
     },
     /// Print the effective config as TOML.
     Dump,

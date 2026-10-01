@@ -763,6 +763,74 @@ impl Config {
     }
 }
 
+/// Why an override at `path` does not deserialize: the error's first line, or for an unknown
+/// key the section it is not in and the nearest key serde offered (`expected one of `a`, …`),
+/// spelled as the variable to set instead.
+fn env_override_error(path: &[String], err: &str) -> String {
+    let first = err
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("invalid")
+        .to_string();
+    // `unknown field `x`, expected one of `a`, `b`` → x, then the candidates.
+    let Some((_, tail)) = err.split_once("unknown field `") else {
+        return first;
+    };
+    let mut ticks = tail
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split('`')
+        .step_by(2);
+    let Some(field) = ticks.next() else {
+        return first;
+    };
+    let Some(depth) = path.iter().position(|p| p == field) else {
+        return first;
+    };
+    let section = match path.get(..depth) {
+        Some([]) | None => "the top level".to_string(),
+        Some(s) => format!("[{}]", s.join(".")),
+    };
+    let nearest = ticks
+        .filter(|c| !c.is_empty())
+        .map(|c| (edit_distance(field, c), c))
+        .min()
+        .filter(|(d, _)| *d <= 2.max(field.len() / 3));
+    match nearest {
+        Some((_, key)) => {
+            let fixed: Vec<&str> = path
+                .iter()
+                .take(depth)
+                .map(String::as_str)
+                .chain([key])
+                .collect();
+            format!(
+                "unknown key `{field}` in {section}; did you mean WALGIT__{}?",
+                fixed.join("__").to_ascii_uppercase()
+            )
+        }
+        None => format!("unknown key `{field}` in {section}"),
+    }
+}
+
+/// Levenshtein distance; enough to turn a typo'd override into a suggestion.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let mut prev: Vec<usize> = (0..=b.chars().count()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (cb, pair) in b.chars().zip(prev.windows(2)) {
+            let left = cur.last().copied().unwrap_or_default();
+            if let [diag, up] = pair {
+                cur.push((diag + usize::from(ca != cb)).min(up + 1).min(left + 1));
+            }
+        }
+        prev = cur;
+    }
+    prev.last().copied().unwrap_or_default()
+}
+
 /// `owner/name` matches an entry of `list` (`owner/name`, `owner/*`, `*`; `.git` tolerated).
 /// The `placement` table as the env overrides alone set it (None when no
 /// `WALGIT__PLACEMENT__*` variable was present).
@@ -965,29 +1033,17 @@ impl Config {
     /// Apply `WALGIT__a__b=v` overrides (values parsed as TOML values, falling back to string)
     /// and a serverless host's `PORT`.
     ///
-    /// Config and image are released independently (the ssd-host host follows
-    /// the serving image's version): an override for a key **unknown to this build**
-    /// (or with an unparsable value) is **ignored with a WARN**, never a
-    /// startup failure (2026-08-21: `unknown field disk_high_watermark`
-    /// crash-looped a host running the previous image). The ignored keys are
-    /// returned by [`apply_env_report`].
+    /// Fails closed, like an unknown key in the file (`deny_unknown_fields`): an override this
+    /// build cannot apply — a malformed name, an unknown section or key (a typo, or a key from
+    /// a newer build), a value of the wrong type — is an error naming every such variable (and
+    /// the nearest known key), and nothing is applied. A typo'd `WALGIT__SERVER__LSITEN` used
+    /// to be a WARN while the host ran on the default. Validate an env file against the binary
+    /// that will run before rolling either out: `walgit config check --env-file`.
     pub fn apply_env(&mut self, vars: impl Iterator<Item = (String, String)>) -> Result<()> {
-        let ignored = self.apply_env_report(vars)?;
-        for (k, why) in &ignored {
-            tracing::warn!(key = %k, reason = %why, "ignoring {k}: unknown in this build");
-        }
-        Ok(())
-    }
-
-    /// [`apply_env`] returning the `(key, reason)` pairs it had to ignore.
-    pub fn apply_env_report(
-        &mut self,
-        vars: impl Iterator<Item = (String, String)>,
-    ) -> Result<Vec<(String, String)>> {
         let mut vars_seen: Vec<String> = Vec::new();
         let mut doc: toml::Table = toml::Table::try_from(&*self).context("serializing config")?;
         let mut touched = false;
-        let mut ignored = Vec::new();
+        let mut refused = Vec::new();
         let mut port_override = None;
         for (k, v) in vars {
             if k == "PORT" {
@@ -999,14 +1055,17 @@ impl Config {
             };
             vars_seen.push(k.clone());
             let path: Vec<String> = rest.split("__").map(str::to_ascii_lowercase).collect();
-            if path.is_empty() || path.iter().any(std::string::String::is_empty) {
+            if path.iter().any(std::string::String::is_empty) {
+                refused.push(format!(
+                    "{k}: not a configuration path (WALGIT__SECTION__KEY)"
+                ));
                 continue;
             }
             let value: toml::Value = v
                 .parse::<toml::Value>()
                 .unwrap_or(toml::Value::String(v.clone()));
-            // Apply into a copy and type-check it alone: a bad/unknown key is
-            // dropped (WARN) instead of failing every other override with it.
+            // Apply into a copy and type-check it alone, so every unusable
+            // override is named at once, each with its own reason.
             let mut trial = doc.clone();
             let bad = {
                 fn set(
@@ -1030,22 +1089,25 @@ impl Config {
                 }
                 match set(&mut trial, &path, value) {
                     Err(why) => Some(why),
-                    Ok(()) => trial.clone().try_into::<Config>().err().map(|e| {
-                        e.to_string()
-                            .lines()
-                            .next()
-                            .unwrap_or("invalid")
-                            .to_string()
-                    }),
+                    Ok(()) => trial
+                        .clone()
+                        .try_into::<Config>()
+                        .err()
+                        .map(|e| env_override_error(&path, &e.to_string())),
                 }
             };
             if let Some(why) = bad {
-                ignored.push((k, why));
+                refused.push(format!("{k}: {why}"));
             } else {
                 doc = trial;
                 touched = true;
             }
         }
+        anyhow::ensure!(
+            refused.is_empty(),
+            "WALGIT__ environment override(s) this build cannot apply:\n  {}",
+            refused.join("\n  ")
+        );
         // `[placement]` is a host fact set as a GROUP: any WALGIT__PLACEMENT__* override
         // replaces the whole section (unset keys = the section's defaults), never
         // merges with the baked file's. 2026-08-21 07:00Z: the image's toml carried
@@ -1073,7 +1135,7 @@ impl Config {
                 *u = rewrite_origin_port(u, port);
             }
         }
-        Ok(ignored)
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -1356,8 +1418,13 @@ mod tests {
 
     #[test]
     fn example_configurations_parse_and_validate() {
-        Config::parse(include_str!("../../../walgit.example.toml")).unwrap();
+        let example = Config::parse(include_str!("../../../walgit.example.toml")).unwrap();
         Config::parse(include_str!("../../../walgit.standalone.toml")).unwrap();
+        // The example documents defaults; `[store.s3]` once showed AWS values instead.
+        assert_eq!(
+            toml::to_string(&example.store.s3).unwrap(),
+            toml::to_string(&S3Config::default()).unwrap()
+        );
     }
 
     #[test]
@@ -1468,50 +1535,65 @@ mod tests {
         c.validate().unwrap();
     }
 
-    /// Config and image release independently: an override for a key this
-    /// build does not know (or a value it cannot parse) is ignored and
-    /// reported, the known ones still apply, startup continues.
+    /// An override this build cannot apply fails closed, like an unknown key in the
+    /// file: every such variable is named (with the nearest key for a typo), and none
+    /// of the batch is applied — not even the valid ones.
     #[test]
-    fn env_override_unknown_key_is_ignored_not_fatal() {
+    fn env_override_this_build_cannot_apply_is_an_error() {
         let mut c = Config::default();
-        let ignored = c
-            .apply_env_report(
+        let err = c
+            .apply_env(
                 vec![
+                    ("WALGIT__WAL__BATCH_WINDOW".to_string(), "30ms".to_string()),
                     (
-                        "WALGIT__CACHE__NOT_A_KEY_YET".to_string(),
-                        "0.9".to_string(),
+                        "WALGIT__SERVER__LSITEN".to_string(),
+                        "0.0.0.0:9".to_string(),
                     ),
                     (
                         "WALGIT__WAL__MAX_BATCH".to_string(),
                         "not-a-number".to_string(),
                     ),
                     ("WALGIT__NOSUCHSECTION__X".to_string(), "1".to_string()),
-                    ("WALGIT__WAL__BATCH_WINDOW".to_string(), "30ms".to_string()),
+                    ("WALGIT__CACHE____DIR".to_string(), "/x".to_string()),
                 ]
                 .into_iter(),
             )
-            .unwrap();
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "WALGIT__SERVER__LSITEN: unknown key `lsiten` in [server]; did you mean WALGIT__SERVER__LISTEN?"
+            ),
+            "{err}"
+        );
+        assert!(err.contains("WALGIT__WAL__MAX_BATCH: "), "{err}");
+        assert!(
+            err.contains("WALGIT__NOSUCHSECTION__X: unknown key `nosuchsection` in the top level"),
+            "{err}"
+        );
+        assert!(!err.contains("did you mean WALGIT__NOSUCHSECTION"), "{err}");
+        assert!(
+            err.contains("WALGIT__CACHE____DIR: not a configuration path"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("BATCH_WINDOW"),
+            "a valid override is not refused: {err}"
+        );
         assert_eq!(
             c.wal.batch_window,
-            Duration::from_millis(30),
-            "known override still applied"
+            Config::default().wal.batch_window,
+            "nothing applied from a refused batch"
         );
-        let keys: Vec<&str> = ignored.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(
-            keys,
-            [
-                "WALGIT__CACHE__NOT_A_KEY_YET",
-                "WALGIT__WAL__MAX_BATCH",
-                "WALGIT__NOSUCHSECTION__X"
-            ]
+        assert_eq!(c.server.listen, Config::default().server.listen);
+        // `Config::parse` (startup) reads the process env through the same path.
+        let mut c = Config::default();
+        assert!(
+            c.apply_env(vec![("WALGIT__GIT__BINARI".to_string(), "g".to_string())].into_iter())
+                .unwrap_err()
+                .to_string()
+                .contains("did you mean WALGIT__GIT__BINARY?")
         );
-        assert!(ignored[0].1.contains("unknown field"), "{:?}", ignored[0]);
-        // Plain apply_env is the same, just warns.
-        let mut c2 = Config::default();
-        c2.apply_env(
-            vec![("WALGIT__CACHE__NOT_A_KEY_YET".to_string(), "1".to_string())].into_iter(),
-        )
-        .unwrap();
     }
 
     #[test]
