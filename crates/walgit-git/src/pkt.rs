@@ -358,17 +358,41 @@ pub async fn read_ls_refs_args<R: AsyncRead + Unpin>(
 /// Arguments for the v2 `object-info` command.
 #[derive(Debug, Default, Clone)]
 pub struct ObjectInfoRequest {
+    pub size: bool,
     pub oids: Vec<String>,
 }
 
 pub fn parse_object_info(cmd: &V2Command) -> ObjectInfoRequest {
     let mut req = ObjectInfoRequest::default();
     for a in &cmd.args {
-        if let Some(o) = a.strip_prefix("oid ") {
-            req.oids.push(o.to_string());
-        }
+        parse_object_info_line(&mut req, a);
     }
     req
+}
+
+fn parse_object_info_line(req: &mut ObjectInfoRequest, line: &str) {
+    if line == "size" {
+        req.size = true;
+    } else if let Some(oid) = line.strip_prefix("oid ") {
+        req.oids.push(oid.to_string());
+    }
+}
+
+/// Read the command-specific section after the v2 command delimiter.
+pub async fn read_object_info_args<R: AsyncRead + Unpin>(
+    mut reader: R,
+    mut req: ObjectInfoRequest,
+) -> Result<ObjectInfoRequest, GitError> {
+    loop {
+        match read_pkt_line(&mut reader).await? {
+            Some(PktLine::Data(data)) => {
+                parse_object_info_line(&mut req, String::from_utf8_lossy(&data).trim_end());
+            }
+            Some(PktLine::Delim) => {}
+            Some(PktLine::Flush | PktLine::ResponseEnd) | None => break,
+        }
+    }
+    Ok(req)
 }
 
 fn io_to_git(e: std::io::Error) -> GitError {
@@ -446,5 +470,18 @@ mod tests {
             .unwrap();
         assert_eq!(req.prefixes, vec!["refs/heads/ref-199"]);
         assert!(req.peel);
+    }
+
+    #[tokio::test]
+    async fn read_object_info_args_reads_size_and_oids_after_delimiter() {
+        let mut body = Vec::new();
+        encode_data(&mut body, b"size\n");
+        encode_data(&mut body, b"oid 1111111111111111111111111111111111111111\n");
+        encode_flush(&mut body);
+        let req = read_object_info_args(std::io::Cursor::new(body), ObjectInfoRequest::default())
+            .await
+            .unwrap();
+        assert!(req.size);
+        assert_eq!(req.oids, vec!["1111111111111111111111111111111111111111"]);
     }
 }

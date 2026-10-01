@@ -18,6 +18,8 @@ use crate::repo::RepoRoute;
 use crate::stream::{VecWriter, body_to_async_read, maybe_gunzip, write_body_pipe};
 use tracing::Instrument;
 
+const MAX_OBJECT_INFO_OIDS: usize = 1024;
+
 /// Cache-control headers for smart endpoints (info/refs and pkt responses).
 fn no_cache_headers() -> [(axum::http::HeaderName, &'static str); 3] {
     [
@@ -151,6 +153,7 @@ async fn v2_capability_advert(
     // packfile section: auth, WAL sync, materialization progress. Both engines frame their sections that way.
     fetch.push_str(" sideband-all packfile-uris packfile-indexes");
     pktline::encode_text(buf, &format!("{fetch}\n"));
+    pktline::encode_text(buf, "object-info=size\n");
     pktline::encode_text(buf, "server-option\n");
     let fmt = match handle.local().object_format() {
         walgit_git::ObjectFormat::Sha1 => "sha1",
@@ -333,16 +336,89 @@ async fn upload_pack_v2(
             ))
         }
         "object-info" => {
-            let _guard = handle.sync().await.map_err(wal_err)?;
+            if let Some(r) = not_served_here(st, &route.id, "git-upload-pack").await {
+                return Ok(r);
+            }
             let req = walgit_git::pkt::parse_object_info(&cmd);
+            let req = walgit_git::pkt::read_object_info_args(reader, req)
+                .await
+                .map_err(git_err)?;
+            if !req.size {
+                return Err(ApiError::BadRequest(
+                    "object-info currently requires the size attribute".into(),
+                ));
+            }
+            if req.oids.len() > MAX_OBJECT_INFO_OIDS {
+                return Ok(git_err_response(
+                    "git-upload-pack",
+                    &format!(
+                        "walgit: object-info request has {} object ids; maximum is {MAX_OBJECT_INFO_OIDS}",
+                        req.oids.len()
+                    ),
+                ));
+            }
+            let (_guard, access) = handle.sync_objects().await.map_err(wal_err)?;
+            let repo_key = route.id.to_string();
+            let version = handle.manifest_version();
+            let oids: Vec<Option<gix_hash::ObjectId>> = req
+                .oids
+                .iter()
+                .map(|hex| gix_hash::ObjectId::from_hex(hex.as_bytes()).ok())
+                .collect();
+            let sizes = match access {
+                walgit_wal::ObjectAccess::Local => {
+                    let repo = handle.local().gix();
+                    oids.iter()
+                        .map(|oid| {
+                            let Some(oid) = oid else { return None };
+                            if let Some(size) =
+                                st.caches.object_info.get(&repo_key, version.as_ref(), *oid)
+                            {
+                                return size;
+                            }
+                            let size = gix_object::FindHeader::try_header(&repo.objects, oid)
+                                .ok()
+                                .flatten()
+                                .map(|header| header.size);
+                            st.caches
+                                .object_info
+                                .insert(&repo_key, version.as_ref(), *oid, size);
+                            size
+                        })
+                        .collect()
+                }
+                walgit_wal::ObjectAccess::Remote(packs) => {
+                    let results = futures::future::join_all(oids.iter().map(|oid| {
+                        let packs = packs.clone();
+                        let cache = st.caches.object_info.clone();
+                        let repo_key = repo_key.clone();
+                        let version = version.clone();
+                        async move {
+                            let Some(oid) = oid else { return Ok(None) };
+                            if let Some(size) = cache.get(&repo_key, version.as_ref(), *oid) {
+                                return Ok(size);
+                            }
+                            let size = packs.header(oid).await?.map(|(_, size)| size);
+                            cache.insert(&repo_key, version.as_ref(), *oid, size);
+                            Ok::<Option<u64>, walgit_wal::WalError>(size)
+                        }
+                    }))
+                    .await;
+                    results
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(wal_err)?
+                }
+            };
             let mut sizes_buf = Vec::with_capacity(256);
-            let repo = handle.local().gix();
-            for hex in &req.oids {
-                let size = gix_hash::ObjectId::from_hex(hex.as_bytes())
-                    .ok()
-                    .and_then(|oid| repo.find_object(oid).ok())
-                    .map_or(-1, |o| o.data.len() as i64);
-                pktline::encode_text(&mut sizes_buf, &format!("size {size}\n"));
+            pktline::encode_text(&mut sizes_buf, "size\n");
+            for (hex, size) in req.oids.iter().zip(sizes) {
+                match size {
+                    Some(size) => {
+                        pktline::encode_text(&mut sizes_buf, &format!("{hex} {size}\n"));
+                    }
+                    None => pktline::encode_text(&mut sizes_buf, &format!("{hex} \n")),
+                }
             }
             pktline::encode_flush(&mut sizes_buf);
             Ok(text_response(

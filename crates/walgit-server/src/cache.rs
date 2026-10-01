@@ -246,6 +246,65 @@ impl RefIndexCache {
 }
 
 // ---------------------------------------------------------------------------
+// Object information (protocol v2)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ObjectInfoKey {
+    repo: String,
+    version: String,
+    oid: gix_hash::ObjectId,
+}
+
+/// Bounded cache of object sizes. The manifest version keeps negative results
+/// from surviving a push that makes an object visible.
+#[derive(Clone)]
+pub struct ObjectInfoCache {
+    inner: Cache<ObjectInfoKey, Option<u64>>,
+}
+
+impl ObjectInfoCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            inner: Cache::builder().max_capacity(max_entries as u64).build(),
+        }
+    }
+
+    fn key(repo: &str, version: Option<&Version>, oid: gix_hash::ObjectId) -> ObjectInfoKey {
+        ObjectInfoKey {
+            repo: repo.to_string(),
+            version: version.map(|v| v.as_str().to_string()).unwrap_or_default(),
+            oid,
+        }
+    }
+
+    pub fn get(
+        &self,
+        repo: &str,
+        version: Option<&Version>,
+        oid: gix_hash::ObjectId,
+    ) -> Option<Option<u64>> {
+        let value = self.inner.get(&Self::key(repo, version, oid));
+        if value.is_some() {
+            metrics::counter!("walgit_cache_object_info_hit").increment(1);
+        } else {
+            metrics::counter!("walgit_cache_object_info_miss").increment(1);
+        }
+        value
+    }
+
+    pub fn insert(
+        &self,
+        repo: &str,
+        version: Option<&Version>,
+        oid: gix_hash::ObjectId,
+        size: Option<u64>,
+    ) {
+        self.inner.insert(Self::key(repo, version, oid), size);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ServerCaches — aggregate held by AppState
 // ---------------------------------------------------------------------------
 
@@ -254,6 +313,7 @@ impl RefIndexCache {
 pub struct ServerCaches {
     pub ref_advert: RefAdvertCache,
     pub ref_index: RefIndexCache,
+    pub object_info: ObjectInfoCache,
     /// Rendered sha-addressed web API JSON (immutable): key = repo\0kind\0sha\0path.
     pub api_immutable: Cache<String, bytes::Bytes>,
 }
@@ -263,6 +323,7 @@ impl ServerCaches {
         Self {
             ref_advert: RefAdvertCache::new(cfg.cache.ref_advert_entries),
             ref_index: RefIndexCache::new(cfg.cache.ref_advert_entries.max(64)),
+            object_info: ObjectInfoCache::new(cfg.cache.object_info_entries),
             api_immutable: Cache::builder()
                 .max_capacity(64 * 1024 * 1024)
                 .weigher(|k: &String, v: &bytes::Bytes| {

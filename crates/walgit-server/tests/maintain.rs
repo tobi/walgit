@@ -671,6 +671,32 @@ async fn host_excluded_from_serving_a_repo_refuses_object_work_with_503() -> any
     );
     let text = r.text().await?;
     assert!(text.contains("ERR walgit: acme/big is served by"), "{text}");
+
+    // Object-info is object work too and must refuse placement before sync.
+    let mut body = Vec::new();
+    walgit_server::pktline::encode_text(&mut body, "command=object-info\n");
+    walgit_server::pktline::encode_delim(&mut body);
+    walgit_server::pktline::encode_text(&mut body, "size\n");
+    walgit_server::pktline::encode_text(
+        &mut body,
+        "oid 0000000000000000000000000000000000000000\n",
+    );
+    walgit_server::pktline::encode_flush(&mut body);
+    let r = client
+        .post(format!("{}/acme/big.git/git-upload-pack", front.base_url))
+        .header("Git-Protocol", "version=2")
+        .header("Content-Type", "application/x-git-upload-pack-request")
+        .body(body)
+        .send()
+        .await?;
+    assert_eq!(r.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        r.headers().get("retry-after").map(|v| v.to_str().unwrap()),
+        Some("15")
+    );
+    let text = r.text().await?;
+    assert!(text.contains("ERR walgit: acme/big is served by"), "{text}");
+
     let tasks = step!("tasks", front.get_text("/acme/big/api/tasks", &[]))?;
     assert!(
         !tasks.contains("materialize") && !tasks.contains("remote-index"),
