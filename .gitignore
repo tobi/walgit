@@ -1,5 +1,6 @@
 target/
 *.orig
+.DS_Store
 
 # local secrets / environment — never in the repo
 .env
