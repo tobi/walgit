@@ -1080,6 +1080,10 @@ impl Config {
         self.refs.validate()?;
         self.packs.validate()?;
         anyhow::ensure!(
+            self.server.max_concurrent_per_repo > 0,
+            "server.max_concurrent_per_repo must be positive"
+        );
+        anyhow::ensure!(
             self.packfile_uri.uri_min_bytes.as_u64() > 0,
             "packfile_uri.uri_min_bytes must be positive"
         );
@@ -1352,6 +1356,14 @@ mod tests {
         let text = toml::to_string(&c).unwrap();
         let back = Config::parse(&text).unwrap();
         assert_eq!(back.store.bucket, c.store.bucket);
+    }
+
+    #[test]
+    fn zero_per_repo_concurrency_is_rejected() {
+        let mut c = Config::default();
+        c.server.max_concurrent_per_repo = 0;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("server.max_concurrent_per_repo must be positive"));
     }
 
     #[test]
