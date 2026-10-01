@@ -179,7 +179,6 @@ max_object_bytes = "16GiB"
                                                           # maintenance.follow_interval, published through the WAL as a push; fast-forward only
 
 [git]
-binary = "git"                    # path to upstream git binary (>= 2.47 recommended: pack.writeReverseIndex)
 upload_pack_engine = "auto"       # "auto" = stock git when packs are local/mount-linked, gix only for remote-served bases | "git" | "gix"
 allow_filter = true               # uploadpack.allowFilter
 allow_any_sha1_in_want = false    # uploadpack.allowAnySHA1InWant
