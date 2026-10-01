@@ -6,7 +6,6 @@
 
 [server]
 listen = "127.0.0.1:8080"        # default; `mode = none` is refused unless this is loopback. Public bind: 0.0.0.0 with token/oidc.
-http2 = true                      # HTTP/2 (h2c when TLS is off, ALPN when on)
 max_concurrent_requests = 512     # global cap on in-flight git requests
 max_concurrent_per_repo = 64      # per-repo cap (upload-pack / receive-pack)
 request_timeout = "1h"
@@ -80,7 +79,6 @@ force_path_style = false          # true for most self-hosted S3 implementations
 
 [store.gcs]
 endpoint = "https://storage.googleapis.com"  # gRPC endpoint; credentials = Application Default Credentials
-direct_connectivity = true
 # signing_service_account = "sa@project.iam.gserviceaccount.com"   # for lfs serve_via = "signed_url"
 bulk_clients = 4                  # separate data channels for pack/idx/side-file/LFS bytes + ranged reads
 bulk_concurrency = 32             # max concurrent bulk requests per process (control plane never queues behind them)
