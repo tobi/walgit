@@ -631,3 +631,310 @@ async fn policy_and_settings_writes_require_admin() -> TestResult {
     assert_eq!(st, 200, "{text}");
     Ok(())
 }
+
+/// The proxy's shared secret, as the proxy sends it.
+const PROXY_SECRET: &str = "0123456789abcdef0123456789abcdef-proxy-secret";
+
+/// A `proxy`-mode server on loopback (the sidecar shape) whose secret variable `var` holds
+/// [`PROXY_SECRET`] the way a secret file usually does: with a trailing newline.
+async fn proxy_server(var: &'static str) -> anyhow::Result<Server> {
+    // A name only this test reads; set once, before the server resolves it.
+    #[allow(unsafe_code)]
+    // SAFETY: the variable is private to this test and written before anything reads it.
+    unsafe {
+        std::env::set_var(var, format!("{PROXY_SECRET}\n"));
+    }
+    Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Proxy;
+        c.server.auth.anonymous_read = false;
+        c.server.auth.proxy_secret_env = Some(var.to_string());
+    })
+    .await
+}
+
+/// D50: behind an identity-aware proxy (`server.auth.mode = "proxy"`, loopback: the
+/// sidecar shape, with the secret all the same) identity and access come only from the
+/// proxy's headers, and `X-Walgit-Owners` narrows what exists: listings omit other owners
+/// and every route under their prefix — JSON API in both lanes, repo admin, UI data, git
+/// smart HTTP — answers the 404 of a repository that does not exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_mode_takes_identity_access_and_owner_scope_from_the_proxy() -> TestResult {
+    let server = proxy_server("WALGIT_TEST_PROXY_SECRET_SCOPE").await?;
+    let as_ = |access: &'static str, owners: Option<&'static str>| {
+        let mut h = vec![
+            ("X-Walgit-Proxy-Secret", PROXY_SECRET),
+            ("X-Walgit-Principal", "dev@example.com"),
+            ("X-Walgit-Access", access),
+        ];
+        if let Some(o) = owners {
+            h.push(("X-Walgit-Owners", o));
+        }
+        h
+    };
+    for path in ["/acme/app/api", "/other/app/api"] {
+        let (st, text, _) = req(&server, reqwest::Method::PUT, path, &as_("write", None)).await?;
+        assert_eq!(st, 201, "{path}: {text}");
+    }
+
+    // No principal: 401; no or an unknown access level: 403; read cannot write.
+    assert_eq!(
+        req(
+            &server,
+            reqwest::Method::GET,
+            "/api/v1/owners",
+            &[("X-Walgit-Proxy-Secret", PROXY_SECRET)]
+        )
+        .await?
+        .0,
+        401
+    );
+    let nameless = [
+        ("X-Walgit-Proxy-Secret", PROXY_SECRET),
+        ("X-Walgit-Access", "admin"),
+    ];
+    assert_eq!(
+        req(&server, reqwest::Method::GET, "/acme/app/api", &nameless)
+            .await?
+            .0,
+        401
+    );
+    let levelless = [
+        ("X-Walgit-Proxy-Secret", PROXY_SECRET),
+        ("X-Walgit-Principal", "dev@example.com"),
+    ];
+    assert_eq!(
+        req(&server, reqwest::Method::GET, "/acme/app/api", &levelless)
+            .await?
+            .0,
+        403
+    );
+    assert_eq!(
+        req(
+            &server,
+            reqwest::Method::PUT,
+            "/acme/new/api",
+            &as_("read", None)
+        )
+        .await?
+        .0,
+        403
+    );
+    assert_eq!(
+        req(
+            &server,
+            reqwest::Method::DELETE,
+            "/acme/app/api",
+            &as_("write", None)
+        )
+        .await?
+        .0,
+        403,
+        "write is push, not admin"
+    );
+    let (st, me, _) = req(
+        &server,
+        reqwest::Method::GET,
+        "/api/v1/me",
+        &as_("read", None),
+    )
+    .await?;
+    assert_eq!(st, 200);
+    assert_eq!(
+        serde_json::from_str::<Value>(&me)?["principal"],
+        "dev@example.com"
+    );
+
+    // Absent or `*`: every owner.
+    for owners in [None, Some("*")] {
+        let (_, text, _) = req(
+            &server,
+            reqwest::Method::GET,
+            "/api/v1/owners",
+            &as_("read", owners),
+        )
+        .await?;
+        assert_eq!(
+            serde_json::from_str::<Value>(&text)?,
+            serde_json::json!(["acme", "other"])
+        );
+    }
+
+    let scoped = as_("admin", Some("acme"));
+    for path in ["/api/v1/owners", "/services/api/owners"] {
+        let (st, text, _) = req(&server, reqwest::Method::GET, path, &scoped).await?;
+        assert_eq!(st, 200, "{path}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&text)?,
+            serde_json::json!(["acme"]),
+            "{path}"
+        );
+    }
+    for path in ["/api/v1/owners/other/repos", "/services/api/owners/other"] {
+        let (st, text, _) = req(&server, reqwest::Method::GET, path, &scoped).await?;
+        assert_eq!(
+            (st.as_u16(), text.as_str()),
+            (200, "[]"),
+            "{path}: lists like an unknown owner"
+        );
+    }
+    let (_, text, _) = req(
+        &server,
+        reqwest::Method::GET,
+        "/api/v1/owners/acme/repos",
+        &scoped,
+    )
+    .await?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&text)?,
+        serde_json::json!(["app"])
+    );
+
+    for (method, path) in [
+        (reqwest::Method::GET, "/other/app/api"),
+        (reqwest::Method::GET, "/other/app/api-browser"),
+        (reqwest::Method::GET, "/other/app/api/refs"),
+        (reqwest::Method::GET, "/other/app/api/overview"),
+        (reqwest::Method::GET, "/other/app/api/settings"),
+        (reqwest::Method::GET, "/other/app/api/policy"),
+        (
+            reqwest::Method::GET,
+            "/other/app.git/info/refs?service=git-upload-pack",
+        ),
+        (
+            reqwest::Method::POST,
+            "/other/app.git/info/lfs/objects/batch",
+        ),
+        (reqwest::Method::DELETE, "/other/app/api"),
+        (reqwest::Method::PUT, "/other/fresh/api"),
+    ] {
+        let (st, text, _) = req(&server, method.clone(), path, &scoped).await?;
+        assert_eq!(st, 404, "{method} {path} is out of scope: {text}");
+    }
+    assert_eq!(
+        req(
+            &server,
+            reqwest::Method::GET,
+            "/other/app/api",
+            &as_("admin", Some(""))
+        )
+        .await?
+        .0,
+        404,
+        "an empty owner list is the empty scope"
+    );
+    // In scope, the same caller is served; the out-of-scope repository is intact.
+    assert_eq!(
+        req(&server, reqwest::Method::GET, "/acme/app/api", &scoped)
+            .await?
+            .0,
+        200
+    );
+    let (st, _, h) = req(
+        &server,
+        reqwest::Method::GET,
+        "/acme/app.git/info/refs?service=git-upload-pack",
+        &scoped,
+    )
+    .await?;
+    assert_eq!(st, 200);
+    assert!(hdr(&h, "content-type").contains("git-upload-pack"));
+    assert_eq!(
+        req(
+            &server,
+            reqwest::Method::GET,
+            "/other/app/api",
+            &as_("read", None)
+        )
+        .await?
+        .0,
+        200
+    );
+    Ok(())
+}
+
+/// A request that does not prove it came through the proxy (secret missing or wrong) is
+/// the proxy's misconfiguration — or a caller bypassing it — never the client's bad
+/// credential: a 403 that names the proxy, without `WWW-Authenticate`, and never a 401
+/// (git erases the stored credential on a 401). A git client is told in band.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_proxy_that_does_not_prove_itself_is_a_403_naming_the_proxy_never_a_401() -> TestResult {
+    let server = proxy_server("WALGIT_TEST_PROXY_SECRET_UNPROVEN").await?;
+    let identity = [
+        ("X-Walgit-Principal", "dev@example.com"),
+        ("X-Walgit-Access", "admin"),
+        ("Authorization", "Bearer the-users-own-token"),
+    ];
+    let with_secret = |secret: Option<&'static str>| {
+        let mut h = identity.to_vec();
+        if let Some(s) = secret {
+            h.push(("X-Walgit-Proxy-Secret", s));
+        }
+        h
+    };
+    let (st, _, _) = req(
+        &server,
+        reqwest::Method::PUT,
+        "/acme/app/api",
+        &with_secret(Some(PROXY_SECRET)),
+    )
+    .await?;
+    assert_eq!(
+        st, 201,
+        "the right secret (stored with a trailing newline) is accepted"
+    );
+
+    for secret in [None, Some("wrong"), Some(&PROXY_SECRET[1..])] {
+        for (method, path) in [
+            (reqwest::Method::GET, "/api/v1/owners"),
+            (reqwest::Method::GET, "/api/v1/me"),
+            (reqwest::Method::GET, "/acme/app/api"),
+            (reqwest::Method::DELETE, "/acme/app/api"),
+            (
+                reqwest::Method::GET,
+                "/acme/app.git/info/refs?service=git-upload-pack",
+            ),
+            (reqwest::Method::GET, "/_auth/check"),
+        ] {
+            let (st, text, h) = req(&server, method.clone(), path, &with_secret(secret)).await?;
+            assert_ne!(st, 401, "{secret:?} {method} {path}: {text}");
+            assert_eq!(st, 403, "{secret:?} {method} {path}: {text}");
+            assert!(text.contains("proxy"), "{secret:?} {method} {path}: {text}");
+            assert!(
+                h.get("www-authenticate").is_none(),
+                "{secret:?} {method} {path}: no credential challenge"
+            );
+        }
+        // LFS (the batch body is parsed first, so send a valid one).
+        let (st, text) = req_body(
+            &server,
+            reqwest::Method::POST,
+            "/acme/app.git/info/lfs/objects/batch",
+            &with_secret(secret),
+            r#"{"operation":"download","objects":[]}"#,
+        )
+        .await?;
+        assert_eq!(
+            (st.as_u16(), text.contains("proxy")),
+            (403, true),
+            "{secret:?} lfs: {text}"
+        );
+        // git: the same, in band (git prints `remote error: …` and keeps its credential).
+        for service in ["git-upload-pack", "git-receive-pack"] {
+            let mut h = with_secret(secret);
+            h.push(("User-Agent", "git/2.46.0"));
+            let (st, text, _) = req(
+                &server,
+                reqwest::Method::GET,
+                &format!("/acme/app.git/info/refs?service={service}"),
+                &h,
+            )
+            .await?;
+            assert_ne!(st, 401, "{secret:?} {service}: {text}");
+            assert!(
+                text.contains("ERR walgit: forbidden") && text.contains("proxy"),
+                "{secret:?} {service}: {text}"
+            );
+        }
+    }
+    Ok(())
+}

@@ -5,7 +5,7 @@
 # Validate with: walgit --config walgit.toml config check
 
 [server]
-listen = "127.0.0.1:8080"        # default; `mode = none` is refused unless this is loopback. Public bind: 0.0.0.0 with token/oidc.
+listen = "127.0.0.1:8080"        # default; `mode = none` is refused unless this is loopback. Public bind: 0.0.0.0 with token/oidc/proxy.
 http2 = true                      # HTTP/2 (h2c when TLS is off, ALPN when on)
 max_concurrent_requests = 512     # global cap on in-flight git requests
 max_concurrent_per_repo = 64      # per-repo cap (upload-pack / receive-pack)
@@ -37,12 +37,16 @@ mode = "off"                      # "off" (HTTP/1.1 + h2c) | "self_signed" (gene
 # hostnames = ["git.example.com"] # self_signed SANs; empty = localhost, *.localhost, 127.0.0.1, ::1 + public_url's host
 
 [server.auth]
-mode = "none"                     # "none" | "token" | "oidc"
+mode = "none"                     # "none" | "token" | "oidc" | "proxy"
                                   #   none  — everyone is `anon` with write+admin; loopback listen only
                                   #   token — static `tokens` below, as `Authorization: Bearer` or the password of HTTP Basic
                                   #   oidc  — any OpenID Connect issuer: browser sign-in through it, ID tokens as bearers,
                                   #           walgit-issued access tokens for git (/_auth/tokens), plus `tokens` for robots
-anonymous_read = true             # must be false in oidc mode
+                                  #   proxy — an identity-aware proxy in front authenticates and authorizes every request and
+                                  #           asserts X-Walgit-Principal, X-Walgit-Access (read|write|admin, required) and
+                                  #           optionally X-Walgit-Owners (owner[,owner…] or *; others then 404). The proxy must
+                                  #           strip these headers from clients. No tokens, trusted_forwarders or admin_* here.
+anonymous_read = true             # must be false in oidc and proxy mode
 # tokens = [                      # token → principal; `token_env` reads the value from the environment at startup
 #   { principal = "alice", token_env = "WALGIT_TOKEN_ALICE", write = true, admin = true },
 #   { principal = "ci", token = "literal-secret", write = false },
@@ -62,6 +66,11 @@ anonymous_read = true             # must be false in oidc mode
 # audiences = []                           # oidc: `aud` values accepted on bearer ID tokens clients mint themselves;
 #                                          #       the configured web client is always accepted
 # trusted_forwarders = []                  # principals allowed to set X-Walgit-Principal (a front in front of a push broker)
+# proxy_secret_env = "WALGIT_PROXY_SECRET"   # proxy: env var holding the secret the proxy sends as X-Walgit-Proxy-Secret;
+#                                          #        required, loopback listen included (a sidecar's pod shares loopback).
+#                                          #        Trimmed (a trailing newline is fine), >= 32 bytes; unset/blank/short
+#                                          #        at startup = the server refuses to start. Wrong/missing on a request
+#                                          #        = 403 naming the proxy (never 401: git would drop the user's token).
 
 [store]
 backend = "s3"                    # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "memory" (tests)

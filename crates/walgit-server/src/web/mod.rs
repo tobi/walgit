@@ -9,13 +9,52 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::{FromRequestParts, RawPathParams, Request, State},
     http::{StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Redirect, Response},
 };
 
 use crate::AppState;
+use crate::error::ApiError;
+
+/// The answer for an owner outside the caller's scope: the same 404 as a repository that
+/// does not exist, so the scope never confirms what lies beyond it.
+pub(crate) fn out_of_scope() -> ApiError {
+    ApiError::NotFound(walgit_wal::WalError::NotFound.to_string())
+}
+
+/// `proxy` mode's owner scope (D50) on every matched route under a repository prefix —
+/// the routes with `{owner}` and `{repo}` path parameters: the JSON API in both lanes, repo
+/// admin, UI data and pages. Installed once as a `route_layer` over all merged routers, so
+/// a new repository route inherits it; the fallback dispatcher (git smart HTTP, LFS, `.git`
+/// paths) makes the same check itself (`dispatch_route`). Raw (still percent-encoded)
+/// parameters are compared: scope entries are validated owner names without `%`, so an
+/// encoded spelling can only miss the scope, never enter it.
+pub async fn owner_scope(
+    State(st): State<Arc<AppState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if st.auth.mode() != walgit_config::AuthMode::Proxy {
+        return next.run(req).await;
+    }
+    let (mut parts, body) = req.into_parts();
+    let owner = RawPathParams::from_request_parts(&mut parts, &())
+        .await
+        .ok()
+        .and_then(|params| {
+            let owner = params.iter().find(|(k, _)| *k == "owner")?.1.to_string();
+            params.iter().any(|(k, _)| k == "repo").then_some(owner)
+        });
+    let req = Request::from_parts(parts, body);
+    if let Some(owner) = owner
+        && st.auth.hides_owner(req.headers(), &owner)
+    {
+        return out_of_scope().into_response();
+    }
+    next.run(req).await
+}
 
 /// Send a browser on `localhost` / `127.0.0.1` to `walgit.localhost` (same port).
 /// Keep `/_auth/*` on the literal loopback host so an issuer's registered callback remains exact.
@@ -116,6 +155,9 @@ pub async fn require_auth(
                     .map_or_else(|| "/".to_string(), |pq| pq.as_str().to_string());
                 let q = url_encode(&next_url);
                 return Redirect::temporary(&format!("/_auth/login?next={q}")).into_response();
+            }
+            if matches!(e, crate::auth::AuthError::UntrustedProxy) {
+                return crate::error::ApiError::UntrustedProxy.into_response();
             }
             let status = match e {
                 crate::auth::AuthError::Forbidden => StatusCode::FORBIDDEN,

@@ -400,6 +400,9 @@ async fn check(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response 
             r
         }
         Err(crate::auth::AuthError::Forbidden) => crate::error::ApiError::Forbidden.into_response(),
+        Err(crate::auth::AuthError::UntrustedProxy) => {
+            crate::error::ApiError::UntrustedProxy.into_response()
+        }
         Err(crate::auth::AuthError::Unavailable) => {
             crate::error::ApiError::ServiceUnavailable("auth provider unavailable".into())
                 .into_response()

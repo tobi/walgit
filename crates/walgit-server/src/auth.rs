@@ -1,5 +1,5 @@
-//! Authentication: `none` / `token` / `oidc`. Resolves a request to a
-//! [`Principal`] (name + write bit).
+//! Authentication: `none` / `token` / `oidc` / `proxy`. Resolves a request to a
+//! [`Principal`] (name, write/admin bits, owner scope).
 //!
 //! * **`token`** — static tokens from the config, presented as `Authorization:
 //!   Bearer <token>` or as the password of HTTP Basic (any user name).
@@ -14,6 +14,13 @@
 //!   Static `tokens` are honoured in this mode too (robots, CI).
 //!   Every path ends in the same allowlist: `allowed_domains` / `allowed_emails`,
 //!   `write_domains`.
+//! * **`proxy`** — an identity-aware proxy in front has already authenticated and
+//!   authorized the caller and says so in headers (D50): `X-Walgit-Principal` (who),
+//!   `X-Walgit-Access` (`read` | `write` | `admin`), optionally `X-Walgit-Owners` (the
+//!   owners that exist for this caller). The proxy proves itself on every request with
+//!   `X-Walgit-Proxy-Secret`, loopback listen included. A request that fails that proof
+//!   is a 403 naming the proxy, never a 401: the client's credential was not the one
+//!   rejected, and a 401 makes git erase it. These headers are read in no other mode.
 //!
 //! An edge in front of walgit may take the client's `Authorization` for its own
 //! hop credential; it then announces `client-authorization` in
@@ -35,6 +42,19 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use walgit_config::{ACCESS_TOKEN_PREFIX, AuthMode, StaticToken};
 
+/// End-user identity: set by a trusted forwarder (push broker hop), by anyone in `none`
+/// mode, and by the proxy in `proxy` mode.
+pub const PRINCIPAL_HEADER: &str = "x-walgit-principal";
+/// `proxy` mode: the caller's access level as the proxy decided it — `read`, `write`
+/// (implies read) or `admin` (implies write).
+pub const PROXY_ACCESS_HEADER: &str = "x-walgit-access";
+/// `proxy` mode: `<owner>[,<owner>…]` or `*`. Absent = every owner.
+pub const PROXY_OWNERS_HEADER: &str = "x-walgit-owners";
+/// `proxy` mode: the shared secret named by `server.auth.proxy_secret_env`.
+pub const PROXY_SECRET_HEADER: &str = "x-walgit-proxy-secret";
+/// Shortest accepted proxy secret (the same floor as `session_secret`), counted after
+/// surrounding whitespace is trimmed.
+const MIN_PROXY_SECRET_BYTES: usize = 32;
 /// Client `Authorization` as copied by an edge before it replaces that header with its own
 /// hop credential. Read only when the edge announces `client-authorization`.
 pub const FORWARDED_AUTHORIZATION_HEADER: &str = "x-walgit-authorization";
@@ -59,6 +79,8 @@ pub struct Principal {
     /// Independent of `write` (push and repository creation).
     pub admin: bool,
     pub anonymous: bool,
+    /// Owners this principal may address at all ([`OwnerScope::All`] outside `proxy` mode).
+    pub owners: OwnerScope,
 }
 
 impl Principal {
@@ -68,8 +90,138 @@ impl Principal {
             write: false,
             admin: false,
             anonymous: true,
+            owners: OwnerScope::All,
         }
     }
+
+    /// Whether `owner` exists for this principal (listings, and every route under it).
+    pub fn sees_owner(&self, owner: &str) -> bool {
+        self.owners.contains(owner)
+    }
+}
+
+/// The owners a principal may address. Only `proxy` mode narrows it (`X-Walgit-Owners`):
+/// an owner outside the list does not exist for the caller — listings omit it and every
+/// route under its prefix answers 404, exactly like an owner without repositories. Never
+/// 403: the answer must not confirm that the owner exists. The proxy remains the
+/// authority for per-repository decisions; this is the listing filter and a second wall.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum OwnerScope {
+    #[default]
+    All,
+    /// Exact (case-sensitive, like the bucket prefix) owner names. Empty = none.
+    Only(Vec<String>),
+}
+
+impl OwnerScope {
+    pub fn contains(&self, owner: &str) -> bool {
+        match self {
+            OwnerScope::All => true,
+            OwnerScope::Only(owners) => owners.iter().any(|o| o == owner),
+        }
+    }
+
+    /// Parse an `X-Walgit-Owners` value: `*`, or comma-separated owner names (blank entries
+    /// skipped, so an empty value is the empty scope). A malformed entry refuses the whole
+    /// header rather than dropping it: a proxy that sends garbage is misconfigured, and
+    /// guessing which part it meant is how a scope widens.
+    fn parse(value: &str) -> Option<Self> {
+        if value.trim() == "*" {
+            return Some(OwnerScope::All);
+        }
+        let mut owners = Vec::new();
+        for owner in value.split(',').map(str::trim).filter(|o| !o.is_empty()) {
+            // Owner names follow the repository-id rules; the name half is a placeholder.
+            walgit_git::RepoId::new(owner, "_").ok()?;
+            owners.push(owner.to_string());
+        }
+        Some(OwnerScope::Only(owners))
+    }
+}
+
+/// How a `proxy`-mode request proves it came from the proxy. There is no loopback
+/// exemption: in a sidecar deployment every container of the pod shares the network
+/// namespace, so "can reach 127.0.0.1" names the pod, not the proxy.
+enum ProxyTrust {
+    /// SHA-256 of the shared secret. The presented value is hashed too and the digests are
+    /// compared in constant time, so neither length nor prefix leaks by timing.
+    Secret([u8; 32]),
+    /// The secret could not be resolved (none configured, or an unset, blank or short
+    /// variable): every request is refused.
+    Refuse,
+}
+
+/// `server.auth.proxy_secret_env` resolved through `env`: `Ok(None)` outside `proxy`
+/// mode, `Ok(Some(secret))` in it, `Err` when none is configured or the named variable
+/// is unset, blank or shorter than 32 bytes. The value is trimmed the way the header
+/// value is (`single_header`): a secret file or Kubernetes `Secret` ending in a newline
+/// must match the header the proxy sends, and surrounding whitespace can never travel
+/// in a header value anyway. Startup calls this with the process environment so a
+/// missing secret fails the boot instead of refusing every request behind a green
+/// `/readyz`.
+pub fn resolve_proxy_secret(
+    auth: &walgit_config::AuthConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<String>, String> {
+    if auth.mode != AuthMode::Proxy {
+        return Ok(None);
+    }
+    let Some(var) = auth.proxy_secret_env.as_deref().filter(|v| !v.is_empty()) else {
+        return Err("server.auth.proxy_secret_env is required in proxy mode".to_string());
+    };
+    let value = env(var).unwrap_or_default();
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!(
+            "server.auth.proxy_secret_env: ${var} is unset or blank"
+        ));
+    }
+    if value.len() < MIN_PROXY_SECRET_BYTES {
+        return Err(format!(
+            "server.auth.proxy_secret_env: ${var} must be at least {MIN_PROXY_SECRET_BYTES} bytes (after trimming whitespace)"
+        ));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn process_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+fn proxy_trust(cfg: &walgit_config::Config, env: &dyn Fn(&str) -> Option<String>) -> ProxyTrust {
+    use sha2::Digest;
+    if cfg.server.auth.mode != AuthMode::Proxy {
+        return ProxyTrust::Refuse;
+    }
+    match resolve_proxy_secret(&cfg.server.auth, env) {
+        Ok(Some(secret)) => ProxyTrust::Secret(sha2::Sha256::digest(secret.as_bytes()).into()),
+        // Unreachable in proxy mode; an authenticator built from an unvalidated config must
+        // not be the one place a missing secret is honoured.
+        Ok(None) => ProxyTrust::Refuse,
+        Err(e) => {
+            tracing::error!(error = %e, "proxy secret unavailable; refusing every request");
+            ProxyTrust::Refuse
+        }
+    }
+}
+
+/// Constant-time equality of two SHA-256 digests.
+fn digests_equal(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// The single value of `name`: `Ok(None)` when absent, `Err` when repeated or not visible
+/// ASCII. A repeated identity header means something between the client and walgit
+/// appended instead of replacing — the request is not trusted to mean either value.
+fn single_header<'h>(headers: &'h HeaderMap, name: &str) -> Result<Option<&'h str>, ()> {
+    let mut values = headers.get_all(name).iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    first.to_str().map(|v| Some(v.trim())).map_err(|_| ())
 }
 
 /// A JWKS public key: RSA or EC P-256.
@@ -379,6 +531,8 @@ pub struct Authenticator {
     access_token_ttl: Duration,
     oauth_client_id: Option<String>,
     oauth_client_secret: Option<String>,
+    /// `proxy` mode's trust boundary (`Refuse` in every other mode, where it is never read).
+    proxy_trust: ProxyTrust,
 }
 
 impl Authenticator {
@@ -388,19 +542,20 @@ impl Authenticator {
             issuer: cfg.server.auth.issuer.trim_end_matches('/').to_string(),
             discovery: Mutex::new(None),
         });
-        Self::build(cfg, source.clone(), Some(source))
+        Self::build(cfg, source.clone(), Some(source), &process_env)
     }
 
     /// Construct an authenticator with an injectable JWKS source (tests: no network; the
     /// browser sign-in endpoints are unavailable).
     pub fn with_key_source(cfg: &walgit_config::Config, keys: Arc<dyn JwksSource>) -> Arc<Self> {
-        Self::build(cfg, keys, None)
+        Self::build(cfg, keys, None, &process_env)
     }
 
     fn build(
         cfg: &walgit_config::Config,
         keys: Arc<dyn JwksSource>,
         discovery: Option<Arc<HttpOidcSource>>,
+        env: &dyn Fn(&str) -> Option<String>,
     ) -> Arc<Self> {
         let auth = &cfg.server.auth;
         let oauth_client_id = auth.oauth_client_id.clone().filter(|s| !s.is_empty());
@@ -456,6 +611,7 @@ impl Authenticator {
             access_token_ttl: auth.access_token_ttl,
             oauth_client_id,
             oauth_client_secret: auth.oauth_client_secret.clone().filter(|s| !s.is_empty()),
+            proxy_trust: proxy_trust(cfg, env),
         })
     }
 
@@ -622,9 +778,13 @@ impl Authenticator {
         &self,
         headers: &HeaderMap,
     ) -> Result<Principal, AuthError> {
+        // The proxy's principal header is the identity itself, not a forwarding claim.
+        if self.mode == AuthMode::Proxy {
+            return self.authenticate_proxy(headers);
+        }
         let caller = self.authenticate_inner(headers).await?;
         let Some(forwarded) = headers
-            .get("x-walgit-principal")
+            .get(PRINCIPAL_HEADER)
             .and_then(|v| v.to_str().ok())
             .map(str::trim)
             .filter(|v| !v.is_empty())
@@ -643,9 +803,72 @@ impl Authenticator {
                 write: caller.write,
                 admin: self.is_admin(forwarded),
                 anonymous: false,
+                owners: OwnerScope::All,
             });
         }
         Ok(caller)
+    }
+
+    /// `proxy` mode: the proxy proves itself first (nothing else it says is read before
+    /// that; failing is [`AuthError::UntrustedProxy`], a 403 — the client's credential is
+    /// not what was rejected), then names the caller (401 without one: there is no
+    /// anonymous access) and its access level (403 when missing or unknown — fail closed,
+    /// never a default). Admin comes only from the proxy; nothing in the config grants it.
+    fn authenticate_proxy(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
+        let result = self.proxy_principal(headers);
+        if matches!(result, Err(AuthError::UntrustedProxy)) {
+            // Operator-facing: every request through a misconfigured proxy fails this way.
+            tracing::warn!(
+                secret_present = headers.contains_key(PROXY_SECRET_HEADER),
+                "request did not prove it came through the proxy (X-Walgit-Proxy-Secret missing, wrong or repeated, or a repeated identity header): a misconfigured proxy, or a caller bypassing it"
+            );
+        }
+        result
+    }
+
+    /// [`Self::authenticate_proxy`] without logging (also asked by [`Self::hides_owner`]).
+    fn proxy_principal(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
+        use sha2::Digest;
+        match &self.proxy_trust {
+            ProxyTrust::Secret(expected) => {
+                let presented = single_header(headers, PROXY_SECRET_HEADER)
+                    .map_err(|()| AuthError::UntrustedProxy)?;
+                let digest: [u8; 32] = sha2::Sha256::digest(presented.unwrap_or("")).into();
+                if presented.is_none() || !digests_equal(&digest, expected) {
+                    return Err(AuthError::UntrustedProxy);
+                }
+            }
+            ProxyTrust::Refuse => return Err(AuthError::UntrustedProxy),
+        }
+        // A repeated principal means the proxy appended instead of replacing a header the
+        // client sent: the proxy's fault, so not a 401 either.
+        let name = single_header(headers, PRINCIPAL_HEADER)
+            .map_err(|()| AuthError::UntrustedProxy)?
+            .filter(|v| !v.is_empty())
+            .ok_or(AuthError::Unauthorized)?;
+        let access =
+            single_header(headers, PROXY_ACCESS_HEADER).map_err(|()| AuthError::Forbidden)?;
+        let (write, admin) = match access.map(str::to_ascii_lowercase).as_deref() {
+            Some("read") => (false, false),
+            Some("write") => (true, false),
+            Some("admin") => (true, true),
+            other => {
+                tracing::debug!(access = ?other, "proxy access level missing or unknown");
+                return Err(AuthError::Forbidden);
+            }
+        };
+        let owners = match single_header(headers, PROXY_OWNERS_HEADER) {
+            Ok(None) => OwnerScope::All,
+            Ok(Some(v)) => OwnerScope::parse(v).ok_or(AuthError::Forbidden)?,
+            Err(()) => return Err(AuthError::Forbidden),
+        };
+        Ok(Principal {
+            name: name.to_string(),
+            write,
+            admin,
+            anonymous: false,
+            owners,
+        })
     }
 
     /// A static token or an issued access token, from a bearer or a Basic password.
@@ -656,6 +879,7 @@ impl Authenticator {
                 write: st.write,
                 admin: st.admin,
                 anonymous: false,
+                owners: OwnerScope::All,
             }));
         }
         if tok.starts_with(ACCESS_TOKEN_PREFIX) {
@@ -674,6 +898,7 @@ impl Authenticator {
                 write: true,
                 admin: true,
                 anonymous: false,
+                owners: OwnerScope::All,
             }),
             AuthMode::Token => {
                 let presented =
@@ -701,7 +926,20 @@ impl Authenticator {
                 self.authenticate_cookie(headers)
                     .ok_or(AuthError::Unauthorized)
             }
+            // `authenticate_with_forwarding` answers proxy mode before reaching here.
+            AuthMode::Proxy => self.authenticate_proxy(headers),
         }
+    }
+
+    /// Whether `owner` is outside the caller's owner scope: `proxy` mode with an
+    /// `X-Walgit-Owners` list that does not name it. A request that does not authenticate
+    /// is not hidden here — its handler answers with its own 401/403, so the credential
+    /// story (git's `erase` on a real 401, the in-band help) stays in one place.
+    pub fn hides_owner(&self, headers: &HeaderMap, owner: &str) -> bool {
+        self.mode == AuthMode::Proxy
+            && self
+                .proxy_principal(headers)
+                .is_ok_and(|p| !p.sees_owner(owner))
     }
 
     /// Require a principal with `write` for git push / LFS upload / repo create.
@@ -821,6 +1059,7 @@ impl Authenticator {
             write,
             admin: self.is_admin(&email),
             anonymous: false,
+            owners: OwnerScope::All,
         })
     }
 }
@@ -851,13 +1090,19 @@ pub enum AuthError {
     Unauthorized,
     Forbidden,
     Unavailable,
+    /// `proxy` mode: the request did not prove it came through the proxy (secret missing,
+    /// wrong or repeated; a repeated identity header). A 403 naming the proxy, never a
+    /// 401: what failed is the proxy's configuration, not the client's credential, and a
+    /// 401 is what makes git erase that credential (§1.3). Not a 5xx either: a proxy
+    /// retries 5xx from its upstream, and a caller bypassing the proxy is simply refused.
+    UntrustedProxy,
 }
 
 impl AuthError {
     pub fn status(&self) -> StatusCode {
         match self {
             AuthError::Invalid | AuthError::Unauthorized => StatusCode::UNAUTHORIZED,
-            AuthError::Forbidden => StatusCode::FORBIDDEN,
+            AuthError::Forbidden | AuthError::UntrustedProxy => StatusCode::FORBIDDEN,
             AuthError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
@@ -1407,6 +1652,356 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             none.authenticate(&bearer(&tok)).await,
             Err(AuthError::Invalid)
         ));
+    }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+
+    const SECRET: &str = "0123456789abcdef0123456789abcdef-proxy-secret";
+    /// `SECRET` as a secret file usually holds it.
+    const SECRET_NEWLINE: &str = "0123456789abcdef0123456789abcdef-proxy-secret\n";
+
+    struct NoKeys;
+    #[async_trait]
+    impl JwksSource for NoKeys {
+        async fn fetch(&self) -> Result<JwksResponse, String> {
+            Err("no keys in proxy mode".into())
+        }
+    }
+
+    fn proxy_config(listen: &str, secret_env: Option<&str>) -> walgit_config::Config {
+        let mut cfg = walgit_config::Config::default();
+        cfg.server.listen = listen.parse().unwrap();
+        cfg.server.auth.mode = AuthMode::Proxy;
+        cfg.server.auth.anonymous_read = false;
+        cfg.server.auth.proxy_secret_env = secret_env.map(str::to_string);
+        cfg
+    }
+
+    /// An authenticator whose environment holds `WALGIT_PROXY_SECRET = value`.
+    fn proxy_auth(cfg: &walgit_config::Config, value: Option<&str>) -> Arc<Authenticator> {
+        let value = value.map(str::to_string);
+        let env = move |name: &str| (name == "WALGIT_PROXY_SECRET").then(|| value.clone())?;
+        Authenticator::build(cfg, Arc::new(NoKeys), None, &env)
+    }
+
+    /// The sidecar shape: loopback listen, and the secret all the same.
+    fn sidecar() -> Arc<Authenticator> {
+        proxy_auth(
+            &proxy_config("127.0.0.1:8080", Some("WALGIT_PROXY_SECRET")),
+            Some(SECRET),
+        )
+    }
+
+    /// Exactly these headers.
+    fn bare(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    /// These headers from the proxy: with its secret.
+    fn asserted(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = bare(pairs);
+        h.insert(PROXY_SECRET_HEADER, SECRET.parse().unwrap());
+        h
+    }
+
+    #[tokio::test]
+    async fn the_proxy_names_the_caller_and_its_access_level() {
+        let auth = sidecar();
+        for (access, write, admin) in [
+            ("read", false, false),
+            ("write", true, false),
+            ("admin", true, true),
+            (" Admin ", true, true),
+        ] {
+            let h = asserted(&[
+                (PRINCIPAL_HEADER, "dev@example.com"),
+                (PROXY_ACCESS_HEADER, access),
+            ]);
+            let p = auth.authenticate(&h).await.unwrap();
+            assert_eq!(
+                (p.name.as_str(), p.write, p.admin, p.anonymous),
+                ("dev@example.com", write, admin, false),
+                "{access}"
+            );
+            assert_eq!(p.owners, OwnerScope::All, "no header = every owner");
+        }
+        let read = asserted(&[(PRINCIPAL_HEADER, "r"), (PROXY_ACCESS_HEADER, "read")]);
+        auth.require_read(&read).await.unwrap();
+        assert!(matches!(
+            auth.require_write(&read).await,
+            Err(AuthError::Forbidden)
+        ));
+        let write = asserted(&[(PRINCIPAL_HEADER, "w"), (PROXY_ACCESS_HEADER, "write")]);
+        assert!(matches!(
+            auth.require_admin(&write).await,
+            Err(AuthError::Forbidden)
+        ));
+
+        // No principal (or a blank one) is a 401: there is no anonymous access.
+        for h in [
+            asserted(&[(PROXY_ACCESS_HEADER, "admin")]),
+            asserted(&[(PRINCIPAL_HEADER, "  "), (PROXY_ACCESS_HEADER, "admin")]),
+            asserted(&[]),
+        ] {
+            assert!(matches!(
+                auth.require_read(&h).await,
+                Err(AuthError::Unauthorized)
+            ));
+        }
+        // A missing or unknown access level is a 403, never a default.
+        for access in [None, Some(""), Some("owner"), Some("read,write")] {
+            let mut h = asserted(&[(PRINCIPAL_HEADER, "dev@example.com")]);
+            if let Some(a) = access {
+                h.insert(PROXY_ACCESS_HEADER, a.parse().unwrap());
+            }
+            assert!(
+                matches!(auth.authenticate(&h).await, Err(AuthError::Forbidden)),
+                "{access:?}"
+            );
+        }
+        // Appended rather than replaced: neither value is trusted, and the fault is the
+        // proxy's (a 403 naming it), not the client credential's (a 401 would erase it).
+        let twice = asserted(&[
+            (PRINCIPAL_HEADER, "a"),
+            (PRINCIPAL_HEADER, "b"),
+            (PROXY_ACCESS_HEADER, "read"),
+        ]);
+        assert!(matches!(
+            auth.authenticate(&twice).await,
+            Err(AuthError::UntrustedProxy)
+        ));
+        let twice = asserted(&[
+            (PRINCIPAL_HEADER, "a"),
+            (PROXY_ACCESS_HEADER, "read"),
+            (PROXY_ACCESS_HEADER, "admin"),
+        ]);
+        assert!(matches!(
+            auth.authenticate(&twice).await,
+            Err(AuthError::Forbidden)
+        ));
+        // Config-granted admin does not exist in proxy mode, `none`'s implicit one included.
+        assert!(!auth.is_admin("dev@example.com"));
+    }
+
+    #[tokio::test]
+    async fn the_proxy_proves_itself_with_the_shared_secret() {
+        let cfg = proxy_config("0.0.0.0:8080", Some("WALGIT_PROXY_SECRET"));
+        let auth = proxy_auth(&cfg, Some(SECRET));
+        let identity = [
+            (PRINCIPAL_HEADER, "dev@example.com"),
+            (PROXY_ACCESS_HEADER, "admin"),
+        ];
+        let with = |secret: &[&str]| {
+            let mut h = bare(&identity);
+            for s in secret {
+                h.append(PROXY_SECRET_HEADER, s.parse().unwrap());
+            }
+            h
+        };
+        assert!(auth.authenticate(&with(&[SECRET])).await.unwrap().admin);
+        for bad in [
+            &[][..],
+            &[""][..],
+            &["wrong"][..],
+            &[&SECRET[1..]][..],
+            &[SECRET, SECRET][..],
+        ] {
+            let err = auth.authenticate(&with(bad)).await.unwrap_err();
+            assert!(matches!(err, AuthError::UntrustedProxy), "{bad:?}: {err:?}");
+            // Never a 401: git would erase the client's stored credential, which is not
+            // what failed.
+            assert_eq!(err.status(), StatusCode::FORBIDDEN, "{bad:?}");
+        }
+        // A bad secret is refused before any other header is read.
+        let mut h = with(&["wrong"]);
+        h.remove(PROXY_ACCESS_HEADER);
+        h.remove(PRINCIPAL_HEADER);
+        assert!(matches!(
+            auth.authenticate(&h).await,
+            Err(AuthError::UntrustedProxy)
+        ));
+
+        // Loopback (the sidecar shape) requires it too: the whole pod shares loopback.
+        let auth = sidecar();
+        assert!(auth.authenticate(&with(&[SECRET])).await.is_ok());
+        assert!(matches!(
+            auth.authenticate(&bare(&identity)).await,
+            Err(AuthError::UntrustedProxy)
+        ));
+
+        // A secret file / Kubernetes Secret ending in a newline (or padded) still matches
+        // the header, which arrives trimmed.
+        for stored in [
+            format!("{SECRET}\n"),
+            format!("{SECRET}\r\n"),
+            format!("  {SECRET} \n"),
+        ] {
+            let auth = proxy_auth(&cfg, Some(stored.as_str()));
+            assert!(
+                auth.authenticate(&with(&[SECRET])).await.is_ok(),
+                "{stored:?}"
+            );
+            assert!(matches!(
+                auth.authenticate(&with(&[&SECRET[1..]])).await,
+                Err(AuthError::UntrustedProxy)
+            ));
+        }
+
+        // Unresolvable secret, or none configured (loopback included): nothing is trusted.
+        for (cfg, value) in [
+            (cfg.clone(), None),
+            (cfg.clone(), Some("")),
+            (cfg.clone(), Some("\n")),
+            (cfg.clone(), Some("short")),
+            (proxy_config("0.0.0.0:8080", None), None),
+            (proxy_config("127.0.0.1:8080", None), None),
+        ] {
+            let auth = proxy_auth(&cfg, value);
+            assert!(
+                matches!(
+                    auth.authenticate(&with(&[SECRET])).await,
+                    Err(AuthError::UntrustedProxy)
+                ),
+                "{value:?}"
+            );
+            assert!(matches!(
+                auth.authenticate(&with(&[])).await,
+                Err(AuthError::UntrustedProxy)
+            ));
+        }
+    }
+
+    #[test]
+    fn the_secret_resolves_at_startup_or_fails_it() {
+        let cfg = proxy_config("0.0.0.0:8080", Some("WALGIT_PROXY_SECRET"));
+        let env = |v: Option<&'static str>| move |_: &str| v.map(str::to_string);
+        assert_eq!(
+            resolve_proxy_secret(&cfg.server.auth, &env(Some(SECRET)))
+                .unwrap()
+                .as_deref(),
+            Some(SECRET)
+        );
+        // Trimmed like the header: a trailing newline is not part of the secret.
+        assert_eq!(
+            resolve_proxy_secret(&cfg.server.auth, &env(Some(SECRET_NEWLINE)))
+                .unwrap()
+                .as_deref(),
+            Some(SECRET)
+        );
+        for (value, why) in [
+            (None, "unset"),
+            (Some(""), "unset"),
+            (Some("\n"), "blank"),
+            (Some(" \t\r\n"), "blank"),
+            (Some("short"), "32 bytes"),
+            // 31 bytes once the newline is trimmed.
+            (Some("0123456789abcdef0123456789abcde\n"), "32 bytes"),
+        ] {
+            let err = resolve_proxy_secret(&cfg.server.auth, &env(value)).unwrap_err();
+            assert!(err.contains(why), "{value:?}: {err}");
+        }
+        // Required in proxy mode, loopback included; not read in any other mode.
+        let loopback = proxy_config("127.0.0.1:8080", None);
+        let err = resolve_proxy_secret(&loopback.server.auth, &env(Some(SECRET))).unwrap_err();
+        assert!(err.contains("required"), "{err}");
+        let token = walgit_config::Config::default();
+        assert_eq!(
+            resolve_proxy_secret(&token.server.auth, &env(None)),
+            Ok(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_scope_narrows_what_exists_for_the_caller() {
+        assert_eq!(OwnerScope::parse("*"), Some(OwnerScope::All));
+        assert_eq!(OwnerScope::parse(" * "), Some(OwnerScope::All));
+        assert_eq!(
+            OwnerScope::parse("acme, tools-2,,"),
+            Some(OwnerScope::Only(vec!["acme".into(), "tools-2".into()]))
+        );
+        assert_eq!(OwnerScope::parse(""), Some(OwnerScope::Only(vec![])));
+        for bad in ["*,acme", "acme/app", "../x", ".hidden", "a b"] {
+            assert_eq!(OwnerScope::parse(bad), None, "{bad}");
+        }
+        let only = OwnerScope::Only(vec!["acme".into()]);
+        assert!(only.contains("acme") && !only.contains("Acme") && !only.contains("other"));
+        assert!(!OwnerScope::Only(vec![]).contains("acme"));
+
+        let auth = sidecar();
+        let scoped = |owners: &str| {
+            asserted(&[
+                (PRINCIPAL_HEADER, "dev@example.com"),
+                (PROXY_ACCESS_HEADER, "read"),
+                (PROXY_OWNERS_HEADER, owners),
+            ])
+        };
+        let p = auth.authenticate(&scoped("acme,tools")).await.unwrap();
+        assert!(p.sees_owner("acme") && p.sees_owner("tools") && !p.sees_owner("other"));
+        assert!(auth.hides_owner(&scoped("acme"), "other"));
+        assert!(!auth.hides_owner(&scoped("acme"), "acme"));
+        assert!(!auth.hides_owner(&scoped("*"), "other"));
+        assert!(auth.hides_owner(&scoped(""), "acme"), "empty = no owners");
+        assert!(matches!(
+            auth.authenticate(&scoped("acme/app")).await,
+            Err(AuthError::Forbidden)
+        ));
+        // Unauthenticated requests are not hidden: their handler answers 401/403.
+        assert!(!auth.hides_owner(&asserted(&[(PROXY_OWNERS_HEADER, "acme")]), "other"));
+    }
+
+    /// The proxy's headers mean nothing in any other mode: no access level, no scope, no
+    /// secret is read, whoever sends them.
+    #[tokio::test]
+    async fn proxy_headers_are_ignored_outside_proxy_mode() {
+        let forged = [
+            (PROXY_ACCESS_HEADER, "admin"),
+            (PROXY_OWNERS_HEADER, "nobody"),
+            (PROXY_SECRET_HEADER, SECRET),
+        ];
+
+        let mut cfg = walgit_config::Config::default();
+        cfg.server.auth.mode = AuthMode::Token;
+        cfg.server.auth.tokens = vec![StaticToken {
+            principal: "alice".into(),
+            token: "s3cret".into(),
+            token_env: None,
+            write: false,
+            admin: false,
+        }];
+        let auth = proxy_auth(&cfg, Some(SECRET));
+        let mut h = bare(&forged);
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer s3cret".parse().unwrap(),
+        );
+        h.insert(PRINCIPAL_HEADER, "root@example.com".parse().unwrap());
+        let p = auth.authenticate(&h).await.unwrap();
+        assert_eq!(
+            (p.name.as_str(), p.write, p.admin, &p.owners),
+            ("alice", false, false, &OwnerScope::All),
+            "no trusted forwarder, so not even the principal header is read"
+        );
+        assert!(!auth.hides_owner(&h, "acme"));
+        let anon = auth.authenticate(&bare(&forged)).await.unwrap();
+        assert!(anon.anonymous && !anon.write && !anon.admin);
+
+        // `none` keeps its own (loopback-only) forwarding, but never the proxy's scope.
+        let auth = proxy_auth(&walgit_config::Config::default(), Some(SECRET));
+        let mut h = bare(&forged);
+        h.insert(PROXY_ACCESS_HEADER, "read".parse().unwrap());
+        let p = auth.authenticate(&h).await.unwrap();
+        assert_eq!((p.write, &p.owners), (true, &OwnerScope::All));
+        assert!(!auth.hides_owner(&h, "acme"));
     }
 }
 

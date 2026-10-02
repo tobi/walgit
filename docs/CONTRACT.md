@@ -5,7 +5,7 @@ crates in parallel)**, kept as the reference for names and shapes. Rule still in
 — a type or function listed here is relied on by another crate. **Where this file and the code disagree, the
 code is right and this file is stale**; verify with `rg`/`cargo doc` before relying on a signature. Known
 supersessions (2026-08-20 sweep): `RepoHandle::sync()` is now the *Serve* level of the sync-level family
-(`sync_refs` / `sync` = Serve / `sync_full` / `sync_objects`, `AGENTS.md §2.3`); auth is none/token/oidc
+(`sync_refs` / `sync` = Serve / `sync_full` / `sync_objects`, `AGENTS.md §2.3`); auth is none/token/oidc/proxy
 (`AGENTS.md §1.3`, with explicit admin principals); the server router is `web/API.md` + `AGENTS.md D15/D20/D26/D27`; the packfile replacement target is [PACKFILE_URI_DESIGN.md](PACKFILE_URI_DESIGN.md).
 Runtime bundle contracts are removed; retained protobuf messages exist only for durable replay.
 

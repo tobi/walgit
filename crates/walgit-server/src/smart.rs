@@ -58,6 +58,17 @@ pub async fn info_refs(
             e,
             crate::auth::AuthError::Forbidden | crate::auth::AuthError::Unavailable
         );
+        // A proxy that did not prove itself: nothing the client holds can fix it, and behind
+        // a proxy `Authorization` has usually been consumed already — say so in band.
+        if is_git_client(headers)
+            && !service_param.is_empty()
+            && matches!(e, crate::auth::AuthError::UntrustedProxy)
+        {
+            return Ok(git_err_response(
+                &service_param,
+                &format!("walgit: {}", crate::error::UNTRUSTED_PROXY_MESSAGE),
+            ));
+        }
         if is_git_client(headers) && !service_param.is_empty() && has_creds && retry_cannot_help {
             return Ok(git_err_response(
                 &service_param,
@@ -1461,6 +1472,9 @@ pub(crate) fn auth_help_message(
         .to_string();
     let why = match e {
         crate::auth::AuthError::Forbidden => "your identity is not allowed to access this host",
+        crate::auth::AuthError::UntrustedProxy => {
+            "the proxy in front of this host did not prove itself to walgit (misconfigured proxy)"
+        }
         crate::auth::AuthError::Unavailable => {
             "the token verifier is temporarily unavailable; retry"
         }
@@ -1565,6 +1579,7 @@ pub(crate) fn auth_err(e: crate::auth::AuthError) -> ApiError {
             ApiError::Unauthorized
         }
         crate::auth::AuthError::Forbidden => ApiError::Forbidden,
+        crate::auth::AuthError::UntrustedProxy => ApiError::UntrustedProxy,
         crate::auth::AuthError::Unavailable => {
             ApiError::ServiceUnavailable("auth provider unavailable".into())
         }

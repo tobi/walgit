@@ -190,6 +190,13 @@ pub struct AuthConfig {
     /// Pair with `oauth_client_secret`; both or neither.
     pub oauth_client_id: Option<String>,
     pub oauth_client_secret: Option<String>,
+    /// `proxy` mode: name of the environment variable holding the secret the identity-aware
+    /// proxy presents in `X-Walgit-Proxy-Secret` on every request (compared in constant time,
+    /// at least 32 bytes after trimming surrounding whitespace, so a trailing newline from a
+    /// secret file is harmless). Required in proxy mode, loopback listen included: in a
+    /// sidecar deployment every container in the pod shares the loopback interface, so
+    /// reaching the port does not identify the proxy. Never read in other modes.
+    pub proxy_secret_env: Option<String>,
 }
 
 /// Prefix of access tokens walgit mints itself (`/_auth/tokens`): recognisable in logs and
@@ -208,6 +215,12 @@ pub enum AuthMode {
     /// `OpenID` Connect: browser sign-in through the issuer, ID tokens as bearers, plus
     /// walgit-issued access tokens for git — and `tokens` for robots.
     Oidc,
+    /// An identity-aware proxy in front authenticates and authorizes every request and
+    /// asserts the result in headers: `X-Walgit-Principal` (who), `X-Walgit-Access`
+    /// (`read` | `write` | `admin`), optionally `X-Walgit-Owners` (which owners exist for
+    /// this caller). The proxy proves itself with `X-Walgit-Proxy-Secret`
+    /// (`proxy_secret_env`) on every request, loopback listen included. No anonymous access.
+    Proxy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -831,6 +844,7 @@ impl Default for AuthConfig {
             access_token_ttl: Duration::from_hours(2160),
             oauth_client_id: None,
             oauth_client_secret: None,
+            proxy_secret_env: None,
         }
     }
 }
@@ -1233,6 +1247,35 @@ impl Config {
             anyhow::ensure!(
                 !oauth_id || a.session_secret.as_deref().is_some_and(|s| !s.is_empty()),
                 "server.auth.session_secret is required with oauth_client_id (it signs sessions and access tokens)"
+            );
+        }
+        if a.mode == AuthMode::Proxy {
+            anyhow::ensure!(
+                !a.anonymous_read,
+                "server.auth.anonymous_read must be false in proxy mode (the proxy names every caller)"
+            );
+            // Anything that would let a request in without the proxy — or grant more than
+            // the proxy asserted — is refused rather than silently ignored.
+            anyhow::ensure!(
+                a.tokens.is_empty() && a.trusted_forwarders.is_empty(),
+                "server.auth.tokens and trusted_forwarders are not read in proxy mode (the proxy asserts every identity); remove them"
+            );
+            anyhow::ensure!(
+                a.admin_emails.is_empty() && a.admin_domains.is_empty(),
+                "server.auth.admin_emails/admin_domains are not read in proxy mode (admin comes from `X-Walgit-Access: admin`); remove them"
+            );
+            // The trust boundary: anyone who can reach the port could send the identity
+            // headers — on loopback too, where every container of a pod shares the interface —
+            // so the proxy must prove itself with a shared secret.
+            anyhow::ensure!(
+                a.proxy_secret_env.as_deref().is_some_and(|v| !v.is_empty()),
+                "server.auth.proxy_secret_env is required in proxy mode (a loopback listen is shared by every process in the network namespace, so it does not identify the proxy)"
+            );
+        } else {
+            anyhow::ensure!(
+                a.proxy_secret_env.is_none(),
+                "server.auth.proxy_secret_env is only read in proxy mode (got mode = {:?})",
+                a.mode
             );
         }
         anyhow::ensure!(self.wal.max_batch >= 1, "wal.max_batch must be >= 1");
@@ -1663,6 +1706,59 @@ audiences = ["walgit-cli", "https://git.example.com"]
         assert_eq!(none.server.auth.issuer, "");
         let tok = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ principal = \"ci\", token = \"s\" }]\n").unwrap();
         assert_eq!(tok.server.auth.issuer, "");
+    }
+
+    #[test]
+    fn proxy_mode_needs_a_secret_and_nothing_else_that_grants_access() {
+        let parse = |server: &str, auth: &str| {
+            Config::parse(&format!(
+                "[store]\nbucket = \"b\"\n[server]\n{server}\n[server.auth]\nmode = \"proxy\"\nanonymous_read = false\n{auth}\n"
+            ))
+        };
+        // Without a secret anything that can reach the port could name any caller: a public
+        // bind, and loopback too (the sidecar shape — every container of the pod shares it).
+        for listen in ["0.0.0.0:8080", "127.0.0.1:8080", "[::1]:8080"] {
+            for secret in ["", "proxy_secret_env = \"\""] {
+                let err = parse(&format!("listen = \"{listen}\""), secret).unwrap_err();
+                assert!(
+                    err.to_string().contains("proxy_secret_env"),
+                    "{listen}: {err}"
+                );
+            }
+        }
+        for listen in ["0.0.0.0:8080", "127.0.0.1:8080"] {
+            let ok = parse(
+                &format!("listen = \"{listen}\""),
+                "proxy_secret_env = \"WALGIT_PROXY_SECRET\"",
+            )
+            .unwrap();
+            assert_eq!(ok.server.auth.mode, AuthMode::Proxy);
+            assert_eq!(
+                ok.server.auth.proxy_secret_env.as_deref(),
+                Some("WALGIT_PROXY_SECRET")
+            );
+        }
+        // No anonymous access, and no second way in or implicit admin beside the proxy.
+        let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"proxy\"\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("anonymous_read"), "{err}");
+        for extra in [
+            "tokens = [{ principal = \"ci\", token = \"s\" }]",
+            "trusted_forwarders = [\"front\"]",
+            "admin_emails = [\"a@example.com\"]",
+            "admin_domains = [\"example.com\"]",
+        ] {
+            let err = parse("", &format!("proxy_secret_env = \"S\"\n{extra}")).unwrap_err();
+            assert!(
+                !err.to_string().contains("proxy_secret_env"),
+                "{extra}: {err}"
+            );
+        }
+        // The secret is a proxy-mode key only.
+        let err =
+            Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nproxy_secret_env = \"X\"\n")
+                .unwrap_err();
+        assert!(err.to_string().contains("only read in proxy mode"), "{err}");
     }
 
     #[test]

@@ -6,12 +6,21 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
+/// Body of [`ApiError::UntrustedProxy`] (and of the in-band git `ERR` for it).
+pub const UNTRUSTED_PROXY_MESSAGE: &str = "forbidden: the request did not come through walgit's identity-aware proxy \
+     (X-Walgit-Proxy-Secret missing or wrong): the proxy in front of walgit is misconfigured, or the request \
+     bypassed it. Your credential was not rejected; the operator must fix the proxy";
+
 #[derive(Debug)]
 pub enum ApiError {
     NotFound(String),
     BadRequest(String),
     Unauthorized,
     Forbidden,
+    /// `proxy` mode: the request did not prove it came through the proxy
+    /// (`AuthError::UntrustedProxy`). 403, never 401: git erases the client's stored
+    /// credential on a 401, and the credential is not what failed.
+    UntrustedProxy,
     Conflict(String),
     PayloadTooLarge,
     UnsupportedMediaType(String),
@@ -25,7 +34,7 @@ impl ApiError {
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
-            ApiError::Forbidden => StatusCode::FORBIDDEN,
+            ApiError::Forbidden | ApiError::UntrustedProxy => StatusCode::FORBIDDEN,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             ApiError::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -43,6 +52,7 @@ impl ApiError {
             ApiError::BadRequest(m) => format!("bad request: {m}"),
             ApiError::Unauthorized => "unauthorized".to_string(),
             ApiError::Forbidden => "forbidden".to_string(),
+            ApiError::UntrustedProxy => UNTRUSTED_PROXY_MESSAGE.to_string(),
             ApiError::Conflict(m) => format!("conflict: {m}"),
             ApiError::PayloadTooLarge => "payload too large".to_string(),
             ApiError::UnsupportedMediaType(m) => format!("unsupported media type: {m}"),

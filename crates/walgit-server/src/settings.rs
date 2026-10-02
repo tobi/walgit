@@ -24,6 +24,7 @@ fn auth_err(e: crate::auth::AuthError) -> ApiError {
         crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
             ApiError::Unauthorized
         }
+        crate::auth::AuthError::UntrustedProxy => ApiError::UntrustedProxy,
         _ => ApiError::Forbidden,
     }
 }

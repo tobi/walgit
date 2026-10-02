@@ -52,10 +52,11 @@ pub async fn delete(
 
 /// `GET /` — list repos as text/plain, one `owner/name` per line.
 pub async fn list_repos(st: &AppState, headers: &HeaderMap) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let principal = st.auth.require_read(headers).await.map_err(auth_err)?;
     let repos = st.registry.list().await.map_err(wal_err)?;
     let body = repos
         .into_iter()
+        .filter(|r| principal.sees_owner(r.owner()))
         .map(|r| r.to_string())
         .collect::<Vec<_>>()
         .join("\n");
@@ -76,6 +77,7 @@ fn auth_err(e: crate::auth::AuthError) -> ApiError {
             ApiError::Unauthorized
         }
         crate::auth::AuthError::Forbidden => ApiError::Forbidden,
+        crate::auth::AuthError::UntrustedProxy => ApiError::UntrustedProxy,
         crate::auth::AuthError::Unavailable => {
             ApiError::ServiceUnavailable("auth provider unavailable".into())
         }
