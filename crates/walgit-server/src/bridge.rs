@@ -14,7 +14,8 @@
 //!   `…/manifest.pb` — the commit point itself as a notification. Accepted
 //!   shapes: a GCS Pub/Sub push envelope (`message.attributes.objectId`), an S3
 //!   event notification (`Records[].s3.object.key`), or a plain `{"key": "…"}`
-//!   / `{"repo": "owner/name"}`. A non-2xx here is meant to be redelivered;
+//!   (all bucket keys, `store.prefix` included) / `{"repo": "owner/name"}`
+//!   (whatever the prefix). A non-2xx here is meant to be redelivered;
 //! * the sweep (`events.sweep_interval`): every repo — the backstop. A sweep
 //!   that finds unpublished entries means the notifications are not flowing
 //!   and says so (`events_bridge_sweep_found_total`, warn).
@@ -258,8 +259,9 @@ impl Bridge {
     }
 }
 
-/// The object keys (or repository ids) a notification body names. Store-agnostic.
-fn notified_keys(v: &serde_json::Value) -> Vec<String> {
+/// The bucket object keys a notification body names, `store.prefix` included as the
+/// notifications carry it. Store-agnostic.
+fn notified_keys(v: &serde_json::Value, store_prefix: &str) -> Vec<String> {
     let mut keys = Vec::new();
     // GCS → Pub/Sub push envelope.
     let attrs = &v["message"]["attributes"];
@@ -299,8 +301,9 @@ fn notified_keys(v: &serde_json::Value) -> Vec<String> {
     if let Some(k) = v["key"].as_str() {
         keys.push(k.to_string());
     }
+    // A repository id names no object: use the key its manifest has in this bucket.
     if let Some(r) = v["repo"].as_str() {
-        keys.push(format!("repos/{r}/manifest.pb"));
+        keys.push(format!("{store_prefix}repos/{r}/manifest.pb"));
     }
     keys
 }
@@ -324,7 +327,7 @@ pub async fn http_notify(
     let v: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| ApiError::BadRequest(format!("notify body: {e}")))?;
     let mut reports = Vec::new();
-    for key in notified_keys(&v) {
+    for key in notified_keys(&v, &bridge.store_prefix) {
         match bridge.object_finalized(&key).await {
             Ok(Some(report)) => reports.push(report),
             Ok(None) => {}
@@ -390,7 +393,25 @@ mod tests {
             .manifest_repo("prefix/repos/acme/monorepo/manifest.pb")
             .unwrap();
         assert_eq!(id.to_string(), "acme/monorepo");
+        // Every body shape names the same repository under a non-empty prefix.
+        for body in [
+            serde_json::json!({"repo": "acme/monorepo"}),
+            serde_json::json!({"key": "prefix/repos/acme/monorepo/manifest.pb"}),
+            serde_json::json!({"message": {"attributes": {
+                "eventType": "OBJECT_FINALIZE",
+                "objectId": "prefix/repos/acme/monorepo/manifest.pb"}}}),
+            serde_json::json!({"Records": [{"eventName": "ObjectCreated:Put",
+                "s3": {"object": {"key": "prefix/repos/acme/monorepo/manifest.pb"}}}]}),
+        ] {
+            let ids: Vec<_> = notified_keys(&body, &b.store_prefix)
+                .iter()
+                .filter_map(|k| b.manifest_repo(k))
+                .map(|id| id.to_string())
+                .collect();
+            assert_eq!(ids, ["acme/monorepo"], "{body}");
+        }
         for other in [
+            "repos/t/r/manifest.pb",
             "prefix/repos/t/r/wal/abc.pack",
             "prefix/repos/t/r/events/cursor.json",
             "walgit-go/repos/t/r/manifest.pb",

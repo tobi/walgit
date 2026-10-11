@@ -206,6 +206,73 @@ async fn bridge_publishes_from_cursor_exactly_once() -> TestResult {
     Ok(())
 }
 
+/// With a bucket prefix (`store.prefix`), every notification shape wakes the bridge: bucket
+/// notifications carry the prefixed object key, and a plain `{"repo": …}` names the repository
+/// whatever the prefix. A key outside this walgit's prefix is acked and ignored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn notify_wakes_the_bridge_under_a_store_prefix() -> TestResult {
+    use walgit_store::ObjectStoreExt;
+    let (url, captured) = webhook().await;
+    let server = Server::start_with_tweak(|c| {
+        bridge_cfg(&url, Duration::ZERO)(c);
+        c.store.prefix = "tenant-a".into();
+    })
+    .await?;
+    server.put_repo("t", "r").await?;
+    assert!(
+        server
+            .store
+            .exists("tenant-a/repos/t/r/manifest.pb")
+            .await?,
+        "the repository lives under the prefix"
+    );
+    let src = TestRepo::synthetic(1, 1)?;
+    git_in(&src, &["commit", "--allow-empty", "-m", "a"])?;
+    git_in(&src, &["branch", "-M", "main"])?;
+    git_in(
+        &src,
+        &["remote", "add", "origin", &server.repo_url("t", "r")],
+    )?;
+    git_in(&src, &["push", "-u", "origin", "main"])?;
+
+    let client = reqwest::Client::new();
+    let notify = |body: serde_json::Value| {
+        let client = client.clone();
+        let url = format!("{}/_events/notify", server.base_url);
+        async move {
+            let resp = client.post(url).json(&body).send().await?;
+            anyhow::ensure!(resp.status() == 200, "{body}: {}", resp.status());
+            anyhow::Ok(resp.json::<serde_json::Value>().await?)
+        }
+    };
+    // Outside the prefix: not this walgit's object.
+    let report = notify(serde_json::json!({"key": "repos/t/r/manifest.pb"})).await?;
+    assert_eq!(report, serde_json::json!([]));
+    assert!(captured.lock().unwrap().is_empty());
+
+    let mut events = 0;
+    for body in [
+        serde_json::json!({"repo": "t/r"}),
+        gcs_notification("tenant-a/repos/t/r/manifest.pb", "OBJECT_FINALIZE"),
+        serde_json::json!({"Records": [{"eventName": "ObjectCreated:Put", "s3": {"object": {"key": "tenant-a/repos/t/r/manifest.pb"}}}]}),
+        serde_json::json!({"key": "tenant-a/repos/t/r/manifest.pb"}),
+    ] {
+        git_in(&src, &["commit", "--allow-empty", "-m", "next"])?;
+        git_in(&src, &["push"])?;
+        events += 1;
+        let report = notify(body.clone()).await?;
+        assert_eq!(report[0]["repo"], "t/r", "{body}: {report}");
+        assert_eq!(
+            report[0]["emitted"],
+            if events == 1 { 2 } else { 1 },
+            "{body}: {report}"
+        );
+    }
+    let got = wait_for(&captured, 5).await;
+    assert_eq!(got.len(), 5);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bridge_sweep_timer_publishes_without_notifications() -> TestResult {
     let (url, captured) = webhook().await;

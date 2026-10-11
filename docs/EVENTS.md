@@ -97,7 +97,9 @@ Wake-ups (both idempotent; they only ever call `catch_up`):
   itself as the notification. Accepted bodies: a GCS Pub/Sub push envelope (`message.attributes.eventType =
   OBJECT_FINALIZE`, `objectId`), an S3 event notification (`Records[].eventName = ObjectCreated:*`,
   `s3.object.key`; MinIO, rustfs and Ceph emit the same shape), or your own glue's `{"key": "repos/o/r/manifest.pb"}`
-  / `{"repo": "o/r"}`. Everything else is acked and ignored; a webhook failure answers 503 so the notifier
+  / `{"repo": "o/r"}`. Keys are bucket object keys as notifications carry them, `store.prefix` included
+  (`{"key": "<prefix>/repos/o/r/manifest.pb"}`); `{"repo": …}` names the repository whatever the prefix.
+  Everything else is acked and ignored; a webhook failure answers 503 so the notifier
   redelivers. Authenticated like every route (`require_read`): give the notifier a token.
 - The sweep (`events.sweep_interval`, default 5 min): `list` + one conditional manifest GET per repo. Not needed
   for correctness; it is the backstop *and the health check* — a sweep that publishes anything means

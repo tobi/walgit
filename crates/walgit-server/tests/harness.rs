@@ -109,7 +109,13 @@ impl Server {
         cfg.server.public_url = Some(base_url.clone());
         cfg.validate().context("config validate")?;
 
-        let dyn_store: DynStore = store.clone();
+        // `store.prefix` scopes every key, as `walgit_store::from_config` does for real backends.
+        let prefix = cfg.store_prefix();
+        let dyn_store: DynStore = if prefix.is_empty() {
+            store.clone()
+        } else {
+            Arc::new(walgit_store::Prefixed::new(store.clone(), prefix))
+        };
         let state = AppState::new(Arc::new(cfg), dyn_store).await?;
 
         let registry = state.registry.clone();
