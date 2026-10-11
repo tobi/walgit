@@ -1213,6 +1213,60 @@ async fn liveness_after_a_lost_cas_response() -> Result<()> {
     Ok(())
 }
 
+/// Liveness 4b: the bucket applies the manifest CAS, the reply is lost, and the client library's
+/// automatic retry of the same conditional PUT answers 412 (our own write moved the `ETag`). The
+/// writer must recognise its own commit: the push is acknowledged, the segment the manifest lists
+/// stays, and everybody (a cold instance too) syncs to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn liveness_after_a_landed_cas_answered_412() -> Result<()> {
+    let mut c = Cluster::new(15, 2).await?;
+    let mut p = Pusher::new(0);
+    ensure!(
+        p.push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+            .await?
+    );
+    c.instances[0].link.set(
+        FaultPlan {
+            p_cas_fail_after: 1.0,
+            ..Default::default()
+        }
+        .with_only(&["manifest.pb"]),
+    );
+    let acked = p
+        .push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+        .await?;
+    c.instances[0].link.heal();
+    let r = check_truth(&c, std::slice::from_ref(&p)).await;
+    if let Err(e) = &r {
+        eprintln!("{}", c.dump_traces());
+        bail!("truth inconsistent after a landed CAS answered 412: {e:#}");
+    }
+    ensure!(
+        acked,
+        "a durable push was not acknowledged: {:?}",
+        p.errors.last()
+    );
+    let head = c.truth_manifest().await?.head_seq;
+    let cold = c.add_instance("cold", &|_| {});
+    let h = c.instances[cold].open(&c.id).await?;
+    tokio::time::timeout(Duration::from_secs(10), h.sync_full())
+        .await
+        .map_err(|_| anyhow!("cold sync hung"))??;
+    ensure!(
+        h.applied_seq() == head,
+        "cold at {} != {head}",
+        h.applied_seq()
+    );
+    ensure!(
+        p.push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+            .await?,
+        "writer wedged: {:?}",
+        p.errors.last()
+    );
+    check_truth(&c, std::slice::from_ref(&p)).await?;
+    Ok(())
+}
+
 /// Liveness 7 (found by `sim_safety_then_liveness`): a writer crashes between
 /// its log PUT and its manifest CAS, leaving `log/<head+1>.pb` orphaned. Every
 /// later writer used to 412 on that key forever ("retry exhausted"): one crash

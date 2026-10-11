@@ -280,6 +280,90 @@ async fn replacement_seal_requires_exact_outputs_and_keeps_inputs_until_success(
     );
 }
 
+/// A client library retrying the seal's manifest CAS after its first reply was lost gets 412 from
+/// the seal's own landed write. Like every other publisher, the seal must find its segment listed
+/// and keep it: deleting it leaves the committed manifest pointing at a missing log segment.
+#[tokio::test]
+async fn a_landed_seal_answered_412_keeps_the_commit() {
+    use walgit_store::fault::{FaultPlan, FaultStore};
+    let store = MemoryStore::shared();
+    let dir = tempfile::tempdir().unwrap();
+    let link = FaultStore::new(store.clone(), "seal-landed-412", 1);
+    let registry = Registry::new(link.clone(), Arc::new(config(dir.path())));
+    let h = registry.create(&id(), ObjectFormat::Sha1).await.unwrap();
+    h.publish_settings("", "test", "generation").await.unwrap();
+    let mut manifest = (*h.manifest()).clone();
+    let input = real_pack(&store, &["conserved"]).await;
+    let mut output = real_pack(&store, &["conserved", "extra"]).await;
+    output.published_at = Some(walgit_proto::time::now());
+    output.pack_groups = vec!["_retained".into()];
+    output.audience = PackAudience::Retained as i32;
+    output.ref_policy = h.effective_config().refs.policy_identity();
+    manifest.packs = vec![input.clone()];
+    manifest.revision += 1;
+    seed(&store, &manifest).await;
+    let captured = h.publication_view().await.unwrap();
+    manifest.packs.push(output.clone());
+    manifest.revision += 1;
+    seed(&store, &manifest).await;
+    let lease = tokio::sync::Mutex::new(
+        walgit_store::coord::try_acquire(
+            store.clone(),
+            "test-seal-lease",
+            "test",
+            "seal",
+            std::time::Duration::from_mins(1),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    link.set(FaultPlan {
+        p_cas_fail_after: 1.0,
+        only_keys: Some(vec!["manifest.pb".into()]),
+        ..Default::default()
+    });
+    let sealed = h
+        .seal_pack_replacement(
+            &captured,
+            std::slice::from_ref(&input.checksum),
+            std::slice::from_ref(&output),
+            &[],
+            &lease,
+        )
+        .await;
+    link.heal();
+    let (_, bytes) = store
+        .get_bytes(&format!("{}manifest.pb", id().store_prefix()))
+        .await
+        .unwrap()
+        .unwrap();
+    let committed = Manifest::decode(bytes.as_ref()).unwrap();
+    for segment in &committed.log_segments {
+        assert!(
+            store
+                .get_bytes(&format!("{}{}", id().store_prefix(), segment.key))
+                .await
+                .unwrap()
+                .is_some(),
+            "manifest lists {} but it is gone",
+            segment.key
+        );
+    }
+    let seq = sealed.expect("a durable seal must be acknowledged");
+    assert_eq!(committed.head_seq, seq);
+    assert!(
+        committed
+            .retired_packs
+            .iter()
+            .any(|p| p.checksum == input.checksum)
+    );
+    let reader_dir = tempfile::tempdir().unwrap();
+    let reader = fresh(&store, config(reader_dir.path())).await;
+    drop(reader.sync_refs().await.unwrap());
+    assert_eq!(reader.manifest().head_seq, seq);
+}
+
 #[tokio::test]
 async fn exact_snapshot_is_not_authority_until_cas_and_corruption_is_rejected() {
     let store = MemoryStore::shared();

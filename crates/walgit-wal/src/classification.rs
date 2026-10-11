@@ -376,7 +376,9 @@ impl RepoHandle {
         snapshots: &[CoverageSnapshot],
         lease: &tokio::sync::Mutex<walgit_store::coord::LeaseGuard>,
     ) -> Result<u64, WalError> {
-        use crate::publish::{ClaimOutcome, claim_log_slot, drop_own_slot, sweep_burned};
+        use crate::publish::{
+            ClaimOutcome, SlotEvidence, claim_log_slot, drop_own_slot, slot_evidence, sweep_burned,
+        };
         use walgit_proto::v1::{EntryKind, LogEntry, LogSegmentRef};
         use walgit_proto::{frame, keys, time};
         if inputs.is_empty() || outputs.is_empty() || inputs.len() > 4096 || outputs.len() > 4096 {
@@ -528,7 +530,22 @@ impl RepoHandle {
                 .await;
             let committed = match result {
                 Ok(meta) => Some((updated, meta.version)),
-                Err(StoreError::PreconditionFailed { .. }) => None,
+                // A 412 may answer a transport retry of our own landed CAS: look before
+                // dropping the segment (see `publish::process_batch`).
+                Err(StoreError::PreconditionFailed { .. }) => {
+                    match slot_evidence(&self.store, &slot).await? {
+                        SlotEvidence::Committed(fresh, version) => {
+                            tracing::warn!(repo = %self.id, seq, "seal manifest CAS answered 412 but landed");
+                            Some((*fresh, version))
+                        }
+                        SlotEvidence::Unlisted => None,
+                        SlotEvidence::Unknown => {
+                            return Err(WalError::CommitUnknown(format!(
+                                "seal manifest CAS answered 412 and the manifest no longer shows whether seq {seq} landed"
+                            )));
+                        }
+                    }
+                }
                 Err(error) => match crate::publish::cas_landed(&self.store, &slot).await? {
                     Some(pair) => Some(pair),
                     None => return Err(error.into()),

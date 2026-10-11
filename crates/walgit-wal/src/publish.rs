@@ -23,12 +23,17 @@
 //!      log is strictly increasing, not dense — readers follow
 //!      `manifest.log_segments`) and the orphan is CAS-deleted after commit.
 //!   5. CAS the manifest: `head_seq = last_seq`, `packs += new PackRefs`,
-//!      `log_segments += new segment`. On 412: re-sync (applies others'
-//!      entries), re-verify, CAS-delete *our* segment, retry with new seq. On
-//!      any other error the outcome is ambiguous (the bucket may have applied
-//!      the write and lost the response): re-read the manifest; if it lists
-//!      our segment the publish succeeded, else leave the segment in place
-//!      (an orphan is harmless, a deleted committed segment is not).
+//!      `log_segments += new segment`. On 412 the CAS lost a race, or a
+//!      transport retry of our own landed CAS answered it: re-read the
+//!      manifest first ([`slot_evidence`]). If it lists our segment the publish
+//!      succeeded; if it proves the segment uncommitted (key unlisted, nothing
+//!      folded at our seq), CAS-delete *our* segment, re-sync (applies
+//!      others' entries), re-verify and retry with a new seq; otherwise the
+//!      outcome is unknown and the segment stays. On any other error the
+//!      outcome is ambiguous (the bucket may have applied the write and lost
+//!      the response, or may still): re-read the manifest; if it lists our
+//!      segment the publish succeeded, else leave the segment in place (an
+//!      orphan is harmless, a deleted committed segment is not).
 //!   6. On success: apply all valid txns locally, update handle state, send
 //!      success responses.
 //!
@@ -324,10 +329,68 @@ pub(crate) async fn sweep_burned(store: &Prefixed, slot: &LogSlot) {
     }
 }
 
-/// After a manifest CAS `PreconditionFailed`: CAS-delete *our* segment (only
-/// the version we wrote; never anything a later writer put there).
+/// CAS-delete *our* segment (only the version we wrote; never anything a later
+/// writer put there). Only while no manifest can list it: before our manifest
+/// CAS was sent, or after a 412 that [`SlotEvidence::Unlisted`] resolved.
 pub(crate) async fn drop_own_slot(store: &Prefixed, slot: &LogSlot) {
     let _ = store.delete(&slot.key, Some(slot.version.clone())).await;
+}
+
+/// What a fresh manifest proves about a slot whose manifest CAS did not report
+/// success.
+pub(crate) enum SlotEvidence {
+    /// The manifest lists this exact segment (key, first seq, size, bytes): the
+    /// CAS landed.
+    Committed(Box<Manifest>, walgit_store::Version),
+    /// The manifest does not list the segment's key and no checkpoint folded
+    /// the log at or past its first seq (folding drops segment descriptors), so
+    /// no committed manifest ever listed it. Together with a 412 this proves the
+    /// CAS lost: the request was conditioned on a manifest version that is gone,
+    /// so no copy of it can still land. After any other error it proves nothing
+    /// (the request may still be in flight).
+    Unlisted,
+    /// No proof either way: the log was folded at or past the segment, the
+    /// manifest lists the key with other contents, or there is no manifest. The
+    /// segment may be committed; it must stay and the outcome is unknown.
+    Unknown,
+}
+
+/// Read the manifest fresh and classify `slot` (see [`SlotEvidence`]).
+pub(crate) async fn slot_evidence(
+    store: &Prefixed,
+    slot: &LogSlot,
+) -> Result<SlotEvidence, WalError> {
+    use walgit_store::ObjectStoreExt;
+    let Some((meta, manifest)) =
+        crate::store_proto::get_message::<Manifest>(store, keys::MANIFEST).await?
+    else {
+        return Ok(SlotEvidence::Unknown);
+    };
+    crate::validate_manifest(&manifest)?;
+    if let Some(listed) = manifest.log_segments.iter().find(|s| s.key == slot.key) {
+        // The key is referenced: whatever it holds, it is never ours to delete.
+        let descriptor =
+            listed.first_seq == slot.first_seq && listed.size == slot.bytes.len() as u64;
+        let exact = descriptor
+            && store
+                .get_bytes(&slot.key)
+                .await?
+                .is_some_and(|(_, bytes)| bytes == slot.bytes);
+        return Ok(if exact {
+            SlotEvidence::Committed(Box::new(manifest), meta.version)
+        } else {
+            SlotEvidence::Unknown
+        });
+    }
+    let folded = manifest
+        .checkpoint
+        .as_ref()
+        .is_some_and(|cp| cp.seq >= slot.first_seq);
+    Ok(if folded {
+        SlotEvidence::Unknown
+    } else {
+        SlotEvidence::Unlisted
+    })
 }
 
 /// After a manifest CAS failed with a non-412 error: did the write land?
@@ -337,24 +400,10 @@ pub(crate) async fn cas_landed(
     store: &Prefixed,
     slot: &LogSlot,
 ) -> Result<Option<(Manifest, walgit_store::Version)>, WalError> {
-    use walgit_store::ObjectStoreExt;
-    let Some((meta, manifest)) =
-        crate::store_proto::get_message::<Manifest>(store, keys::MANIFEST).await?
-    else {
-        return Ok(None);
-    };
-    crate::validate_manifest(&manifest)?;
-    let listed = manifest.log_segments.iter().any(|s| {
-        s.key == slot.key && s.first_seq == slot.first_seq && s.size == slot.bytes.len() as u64
-    });
-    if !listed {
-        return Ok(None);
-    }
-    let exact = store
-        .get_bytes(&slot.key)
-        .await?
-        .is_some_and(|(_, bytes)| bytes == slot.bytes);
-    Ok(exact.then_some((manifest, meta.version)))
+    Ok(match slot_evidence(store, slot).await? {
+        SlotEvidence::Committed(manifest, version) => Some((*manifest, version)),
+        SlotEvidence::Unlisted | SlotEvidence::Unknown => None,
+    })
 }
 
 /// Verify a ref transaction against a working ref map. Returns per-ref results.
@@ -748,7 +797,39 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
         // lost the response. Look before deciding.
         let committed: Option<(Manifest, walgit_store::Version)> = match cas {
             Ok(meta) => Some((updated, meta.version)),
-            Err(StoreError::PreconditionFailed { .. }) => None,
+            // A client library that retries a CAS whose first reply was lost gets 412 from our own
+            // landed write (S3's SDK in standard mode; GCS for uploads with a precondition). Look
+            // before dropping the segment the committed manifest may already list.
+            Err(StoreError::PreconditionFailed { .. }) => {
+                match slot_evidence(&handle.store, &slot)
+                    .instrument(span.clone())
+                    .await
+                {
+                    Ok(SlotEvidence::Committed(fresh, version)) => {
+                        tracing::warn!(repo = %handle.id, seq = last_seq, "manifest CAS answered 412 but landed");
+                        Some((*fresh, version))
+                    }
+                    Ok(SlotEvidence::Unlisted) => None,
+                    Ok(SlotEvidence::Unknown) => {
+                        // A checkpoint may have folded our landed entry away before we looked: the
+                        // segment stays, and re-verifying would report our own push as a conflict.
+                        let msg = format!(
+                            "manifest CAS answered 412 and the manifest no longer shows whether seq {first_seq} landed"
+                        );
+                        return finish_with_error_msg(
+                            batch,
+                            &valid_indices,
+                            &msg,
+                            WalError::CommitUnknown(msg.clone()),
+                        );
+                    }
+                    Err(e) => {
+                        let msg =
+                            format!("manifest CAS answered 412 and re-reading it failed: {e}");
+                        return finish_with_error_msg(batch, &valid_indices, &msg, e);
+                    }
+                }
+            }
             Err(e) => match cas_landed(&handle.store, &slot)
                 .instrument(span.clone())
                 .await
@@ -1180,7 +1261,22 @@ pub(crate) async fn publish_compact_classified(
             .await;
         let committed = match cas {
             Ok(meta) => Some((updated, meta.version)),
-            Err(StoreError::PreconditionFailed { .. }) => None,
+            // A 412 can be our own landed write answering a client library's retry (see
+            // `process_batch`): look before dropping the segment.
+            Err(StoreError::PreconditionFailed { .. }) => {
+                match slot_evidence(&handle.store, &slot).await? {
+                    SlotEvidence::Committed(fresh, version) => {
+                        tracing::warn!(repo = %handle.id, seq, "compact manifest CAS answered 412 but landed");
+                        Some((*fresh, version))
+                    }
+                    SlotEvidence::Unlisted => None,
+                    SlotEvidence::Unknown => {
+                        return Err(WalError::CommitUnknown(format!(
+                            "compact manifest CAS answered 412 and the manifest no longer shows whether seq {seq} landed"
+                        )));
+                    }
+                }
+            }
             Err(e) => match cas_landed(&handle.store, &slot).await {
                 Ok(Some((fresh, version))) => {
                     tracing::warn!(repo = %handle.id, seq, "compact manifest CAS errored but landed: {e}");
@@ -1501,6 +1597,22 @@ pub(crate) async fn publish_settings_impl(
                 return Ok(revision);
             }
             Err(StoreError::PreconditionFailed { .. }) => {
+                // A 412 can be our own landed write answering a client library's retry (see
+                // `process_batch`). Committed: leave the segment and let the next sync adopt it.
+                match slot_evidence(&handle.store, &slot).await? {
+                    SlotEvidence::Committed(..) => {
+                        handle.manifest_version.lock().take();
+                        sweep_burned(&handle.store, &slot).await;
+                        tracing::warn!(repo = %handle.id, seq, revision, "settings CAS answered 412 but landed");
+                        return Ok(revision);
+                    }
+                    SlotEvidence::Unlisted => {}
+                    SlotEvidence::Unknown => {
+                        return Err(WalError::CommitUnknown(format!(
+                            "settings manifest CAS answered 412 and the manifest no longer shows whether seq {seq} landed"
+                        )));
+                    }
+                }
                 drop_own_slot(&handle.store, &slot).await;
                 attempts += 1;
                 if attempts >= max_retries {
@@ -1563,6 +1675,115 @@ mod claim_tests {
             "same key and sequence are insufficient"
         );
         assert!(cas_landed(&store, &second).await?.is_some());
+        Ok(())
+    }
+
+    /// After a 412 the segment may be dropped only when the fresh manifest proves no committed
+    /// manifest ever listed it. A checkpoint folding the log at or past its seq drops segment
+    /// descriptors, so an unlisted segment there may still be committed.
+    #[tokio::test]
+    async fn only_an_unlisted_unfolded_segment_is_proven_uncommitted() -> anyhow::Result<()> {
+        let truth = walgit_store::memory::MemoryStore::shared();
+        let store = Prefixed::new(truth, "repos/o/evidence/");
+        let encode = |seq| {
+            frame::encode_entries([&LogEntry {
+                seq,
+                kind: EntryKind::Push as i32,
+                ..Default::default()
+            }])
+        };
+        // Our segment at seq 3, written on a basis of head 2.
+        let ClaimOutcome::Claimed(slot) = claim_log_slot(&store, 2, encode).await? else {
+            anyhow::bail!("uncontended claim expected");
+        };
+        let ours = LogSegmentRef {
+            key: slot.key.clone(),
+            first_seq: 3,
+            last_seq: 3,
+            size: slot.bytes.len() as u64,
+            sealed: true,
+        };
+        let checkpoint = |seq: u64| walgit_proto::v1::CheckpointRef {
+            seq,
+            key: format!("checkpoints/{seq}/checkpoint.pb"),
+            refs_key: format!("checkpoints/{seq}/refs.pb"),
+            ..Default::default()
+        };
+        let manifest = |head_seq: u64, segments: Vec<LogSegmentRef>, cp: Option<u64>| Manifest {
+            format_version: walgit_proto::WAL_FORMAT_VERSION,
+            object_format: "sha1".into(),
+            head_seq,
+            min_seq: cp.map_or(1, |seq| seq + 1),
+            log_segments: segments,
+            checkpoint: cp.map(checkpoint),
+            ..Default::default()
+        };
+        let cases = [
+            (
+                "lists our exact segment",
+                manifest(3, vec![ours.clone()], None),
+                "committed",
+            ),
+            (
+                "lists our segment after an older fold",
+                manifest(4, vec![ours.clone()], Some(2)),
+                "committed",
+            ),
+            (
+                "lists our key with another size",
+                manifest(
+                    3,
+                    vec![LogSegmentRef {
+                        size: ours.size + 1,
+                        ..ours.clone()
+                    }],
+                    None,
+                ),
+                "unknown",
+            ),
+            (
+                "moved without reaching our seq",
+                manifest(2, vec![], None),
+                "unlisted",
+            ),
+            (
+                "burned our seq and committed past it",
+                manifest(
+                    4,
+                    vec![LogSegmentRef {
+                        key: keys::log_segment_key(4),
+                        first_seq: 4,
+                        last_seq: 4,
+                        size: 1,
+                        sealed: true,
+                    }],
+                    Some(2),
+                ),
+                "unlisted",
+            ),
+            ("folded at our seq", manifest(3, vec![], Some(3)), "unknown"),
+            (
+                "folded past our seq",
+                manifest(5, vec![], Some(5)),
+                "unknown",
+            ),
+        ];
+        for (what, m, want) in cases {
+            store
+                .put_bytes(keys::MANIFEST, m.encode_to_vec(), PutMode::Overwrite)
+                .await?;
+            let got = match slot_evidence(&store, &slot).await? {
+                SlotEvidence::Committed(..) => "committed",
+                SlotEvidence::Unlisted => "unlisted",
+                SlotEvidence::Unknown => "unknown",
+            };
+            assert_eq!(got, want, "{what}");
+        }
+        store.delete(keys::MANIFEST, None).await?;
+        assert!(
+            matches!(slot_evidence(&store, &slot).await?, SlotEvidence::Unknown),
+            "no manifest proves nothing"
+        );
         Ok(())
     }
 }

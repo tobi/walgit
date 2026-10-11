@@ -2910,6 +2910,213 @@ async fn lost_cas_reply_is_resolved_or_unknown_without_losing_the_commit() {
     assert_eq!(handle.read_log(1, None).await.unwrap().len(), 3);
 }
 
+/// A client library that retries a conditional write whose first reply was lost gets 412 from its
+/// own landed write. No publisher may read that as a lost race and delete the segment the committed
+/// manifest now lists: not a push, a compaction or a settings change.
+#[tokio::test]
+async fn a_landed_cas_answered_412_keeps_the_commit() {
+    use prost::Message;
+    use walgit_store::ObjectStoreExt;
+    use walgit_store::fault::{FaultPlan, FaultStore};
+    let landed_412 = || FaultPlan {
+        p_cas_fail_after: 1.0,
+        only_keys: Some(vec!["manifest.pb".into()]),
+        ..Default::default()
+    };
+    let cache = tempfile::tempdir().unwrap();
+    let truth = MemoryStore::shared();
+    let link = FaultStore::new(truth.clone(), "landed-412", 1);
+    let registry = Registry::new(link.clone(), Arc::new(make_config(cache.path(), 0)));
+    let id = repo_id("o", "landed");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    // Every segment the manifest lists exists, and a fresh instance syncs to `tip`.
+    let intact = |what: &'static str, tip: String| {
+        let truth = truth.clone();
+        let id = id.clone();
+        async move {
+            let mkey = format!("{}{}", id.store_prefix(), walgit_proto::keys::MANIFEST);
+            let (_, bytes) = truth.get_bytes(&mkey).await.unwrap().unwrap();
+            let manifest = walgit_proto::v1::Manifest::decode(bytes.as_ref()).unwrap();
+            for segment in &manifest.log_segments {
+                let key = format!("{}{}", id.store_prefix(), segment.key);
+                assert!(
+                    truth.get_bytes(&key).await.unwrap().is_some(),
+                    "{what}: manifest lists {} but it is gone",
+                    segment.key
+                );
+            }
+            let reader_cache = tempfile::tempdir().unwrap();
+            let reader = Registry::new(truth, Arc::new(make_config(reader_cache.path(), 0)))
+                .open(&id)
+                .await
+                .unwrap();
+            drop(reader.sync_refs().await.unwrap());
+            assert_eq!(
+                reader.local().ref_view().unwrap().get("refs/heads/main"),
+                Some(tip),
+                "{what}"
+            );
+        }
+    };
+
+    let work = WorkRepo::new();
+    let first = work.commit("first", "content");
+    let pack = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    link.set(landed_412());
+    let pushed = handle
+        .publish_push(
+            Some(pack),
+            make_txn(vec![("refs/heads/main", "", &first)]),
+            HashMap::new(),
+        )
+        .await;
+    link.heal();
+    intact("push", first.clone()).await;
+    assert!(
+        pushed
+            .unwrap()
+            .per_ref
+            .iter()
+            .all(|(_, status)| status.is_ok()),
+        "a durable push must be acknowledged"
+    );
+
+    let second = work.commit("second", "more");
+    let pack = ingest_pack_data(&handle, work.create_incremental_pack(&second, &first))
+        .await
+        .unwrap();
+    handle
+        .publish_push(
+            Some(pack),
+            make_txn(vec![("refs/heads/main", &first, &second)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let repack = handle
+        .local()
+        .repack(walgit_git::RepackOptions {
+            mode: walgit_git::RepackMode::Full,
+            write_bitmap: false,
+            write_midx: false,
+            keep: vec![],
+        })
+        .await
+        .unwrap();
+    link.set(landed_412());
+    let compacted = handle
+        .publish_compact(repack.new_packs[0].clone(), repack.removed.clone(), 2)
+        .await;
+    link.heal();
+    intact("compaction", second.clone()).await;
+    assert!(
+        compacted.is_ok(),
+        "a durable compaction must be acknowledged"
+    );
+
+    link.set(landed_412());
+    let settings = handle
+        .publish_settings("[packs]\nenabled = false\n", "test", "landed 412")
+        .await;
+    link.heal();
+    intact("settings", second).await;
+    assert!(
+        settings.is_ok(),
+        "a durable settings change must be acknowledged"
+    );
+}
+
+/// The manifest as the bucket holds it, read past every link.
+async fn truth_manifest(truth: &MemoryStore, id: &RepoId) -> walgit_proto::v1::Manifest {
+    use walgit_store::ObjectStoreExt;
+    let key = format!("{}{}", id.store_prefix(), walgit_proto::keys::MANIFEST);
+    let (_, bytes) = truth.get_bytes(&key).await.unwrap().unwrap();
+    <walgit_proto::v1::Manifest as prost::Message>::decode(bytes.as_ref()).unwrap()
+}
+
+/// A landed CAS answered 412, and before the writer reads the manifest back another instance
+/// commits on top and a checkpoint folds the log past the writer's entry, dropping its segment
+/// descriptor. The manifest then cannot show whether the push landed: the writer must keep the
+/// segment and answer "commit unknown", not delete it and report its own durable push as a
+/// conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_landed_cas_folded_before_the_412_is_resolved_stays_unknown() {
+    use walgit_store::ObjectStoreExt;
+    use walgit_store::fault::{FaultPlan, FaultStore};
+    let truth = MemoryStore::shared();
+    let id = repo_id("o", "folded");
+    let writer_cache = tempfile::tempdir().unwrap();
+    let link = FaultStore::new(truth.clone(), "landed-412-folded", 1);
+    let writer = Registry::new(link.clone(), Arc::new(make_config(writer_cache.path(), 0)))
+        .create(&id, ObjectFormat::Sha1)
+        .await
+        .unwrap();
+
+    let work = WorkRepo::new();
+    let first = work.commit("first", "content");
+    let pack = ingest_pack_data(&writer, work.create_pack()).await.unwrap();
+    link.set(FaultPlan {
+        p_cas_fail_after: 1.0,
+        only_keys: Some(vec!["manifest.pb".into()]),
+        ..Default::default()
+    });
+    // The first manifest read after the CAS is the writer's evidence check: hold it.
+    let gate = link.gate_next("get", "manifest.pb");
+    let push = {
+        let writer = writer.clone();
+        let txn = make_txn(vec![("refs/heads/main", "", &first)]);
+        tokio::spawn(async move {
+            writer
+                .publish_push_synced(Some(pack), txn, HashMap::new())
+                .await
+        })
+    };
+    gate.entered().await;
+    link.heal();
+    let landed = truth_manifest(&truth, &id).await;
+    assert_eq!(landed.head_seq, 1, "the writer's CAS landed");
+    let segment = format!("{}{}", id.store_prefix(), landed.log_segments[0].key);
+
+    // Meanwhile another instance commits on top and folds the log past seq 1.
+    let other_cache = tempfile::tempdir().unwrap();
+    let other = Registry::new(truth.clone(), Arc::new(make_config(other_cache.path(), 0)))
+        .open(&id)
+        .await
+        .unwrap();
+    other
+        .publish_push(
+            None,
+            make_txn(vec![("refs/heads/other", "", &first)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let cp = other.write_checkpoint().await.unwrap();
+    assert_eq!(cp.seq, 2);
+    assert!(
+        truth_manifest(&truth, &id).await.log_segments.is_empty(),
+        "the fold dropped every segment descriptor"
+    );
+    gate.release();
+
+    let outcome = push.await.unwrap();
+    assert!(
+        matches!(outcome, Err(walgit_wal::WalError::CommitUnknown(_))),
+        "an unprovable outcome is unknown, never a conflict: {:?}",
+        outcome.map(|r| r.per_ref)
+    );
+    assert!(
+        truth.get_bytes(&segment).await.unwrap().is_some(),
+        "the writer deleted its committed (folded) segment"
+    );
+    // The push is durable, and the writer itself converges on it.
+    drop(writer.sync_refs().await.unwrap());
+    assert_eq!(
+        writer.local().ref_view().unwrap().get("refs/heads/main"),
+        Some(first)
+    );
+}
+
 #[tokio::test]
 async fn readiness_carries_only_proven_inventory_and_rechecks_revision_only_restart() {
     let writer_cache = tempfile::tempdir().unwrap();
