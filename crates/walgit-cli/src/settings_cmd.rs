@@ -87,7 +87,7 @@ pub async fn run(action: SettingsAction, cfg: &Arc<Config>) -> Result<()> {
             h.sync_refs().await?;
             let m = h.manifest();
             let from = m.min_seq.max(1);
-            let entries = h.read_log(from, None).await?;
+            let entries = h.read_log(&m, from, None).await?;
             let mut n = 0;
             for e in entries
                 .iter()

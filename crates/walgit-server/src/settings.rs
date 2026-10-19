@@ -108,7 +108,7 @@ pub async fn http_history(
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     let m = h.manifest();
     let entries = h
-        .read_log(m.min_seq.max(1), None)
+        .read_log(&m, m.min_seq.max(1), None)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     let items: Vec<serde_json::Value> = entries
@@ -402,7 +402,7 @@ pub async fn http_policy_dry_run(
     };
     let m = h.manifest();
     let entries = h
-        .read_log(m.min_seq.max(1), None)
+        .read_log(&m, m.min_seq.max(1), None)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     let pushes: Vec<&walgit_proto::v1::LogEntry> = entries

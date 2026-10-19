@@ -483,7 +483,7 @@ pub(crate) async fn apply_delta(
 
     // The checkpoint's times feed `first_state_time` / `refs_as_of`; old refs
     // carry none, the object always does.
-    handle.learn_checkpoint_times().await?;
+    handle.learn_checkpoint_times(new_manifest).await?;
     if need_checkpoint_load {
         let cp = new_manifest
             .checkpoint

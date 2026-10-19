@@ -257,6 +257,6 @@ impl RepoHandle {
         {
             return checkpoint_snapshot(&self.store, cp, &manifest.object_format).await;
         }
-        crate::log_reader::refs_at_seq(self, seq).await
+        crate::log_reader::refs_at_seq(self, &manifest, seq).await
     }
 }

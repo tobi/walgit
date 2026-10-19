@@ -6,25 +6,8 @@ use walgit_store::{GetOptions, GetResult, ObjectStore};
 use crate::error::WalError;
 use crate::handle::RepoHandle;
 
-/// Read log entries in [`from_seq`, `to_seq`]. If `to_seq` is None, read up to
-/// `manifest.head_seq`.
-pub(crate) async fn read_log_impl(
-    handle: &RepoHandle,
-    from_seq: u64,
-    to_seq: Option<u64>,
-) -> Result<Vec<LogEntry>, WalError> {
-    // Reading the log needs a *fresh manifest*, not a synced local copy: do a
-    // lock-free conditional GET and use whichever manifest is newer. Taking
-    // the repo's write lock here would deadlock callers that hold a read
-    // guard (overview, tests), and freshness_ttl=0 makes that the common case.
-    let (held, known) = handle.manifest_pair();
-    let manifest = match crate::sync::freshness_check(&handle.store, known.as_ref()).await? {
-        crate::sync::SyncOutcome::Unchanged => held,
-        crate::sync::SyncOutcome::Changed { manifest, .. } => manifest,
-    };
-    read_log_manifest(handle, &manifest, from_seq, to_seq).await
-}
-
+/// Read log entries in [`from_seq`, `to_seq`] through `manifest`'s segments. If
+/// `to_seq` is None, read up to `manifest.head_seq`.
 pub(crate) async fn read_log_manifest(
     handle: &RepoHandle,
     manifest: &walgit_proto::v1::Manifest,
@@ -80,9 +63,10 @@ pub(crate) async fn read_log_manifest(
 /// the last entry applied (0 = none).
 pub async fn refs_as_of(
     handle: &super::handle::RepoHandle,
+    manifest: &walgit_proto::v1::Manifest,
     at: std::time::SystemTime,
 ) -> Result<(walgit_proto::v1::RefSnapshot, u64), WalError> {
-    replay_refs(handle, Cut::Time(at)).await
+    replay_refs(handle, manifest, Cut::Time(at)).await
 }
 
 /// Ref state **at** WAL `seq` exactly (the newest checkpoint at or before it + every ref
@@ -91,9 +75,9 @@ pub async fn refs_as_of(
 /// compose, whose header must carry the refs at the base pack's seq whatever moved since.
 pub async fn refs_at_seq(
     handle: &super::handle::RepoHandle,
+    manifest: &walgit_proto::v1::Manifest,
     seq: u64,
 ) -> Result<walgit_proto::v1::RefSnapshot, WalError> {
-    let manifest = handle.manifest();
     if seq > manifest.head_seq {
         return Err(WalError::Corrupt(format!("future refs sequence {seq}")));
     }
@@ -104,7 +88,7 @@ pub async fn refs_at_seq(
             manifest.min_seq
         )));
     }
-    Ok(replay_refs(handle, Cut::Seq(seq)).await?.0)
+    Ok(replay_refs(handle, manifest, Cut::Seq(seq)).await?.0)
 }
 
 enum Cut {
@@ -114,9 +98,9 @@ enum Cut {
 
 async fn replay_refs(
     handle: &super::handle::RepoHandle,
+    manifest: &walgit_proto::v1::Manifest,
     cut: Cut,
 ) -> Result<(walgit_proto::v1::RefSnapshot, u64), WalError> {
-    let manifest = handle.manifest();
     // Start point: checkpoint ≤ cut (checkpoint created_at on the ref; when
     // the ref has no timestamp, fall back to replaying from seq 0).
     let mut snap = walgit_proto::v1::RefSnapshot::default();
@@ -129,8 +113,8 @@ async fn replay_refs(
         let usable = match cut {
             Cut::Seq(seq) => cp.seq <= seq,
             Cut::Time(at) => {
-                handle.learn_checkpoint_times().await?;
-                let times = handle.checkpoint_times();
+                handle.learn_checkpoint_times(manifest).await?;
+                let times = handle.checkpoint_times(manifest);
                 let cp_time = times.and_then(|t| t.as_of.or(t.created_at));
                 cp_time.is_some_and(|t| t <= at)
             }
@@ -151,7 +135,7 @@ async fn replay_refs(
         Cut::Seq(seq) => Some(seq),
         Cut::Time(_) => None,
     };
-    let entries = read_log_manifest(handle, &manifest, from_seq + 1, to_seq).await?;
+    let entries = read_log_manifest(handle, manifest, from_seq + 1, to_seq).await?;
     let mut map: std::collections::BTreeMap<String, walgit_proto::v1::Ref> =
         snap.refs.into_iter().map(|r| (r.name.clone(), r)).collect();
     let mut head_target = snap.head_target;

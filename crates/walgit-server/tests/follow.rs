@@ -88,7 +88,7 @@ async fn follows_upstream_refs_through_the_wal_fast_forward_only() -> anyhow::Re
     );
     let h = step!("open", fo.state.registry.open(&id))?;
     assert_eq!(h.manifest().head_seq, 1);
-    let entries = step!("log", h.read_log(1, None))?;
+    let entries = step!("log", h.read_log(&h.manifest(), 1, None))?;
     assert_eq!(
         entries[0].meta.get("principal").map(String::as_str),
         Some("upstream")

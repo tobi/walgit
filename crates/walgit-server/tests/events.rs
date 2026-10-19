@@ -261,3 +261,58 @@ async fn bridge_sink_failure_keeps_the_cursor() -> TestResult {
     assert_eq!(resp.status(), 503, "non-2xx so Pub/Sub redelivers");
     Ok(())
 }
+
+/// A checkpoint that lands while the bridge is catching up must not lose the
+/// entries it folds: the bridge takes `head_seq` from the manifest it holds,
+/// and another instance's checkpoint then trims the store's manifest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bridge_publishes_entries_a_concurrent_checkpoint_folds() -> TestResult {
+    let (url, captured) = webhook().await;
+    // The TTL keeps the bridge on its held manifest, so the interleaving
+    // needs no timing.
+    let server = Server::start_with_tweak(|c| {
+        bridge_cfg(&url, Duration::ZERO)(c);
+        c.wal.freshness_ttl = Duration::from_mins(10);
+    })
+    .await?;
+    let bridge = server.state.bridge.clone().expect("bridge enabled");
+    server.put_repo("t", "r").await?;
+    let id = walgit_git::RepoId::new("t", "r")?;
+
+    let src = TestRepo::synthetic(1, 1)?;
+    git_in(&src, &["commit", "--allow-empty", "-m", "a"])?;
+    git_in(&src, &["branch", "-M", "main"])?;
+    git_in(
+        &src,
+        &["remote", "add", "origin", &server.repo_url("t", "r")],
+    )?;
+    git_in(&src, &["push", "-u", "origin", "main"])?;
+    let r = bridge.catch_up(&id).await?;
+    assert_eq!((r.head_seq, r.emitted), (1, 1));
+    wait_for(&captured, 1).await;
+
+    git_in(&src, &["commit", "--allow-empty", "-m", "b"])?;
+    git_in(&src, &["push"])?;
+
+    // Another instance folds seq 2 into a checkpoint.
+    let sibling = server.start_sibling_with(|_| {}).await?;
+    let cp = sibling
+        .state
+        .registry
+        .open(&id)
+        .await?
+        .write_checkpoint()
+        .await?;
+    assert_eq!(cp.seq, 2);
+
+    let r = bridge.catch_up(&id).await?;
+    assert_eq!(
+        (r.from_seq, r.head_seq, r.emitted, r.gap),
+        (1, 2, 1, None),
+        "seq 2 was committed and seen; it must be published, not skipped"
+    );
+    let got = wait_for(&captured, 2).await;
+    assert_eq!(got[1]["_walgit"]["seq"], "2");
+    assert_eq!(cursor_seq(&server, "t", "r").await, Some(2));
+    Ok(())
+}

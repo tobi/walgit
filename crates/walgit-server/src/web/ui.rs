@@ -529,13 +529,11 @@ async fn overview(
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
     let handle = state.registry.open(&id).await.map_err(wal_err)?;
-    // read_log performs its own freshness check; acquire the read guard only
-    // after it has completed because read_log may need the write lock.
-    let entries = handle.read_log(1, None).await.map_err(wal_err)?;
     // Refs-level sync only: the overview must render for repos whose packs do
     // not fit this instance (that is exactly when people look at it).
     let _guard = handle.sync_refs().await.map_err(wal_err)?;
     let manifest = handle.manifest();
+    let entries = handle.read_log(&manifest, 1, None).await.map_err(wal_err)?;
     let version = handle
         .manifest_version()
         .map(|version| version.to_string())

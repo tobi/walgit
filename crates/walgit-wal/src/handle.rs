@@ -1384,7 +1384,7 @@ impl RepoHandle {
         // checkpoint (seq 1, 08-19 21:33Z) was ignored because its manifest ref
         // carries no times; the bundler then cut "08-19 23:00" slots from today's
         // main. The times now come from the checkpoint object when the ref has none.
-        let cp = self.checkpoint_times();
+        let cp = self.checkpoint_times(&self.manifest());
         [
             cp.as_ref().and_then(|c| c.first_state_at),
             cp.as_ref().and_then(|c| c.created_at),
@@ -1395,11 +1395,10 @@ impl RepoHandle {
         .min()
     }
 
-    /// Times of the current checkpoint: from the manifest's `CheckpointRef`, else
-    /// from the checkpoint object read during sync (`checkpoint_times` cache).
+    /// Times of `m`'s checkpoint: from its `CheckpointRef`, else from the
+    /// checkpoint object read during sync (`checkpoint_times` cache).
     /// None = no checkpoint, or its times are not known to this process yet.
-    pub fn checkpoint_times(&self) -> Option<CheckpointTimes> {
-        let m = self.manifest();
+    pub fn checkpoint_times(&self, m: &Manifest) -> Option<CheckpointTimes> {
         let cp = m.checkpoint.as_ref()?;
         let from_ref = CheckpointTimes {
             created_at: cp.created_at.as_ref().map(walgit_proto::time::to_system),
@@ -1418,14 +1417,13 @@ impl RepoHandle {
         }
     }
 
-    /// Read the checkpoint object's times when the manifest ref has none
+    /// Read `m`'s checkpoint object's times when its ref has none
     /// (one 240-byte GET per checkpoint per process; no-op otherwise).
-    pub(crate) async fn learn_checkpoint_times(&self) -> Result<(), WalError> {
+    pub(crate) async fn learn_checkpoint_times(&self, m: &Manifest) -> Result<(), WalError> {
         use walgit_store::ObjectStoreExt;
 
         use prost::Message;
 
-        let m = self.manifest();
         let Some(cp) = m.checkpoint.as_ref() else {
             return Ok(());
         };
@@ -1452,23 +1450,43 @@ impl RepoHandle {
     /// refs-level, pure). See `log_reader::refs_as_of`.
     pub async fn refs_as_of(
         &self,
+        manifest: &Manifest,
         at: std::time::SystemTime,
     ) -> Result<(walgit_proto::v1::RefSnapshot, u64), WalError> {
-        crate::log_reader::refs_as_of(self, at).await
+        crate::log_reader::refs_as_of(self, manifest, at).await
     }
 
     /// Ref state at WAL `seq` exactly (refs-level, pure). See `log_reader::refs_at_seq`.
-    pub async fn refs_at_seq(&self, seq: u64) -> Result<walgit_proto::v1::RefSnapshot, WalError> {
-        crate::log_reader::refs_at_seq(self, seq).await
+    pub async fn refs_at_seq(
+        &self,
+        manifest: &Manifest,
+        seq: u64,
+    ) -> Result<walgit_proto::v1::RefSnapshot, WalError> {
+        crate::log_reader::refs_at_seq(self, manifest, seq).await
     }
 
-    /// Read log entries [`from_seq`, `to_seq`].
+    /// The freshest manifest: the one this handle holds, or the store's if it
+    /// is newer. A lock-free conditional GET, so a caller holding a read guard
+    /// can call it.
+    pub async fn fresh_manifest(&self) -> Result<Arc<Manifest>, WalError> {
+        let (held, known) = self.manifest_pair();
+        Ok(
+            match crate::sync::freshness_check(&self.store, known.as_ref()).await? {
+                crate::sync::SyncOutcome::Unchanged => held,
+                crate::sync::SyncOutcome::Changed { manifest, .. } => manifest,
+            },
+        )
+    }
+
+    /// Read log entries [`from_seq`, `to_seq`] through `manifest`, the one the
+    /// bounds came from: a later checkpoint trims segments only from its own.
     pub async fn read_log(
         &self,
+        manifest: &Manifest,
         from_seq: u64,
         to_seq: Option<u64>,
     ) -> Result<Vec<walgit_proto::v1::LogEntry>, WalError> {
-        crate::log_reader::read_log_impl(self, from_seq, to_seq).await
+        crate::log_reader::read_log_manifest(self, manifest, from_seq, to_seq).await
     }
 
     // ---- internal helpers ----

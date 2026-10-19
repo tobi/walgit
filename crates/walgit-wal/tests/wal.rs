@@ -259,7 +259,7 @@ async fn test_create_and_three_pushes() {
     assert_eq!(manifest.packs.len(), 3);
 
     // Check log is readable
-    let log = handle.read_log(1, None).await.unwrap();
+    let log = handle.read_log(&handle.manifest(), 1, None).await.unwrap();
     assert_eq!(log.len(), 3);
     assert_eq!(log[0].seq, 1);
     assert_eq!(log[1].seq, 2);
@@ -907,7 +907,10 @@ async fn test_orphan_log_invisible_and_cleaned() {
     );
 
     // Orphan log entry should not appear in read_log
-    let log = handle2.read_log(1, None).await.unwrap();
+    let log = handle2
+        .read_log(&handle2.fresh_manifest().await.unwrap(), 1, None)
+        .await
+        .unwrap();
     assert!(
         !log.iter().any(|e| e.seq == 99),
         "Orphan entry should not be in log"
@@ -2176,14 +2179,17 @@ async fn test_publish_at_explicit_monotonic_created_at() {
         .unwrap();
     assert!(r.per_ref.iter().all(|(_, r)| r.is_ok()), "{:?}", r.per_ref);
     // Entry times are the explicit ones, in order.
-    let log = handle.read_log(1, None).await.unwrap();
+    let log = handle.read_log(&handle.manifest(), 1, None).await.unwrap();
     let times: Vec<i64> = log
         .iter()
         .map(|e| e.created_at.as_ref().unwrap().seconds)
         .collect();
     assert_eq!(times, vec![1786402800, 1786489200, 1786575600]);
     // As-of cuts per slot.
-    let (s, seq) = handle.refs_as_of(t("2026-08-11T23:30:00Z")).await.unwrap();
+    let (s, seq) = handle
+        .refs_as_of(&handle.manifest(), t("2026-08-11T23:30:00Z"))
+        .await
+        .unwrap();
     assert_eq!(seq, 2);
     assert_eq!(
         s.refs
@@ -2193,7 +2199,10 @@ async fn test_publish_at_explicit_monotonic_created_at() {
             .oid,
         c2
     );
-    let (s, seq) = handle.refs_as_of(t("2026-08-10T23:30:00Z")).await.unwrap();
+    let (s, seq) = handle
+        .refs_as_of(&handle.manifest(), t("2026-08-10T23:30:00Z"))
+        .await
+        .unwrap();
     assert_eq!((seq, s.refs[0].oid.as_str()), (1, c1.as_str()));
     // A plain publish (now) after explicit times is fine (now > Aug 12).
     let c4 = work.commit("four", "4");
@@ -2250,7 +2259,7 @@ async fn test_repo_settings_publish_and_effective_config() {
     assert_eq!(rev, 1);
     assert_eq!(handle.manifest().head_seq, 1);
     assert_eq!(handle.effective_config().packs.geometric_factor, 3);
-    let log = handle.read_log(1, None).await.unwrap();
+    let log = handle.read_log(&handle.manifest(), 1, None).await.unwrap();
     assert_eq!(log[0].kind(), walgit_proto::v1::EntryKind::Settings);
     assert_eq!(log[0].settings.as_ref().unwrap().author, "alice");
 
@@ -2339,7 +2348,10 @@ async fn test_repo_settings_bundle_removal_replays_without_losing_overrides() {
     );
     assert_eq!(effective.upstream.follow, ["refs/heads/release"]);
     assert_eq!(replayed.settings().unwrap().toml, saved);
-    let log = replayed.read_log(1, None).await.unwrap();
+    let log = replayed
+        .read_log(&replayed.fresh_manifest().await.unwrap(), 1, None)
+        .await
+        .unwrap();
     assert_eq!(log[0].settings.as_ref().unwrap().toml, saved);
     assert!(
         replayed
@@ -2416,7 +2428,10 @@ async fn test_checkpoint_carries_first_state_and_as_of() {
         "first state survives the checkpoint"
     );
     // refs_as_of between as_of and the write time: the checkpoint applies.
-    let (snap, seq) = h2.refs_as_of(t("2026-08-06T00:00:00Z")).await.unwrap();
+    let (snap, seq) = h2
+        .refs_as_of(&h2.manifest(), t("2026-08-06T00:00:00Z"))
+        .await
+        .unwrap();
     assert_eq!(seq, 2);
     assert_eq!(
         snap.refs
@@ -2644,7 +2659,10 @@ async fn test_checkpoint_times_come_from_the_object_when_the_ref_has_none() {
         "learned from the checkpoint object"
     );
     // A slot after the import but before the next entry = the import state (seq 1), never "nothing".
-    let (snap, seq) = h2.refs_as_of(t("2026-08-19T23:00:00Z")).await.unwrap();
+    let (snap, seq) = h2
+        .refs_as_of(&h2.manifest(), t("2026-08-19T23:00:00Z"))
+        .await
+        .unwrap();
     assert_eq!(seq, 1);
     assert_eq!(
         snap.refs
@@ -2655,10 +2673,16 @@ async fn test_checkpoint_times_come_from_the_object_when_the_ref_has_none() {
         c1
     );
     // Before the import: nothing.
-    let (_, seq) = h2.refs_as_of(t("2026-08-19T20:00:00Z")).await.unwrap();
+    let (_, seq) = h2
+        .refs_as_of(&h2.manifest(), t("2026-08-19T20:00:00Z"))
+        .await
+        .unwrap();
     assert_eq!(seq, 0);
     // After the later entry: that entry.
-    let (snap, seq) = h2.refs_as_of(t("2026-08-21T04:00:00Z")).await.unwrap();
+    let (snap, seq) = h2
+        .refs_as_of(&h2.manifest(), t("2026-08-21T04:00:00Z"))
+        .await
+        .unwrap();
     assert_eq!(seq, 2);
     assert_eq!(
         snap.refs
@@ -2811,7 +2835,14 @@ async fn noop_receipts_never_claim_a_siblings_log_entry() {
     assert_eq!(rejected.seq, 0);
     assert!(rejected.per_ref.iter().all(|(_, status)| status.is_err()));
     assert_eq!(handle.manifest().head_seq, 2);
-    assert_eq!(handle.read_log(1, None).await.unwrap().len(), 2);
+    assert_eq!(
+        handle
+            .read_log(&handle.manifest(), 1, None)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
     let refused = handle
         .publish_push(
             None,
@@ -2907,7 +2938,14 @@ async fn lost_cas_reply_is_resolved_or_unknown_without_losing_the_commit() {
             Some(tip.clone())
         );
     }
-    assert_eq!(handle.read_log(1, None).await.unwrap().len(), 3);
+    assert_eq!(
+        handle
+            .read_log(&handle.manifest(), 1, None)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
 }
 
 #[tokio::test]

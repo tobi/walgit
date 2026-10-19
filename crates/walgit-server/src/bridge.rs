@@ -138,7 +138,7 @@ impl Bridge {
         };
 
         if head > from {
-            let entries = handle.read_log(from + 1, Some(head)).await?;
+            let entries = handle.read_log(&manifest, from + 1, Some(head)).await?;
             let mut batch = Vec::new();
             events::refs_from_entries(id, &entries, &mut batch);
             // A failing sink returns here: cursor untouched, retried on the

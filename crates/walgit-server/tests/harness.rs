@@ -192,7 +192,9 @@ impl Server {
     ) -> Result<Vec<walgit_proto::v1::LogEntry>> {
         let id = walgit_git::RepoId::new(owner, repo)?;
         let handle = self.registry.open(&id).await?;
-        Ok(handle.read_log(1, None).await?)
+        Ok(handle
+            .read_log(&*handle.fresh_manifest().await?, 1, None)
+            .await?)
     }
 
     /// True when the instance's local copy of the repo has its pack set.

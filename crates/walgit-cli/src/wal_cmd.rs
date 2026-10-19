@@ -23,7 +23,8 @@ pub async fn run(action: WalAction, cfg: &Arc<Config>) -> Result<()> {
             let (owner, name) = parse_repo_id(&repo)?;
             let id = walgit_git::RepoId::new(owner, name)?;
             let handle = registry.open(&id).await?;
-            let entries = handle.read_log(from.unwrap_or(0), to).await?;
+            let manifest = handle.fresh_manifest().await?;
+            let entries = handle.read_log(&manifest, from.unwrap_or(0), to).await?;
 
             if entries.is_empty() {
                 println!("(no WAL entries)");
@@ -136,7 +137,8 @@ pub async fn run(action: WalAction, cfg: &Arc<Config>) -> Result<()> {
             let (owner, name) = parse_repo_id(&repo)?;
             let id = walgit_git::RepoId::new(owner, name)?;
             let handle = registry.open(&id).await?;
-            let entries = handle.read_log(seq, Some(seq)).await?;
+            let manifest = handle.fresh_manifest().await?;
+            let entries = handle.read_log(&manifest, seq, Some(seq)).await?;
 
             let entry = entries
                 .into_iter()
@@ -289,11 +291,17 @@ pub async fn materialize_at(
             }
         }
         if at_seq >= manifest.min_seq {
-            found.extend(handle.read_log(manifest.min_seq, Some(at_seq)).await?);
+            found.extend(
+                handle
+                    .read_log(&manifest, manifest.min_seq, Some(at_seq))
+                    .await?,
+            );
         }
         found
     } else {
-        handle.read_log(start_seq + 1, Some(at_seq)).await?
+        handle
+            .read_log(&manifest, start_seq + 1, Some(at_seq))
+            .await?
     };
     info!(entries = entries.len(), "replaying log entries");
     for entry in &entries {

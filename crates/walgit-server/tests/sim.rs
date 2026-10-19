@@ -501,7 +501,7 @@ async fn check_truth(c: &Cluster, pushers: &[Pusher]) -> Result<()> {
         }
     }
     let log = handle
-        .read_log(cp_seq + 1, None)
+        .read_log(&manifest, cp_seq + 1, None)
         .await
         .context("observer read_log")?;
     ensure!(
