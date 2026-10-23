@@ -1,9 +1,10 @@
 //! Bounded maintenance from committed state: checkpoints, repair, compaction and audits.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant, SystemTime};
 
+use parking_lot::Mutex;
 use prost::Message;
 use tracing::{Instrument, info, warn};
 use walgit_git::RepoId;
@@ -125,6 +126,47 @@ pub fn host_name(state: &AppState) -> String {
         .unwrap_or_else(|| walgit_store::coord::instance_id().to_string())
 }
 
+/// Consecutive failures per repository and the time its next unit may run.
+///
+/// A failing unit would otherwise be retried every pass; the exponential
+/// backoff keeps a broken repository from rewriting packs in a tight loop.
+static FAILURES: LazyLock<Mutex<HashMap<String, (u32, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn backoff_delay(failures: u32) -> Duration {
+    let minutes = 1u64 << failures.min(6);
+    Duration::from_secs(minutes.saturating_mul(60).min(3_600))
+}
+
+fn failure_ready(id: &RepoId) -> bool {
+    let now = Instant::now();
+    FAILURES
+        .lock()
+        .get(&id.to_string())
+        .is_none_or(|(_, until)| *until <= now)
+}
+
+fn record_failure(id: &RepoId) {
+    let mut failures = FAILURES.lock();
+    let entry = failures
+        .entry(id.to_string())
+        .or_insert((0, Instant::now()));
+    entry.0 = entry.0.saturating_add(1);
+    entry.1 = Instant::now() + backoff_delay(entry.0);
+    if entry.0.is_power_of_two() {
+        warn!(
+            repo = %id,
+            failures = entry.0,
+            retry_in = ?backoff_delay(entry.0),
+            "maintenance: backing off after repeated failures"
+        );
+    }
+}
+
+fn clear_failure(id: &RepoId) {
+    FAILURES.lock().remove(&id.to_string());
+}
+
 pub async fn next_unit(state: &Arc<AppState>, id: &RepoId) -> anyhow::Result<Unit> {
     if !state.cfg.placement.maintains(id.owner(), id.name()) {
         return Ok(Unit::NotAssigned);
@@ -235,6 +277,10 @@ pub async fn run_pass(state: &Arc<AppState>) -> anyhow::Result<PassReport> {
             break;
         }
         report.repos += 1;
+        if !failure_ready(&id) {
+            report.skipped += 1;
+            continue;
+        }
         let unit = match next_unit(state, &id).await {
             Ok(u) => u,
             Err(e) => {
@@ -300,8 +346,10 @@ pub async fn run_pass(state: &Arc<AppState>) -> anyhow::Result<PassReport> {
         if done {
             report.units += 1;
             report.last_unit = Some(format!("{id} {unit:?}"));
+            clear_failure(&id);
         } else {
             report.skipped += 1;
+            record_failure(&id);
         }
     }
     Ok(report)
@@ -426,5 +474,18 @@ async fn run_op_value(
             None
         }
         None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::backoff_delay;
+    use std::time::Duration;
+
+    #[test]
+    fn backoff_grows_and_is_capped() {
+        assert_eq!(backoff_delay(1), Duration::from_mins(2));
+        assert_eq!(backoff_delay(2), Duration::from_mins(4));
+        assert_eq!(backoff_delay(10), Duration::from_hours(1));
     }
 }

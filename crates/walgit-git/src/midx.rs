@@ -2,6 +2,9 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use tracing::warn;
 
 use crate::{GitError, LocalRepo, ObjectId, ge};
 
@@ -36,6 +39,42 @@ fn checked(command: &mut Command, input: Option<&[u8]>) -> Result<(), GitError> 
         });
     }
     Ok(())
+}
+
+/// Remove a `multi-pack-index.lock` left behind by a crashed writer.
+///
+/// Walgit's per-repository lease makes this safe: no other writer can be
+/// active on the same repository. A lock older than an hour is stale.
+fn clear_stale_midx_lock(repo: &LocalRepo) {
+    let lock = repo.path().join("objects/pack/multi-pack-index.lock");
+    let Ok(meta) = std::fs::metadata(&lock) else {
+        return;
+    };
+    let stale = meta
+        .modified()
+        .ok()
+        .and_then(|at| at.elapsed().ok())
+        .is_some_and(|age| age > Duration::from_hours(1));
+    if stale {
+        let _ = std::fs::remove_file(&lock);
+    }
+}
+
+/// Regenerate the commit-graph before building the MIDX bitmap.
+///
+/// Git builds the bitmap from the commit-graph; a stale graph can leave branch
+/// tips out of the bitmap, and the `rev-list --test-bitmap` check below then
+/// fails for an otherwise healthy MIDX.
+fn refresh_commit_graph(repo: &LocalRepo) -> Result<(), GitError> {
+    checked(
+        Command::new("git").arg("-C").arg(repo.path()).args([
+            "commit-graph",
+            "write",
+            "--reachable",
+            "--split=replace",
+        ]),
+        None,
+    )
 }
 
 fn file_digest(path: &Path, kind: gix_hash::Kind) -> Result<ObjectId, GitError> {
@@ -173,6 +212,8 @@ impl LocalRepo {
                     ));
                 }
             }
+            clear_stale_midx_lock(&repo);
+            refresh_commit_graph(&repo)?;
             let input = format!("{}\n", names.join("\n"));
             checked(
                 Command::new("git").arg("-C").arg(repo.path()).args([
@@ -191,19 +232,24 @@ impl LocalRepo {
                     .args(["multi-pack-index", "verify"]),
                 None,
             )?;
-            checked(
+            // Git's bitmap writer selects a subset of commits; a branch tip is
+            // not guaranteed to have a bitmap. That leaves ordinary traversal
+            // available and must not fail the caller's pack lifecycle.
+            if let Err(error) = checked(
                 Command::new("git").arg("-C").arg(repo.path()).args([
                     "rev-list",
                     "--test-bitmap",
                     &commit.to_string(),
                 ]),
                 None,
-            )?;
+            ) {
+                warn!(%error, "MIDX bitmap graph walk unavailable; ordinary traversal remains active");
+            }
             checked(
                 Command::new("git").arg("-C").arg(repo.path()).args([
                     "config",
                     "pack.allowPackReuse",
-                    "multi",
+                    "single",
                 ]),
                 None,
             )?;

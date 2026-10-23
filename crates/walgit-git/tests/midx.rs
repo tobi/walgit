@@ -47,9 +47,11 @@ async fn verifies_real_multi_pack_bitmap_and_rejects_missing_or_corrupt_bytes() 
             .await
             .unwrap();
         assert!(verified.bitmap_path.is_file());
+        // `multi` lets pack-objects reuse deltas across packs; a clone then
+        // gets a thin pack whose bases are absent. Keep reuse to one pack.
         assert_eq!(
             common::run_git(repo.path(), &["config", "pack.allowPackReuse"]).trim(),
-            "multi"
+            "single"
         );
         common::run_git(repo.path(), &["fsck", "--strict"]);
         let bytes = std::fs::read(&verified.bitmap_path).unwrap();
