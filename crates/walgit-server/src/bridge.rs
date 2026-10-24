@@ -32,10 +32,20 @@ use crate::events::{self, RefEvent, Sink};
 
 const CURSOR_KEY: &str = "events/cursor.json";
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PublishedRef {
+    name: String,
+    oid: String,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct Cursor {
     published_seq: u64,
     updated_at: String,
+    /// Refs as of `published_seq`. Older cursors have none: the bridge then
+    /// cannot reconstruct a gap, and stores them on its next successful pass.
+    #[serde(default)]
+    refs: Vec<PublishedRef>,
 }
 
 /// What one `catch_up` did.
@@ -113,29 +123,41 @@ impl Bridge {
         let (cursor, version) = match store.get_bytes(CURSOR_KEY).await? {
             Some((meta, bytes)) => {
                 let c: Cursor = serde_json::from_slice(&bytes).context("events/cursor.json")?;
-                (Some(c.published_seq), Some(meta.version))
+                (Some(c), Some(meta.version))
             }
             None => (None, None),
         };
-        let mut from = cursor.unwrap_or(readable_from);
+        // The local refs after `sync_refs`: used both to fill a gap and to
+        // remember what was published for the next gap.
+        let current = handle.local().refs().context("events bridge: local refs")?;
+        let mut from = cursor.as_ref().map_or(readable_from, |c| c.published_seq);
+        let mut emitted = 0usize;
         let mut gap = None;
         if from < readable_from {
             gap = Some([from + 1, readable_from]);
             metrics::counter!("events_bridge_gap_total", "repo" => id.to_string())
                 .increment(readable_from - from);
             tracing::warn!(repo = %id, first = from + 1, last = readable_from,
-                "events bridge: entries folded into a checkpoint before they were published; consumers backfill from the WAL");
+                "events bridge: entries folded into a checkpoint before they were published; publishing the refs that changed since the cursor");
+            if let Some(previous) = &cursor {
+                let previous = previous
+                    .refs
+                    .iter()
+                    .map(|r| (r.name.clone(), r.oid.clone()))
+                    .collect::<Vec<_>>();
+                let mut batch = Vec::new();
+                events::refs_from_gap(id, &previous, &current.refs, readable_from, &mut batch);
+                if !batch.is_empty() {
+                    // A failing sink returns here: cursor untouched, retried on
+                    // the next wake-up with the same synthetic events.
+                    self.publish(&batch).await?;
+                    emitted += batch.len();
+                }
+            }
             from = readable_from;
         }
         metrics::gauge!("events_bridge_lag_entries", "repo" => id.to_string())
             .set((head - from) as f64);
-        let mut report = CatchUp {
-            repo: id.to_string(),
-            from_seq: from,
-            head_seq: head,
-            emitted: 0,
-            gap,
-        };
 
         if head > from {
             let entries = handle.read_log(from + 1, Some(head)).await?;
@@ -144,13 +166,25 @@ impl Bridge {
             // A failing sink returns here: cursor untouched, retried on the
             // next wake-up.
             self.publish(&batch).await?;
-            report.emitted = batch.len();
+            emitted += batch.len();
         }
 
-        if cursor != Some(head) {
+        let refs = current
+            .refs
+            .iter()
+            .map(|r| PublishedRef {
+                name: r.name.clone(),
+                oid: r.oid.clone(),
+            })
+            .collect::<Vec<_>>();
+        let cursor_moved = cursor
+            .as_ref()
+            .map_or(true, |c| c.published_seq != head || c.refs != refs);
+        if cursor_moved {
             let body = serde_json::to_vec(&Cursor {
                 published_seq: head,
                 updated_at: Utc::now().to_rfc3339(),
+                refs,
             })?;
             let mode = match version {
                 Some(v) => PutMode::Update(v),
@@ -167,11 +201,16 @@ impl Bridge {
             }
         }
         metrics::gauge!("events_bridge_lag_entries", "repo" => id.to_string()).set(0.0);
-        if report.emitted > 0 {
-            tracing::info!(repo = %id, from = from, head = head, emitted = report.emitted,
-                "events bridge: published");
+        if emitted > 0 {
+            tracing::info!(repo = %id, from = from, head = head, emitted, "events bridge: published");
         }
-        Ok(report)
+        Ok(CatchUp {
+            repo: id.to_string(),
+            from_seq: from,
+            head_seq: head,
+            emitted,
+            gap,
+        })
     }
 
     /// Every repo (a `list` + one conditional manifest GET each): the backstop
