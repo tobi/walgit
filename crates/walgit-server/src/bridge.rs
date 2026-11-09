@@ -344,9 +344,9 @@ pub async fn http_notify(
 fn auth_err(e: crate::auth::AuthError) -> crate::error::ApiError {
     use crate::error::ApiError;
     match e {
-        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
-            ApiError::Unauthorized
-        }
+        crate::auth::AuthError::Invalid
+        | crate::auth::AuthError::EmailUnverified
+        | crate::auth::AuthError::Unauthorized => ApiError::Unauthorized,
         crate::auth::AuthError::Forbidden => ApiError::Forbidden,
         crate::auth::AuthError::Unavailable => {
             ApiError::ServiceUnavailable("auth provider unavailable".into())

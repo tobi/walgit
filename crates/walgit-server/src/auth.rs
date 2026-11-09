@@ -809,7 +809,7 @@ impl Authenticator {
             .claims;
         if !claims.email_verified {
             tracing::debug!(email = %claims.email, "ID token email is not verified");
-            return Err(AuthError::Invalid);
+            return Err(AuthError::EmailUnverified);
         }
         tracing::debug!(iss = %claims.iss, aud = ?claims.aud, email = %claims.email, "ID token validated");
         self.principal_for_email(claims.email)
@@ -863,6 +863,7 @@ struct IdClaims {
 #[derive(Debug)]
 pub enum AuthError {
     Invalid,
+    EmailUnverified,
     Unauthorized,
     Forbidden,
     Unavailable,
@@ -871,7 +872,9 @@ pub enum AuthError {
 impl AuthError {
     pub fn status(&self) -> StatusCode {
         match self {
-            AuthError::Invalid | AuthError::Unauthorized => StatusCode::UNAUTHORIZED,
+            AuthError::Invalid | AuthError::EmailUnverified | AuthError::Unauthorized => {
+                StatusCode::UNAUTHORIZED
+            }
             AuthError::Forbidden => StatusCode::FORBIDDEN,
             AuthError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
@@ -1245,7 +1248,6 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         for (iss, email, verified, aud) in [
             ("bad", "dev@example.com", true, AUD),
             (ISSUER, "dev@other.com", true, AUD),
-            (ISSUER, "dev@example.com", false, AUD),
             (ISSUER, "dev@example.com", true, "wrong"),
         ] {
             let h = bearer(&token(email, iss, aud, 4_000_000_000, verified));
@@ -1254,6 +1256,10 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                 Err(AuthError::Invalid | AuthError::Forbidden)
             ));
         }
+        let unverified = bearer(&token("dev@example.com", ISSUER, AUD, 4_000_000_000, false));
+        let error = auth.authenticate(&unverified).await.unwrap_err();
+        assert!(matches!(error, AuthError::EmailUnverified));
+        assert_eq!(error.status(), StatusCode::UNAUTHORIZED);
         let expired = bearer(&token("dev@example.com", ISSUER, AUD, 1, true));
         assert!(matches!(
             auth.authenticate(&expired).await,
@@ -1328,7 +1334,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         .unwrap();
         assert!(matches!(
             auth.authenticate(&bearer(&token)).await,
-            Err(AuthError::Invalid)
+            Err(AuthError::EmailUnverified)
         ));
     }
 

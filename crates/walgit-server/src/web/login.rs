@@ -286,6 +286,14 @@ async fn callback(
     };
     let principal = match st.auth.verify_login_id_token(&id_token).await {
         Ok(p) => p,
+        Err(crate::auth::AuthError::EmailUnverified) => {
+            let retry_url = format!(
+                "{}/_auth/login?next={}",
+                crate::smart::request_base_url(&st, &headers),
+                urlencode(&next),
+            );
+            return email_verification_response(&retry_url);
+        }
         Err(crate::auth::AuthError::Forbidden) => {
             return (
                 StatusCode::FORBIDDEN,
@@ -527,6 +535,29 @@ async fn tokens_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Res
     r
 }
 
+fn email_verification_response(retry_url: &str) -> Response {
+    let html = EMAIL_VERIFICATION_PAGE.replace("{{retry_url}}", &html_escape(retry_url));
+    let mut response = (StatusCode::UNAUTHORIZED, axum::response::Html(html)).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+const EMAIL_VERIFICATION_PAGE: &str = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verify your email to sign in</title>
+<style>
+body{font:16px/1.5 system-ui,sans-serif;max-width:36rem;margin:4rem auto;padding:0 1.5rem;color:#1a1a1a}
+a{display:inline-block;padding:.6rem 1.2rem;border:1px solid currentColor;border-radius:999px;color:inherit;text-decoration:none}
+a:focus-visible{outline:2px solid currentColor;outline-offset:3px}
+@media(prefers-color-scheme:dark){body{background:#1a1a1a;color:#f4f4f5}}
+</style></head><body>
+<h1>Verify your email to sign in</h1>
+<p>Your sign-in provider has not verified your email address. Complete email verification with your provider, then sign in again.</p>
+<a href="{{retry_url}}">Sign in again</a>
+</body></html>"#;
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -573,5 +604,160 @@ fn cookie_site(st: &AppState, secure: bool) -> &'static str {
         "SameSite=Lax; Secure"
     } else {
         "SameSite=Lax"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Form, Json, body::Body, http::Request, routing::post};
+    use base64::Engine;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
+    use serde_json::json;
+    use std::collections::HashMap;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn callback_explains_unverified_email_after_validating_the_token() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let other_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some("test".into());
+        let tokens: HashMap<_, _> = [
+            ("unverified", false, "browser", &key),
+            ("verified", true, "browser", &key),
+            ("wrong-audience", false, "another-client", &key),
+            ("forged", false, "browser", &other_key),
+        ]
+        .into_iter()
+        .map(|(code, verified, audience, signing_key)| {
+            let token = jsonwebtoken::encode(
+                &header,
+                &json!({
+                    "iss": issuer, "aud": audience, "exp": now() + 3600,
+                    "email": "member@example.com", "email_verified": verified,
+                }),
+                &EncodingKey::from_ed_der(&signing_key.serialize_der()),
+            )
+            .unwrap();
+            (code, token)
+        })
+        .collect();
+        let discovery = json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "jwks_uri": format!("{issuer}/keys"),
+        });
+        let jwks = json!({"keys": [{
+            "kid": "test", "kty": "OKP", "crv": "Ed25519",
+            "x": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.public_key_raw()),
+        }]});
+        let provider = Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                get(async move || Json(discovery)),
+            )
+            .route("/keys", get(async move || Json(jwks)))
+            .route(
+                "/token",
+                post(async move |Form(form): Form<HashMap<String, String>>| {
+                    Json(json!({"id_token": tokens[form["code"].as_str()]}))
+                }),
+            );
+        let provider_task = tokio::spawn(async move {
+            axum::serve(listener, provider).await.unwrap();
+        });
+        let cache = tempfile::tempdir().unwrap();
+        let mut cfg = walgit_config::Config::default();
+        cfg.cache.dir = cache.path().into();
+        cfg.server.public_url = Some("https://git.example.com/git".into());
+        cfg.server.auth.mode = walgit_config::AuthMode::Oidc;
+        cfg.server.auth.issuer = issuer;
+        cfg.server.auth.allowed_domains = vec!["example.com".into()];
+        cfg.server.auth.oauth_client_id = Some("browser".into());
+        cfg.server.auth.oauth_client_secret = Some("test-client-secret".into());
+        cfg.server.auth.session_secret = Some("test-session-secret-at-least-32-bytes".into());
+        // The local fake provider uses HTTP. Production config still requires HTTPS.
+        let state = AppState::new(Arc::new(cfg), walgit_store::memory::MemoryStore::shared())
+            .await
+            .unwrap();
+        let app = router(state);
+        for code in ["unverified", "verified", "wrong-audience", "forged"] {
+            let login = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/_auth/login?next=%2F_auth%2Ftokens")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let location =
+                reqwest::Url::parse(login.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+            let signed_state = location
+                .query_pairs()
+                .find(|(name, _)| name == "state")
+                .unwrap()
+                .1
+                .into_owned();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/_auth/callback?code={code}&state={}",
+                            urlencode(&signed_state)
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if code == "verified" {
+                assert_eq!(response.status(), StatusCode::SEE_OTHER);
+                assert!(response.headers().contains_key(header::SET_COOKIE));
+                assert_eq!(response.headers()[header::LOCATION], "/_auth/tokens");
+                continue;
+            }
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert!(!response.headers().contains_key(header::SET_COOKIE));
+            if code == "unverified" {
+                assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+                assert_eq!(
+                    response.headers()[header::CONTENT_TYPE],
+                    "text/html; charset=utf-8"
+                );
+            }
+            let body = axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap();
+            let text = std::str::from_utf8(&body).unwrap();
+            if code == "unverified" {
+                assert!(text.contains("<h1>Verify your email to sign in</h1>"));
+                assert!(text.contains("Complete email verification with your provider"));
+                assert!(text.contains(
+                    "href=\"https://git.example.com/git/_auth/login?next=%2F_auth%2Ftokens\""
+                ));
+                assert!(text.contains(">Sign in again</a>"));
+            } else {
+                assert_eq!(text, "sign-in failed: token rejected");
+            }
+        }
+        provider_task.abort();
+    }
+
+    #[tokio::test]
+    async fn email_verification_page_escapes_the_retry_link() {
+        let response = email_verification_response("/login?next=\"<script>&");
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("href=\"/login?next=&quot;&lt;script&gt;&amp;\""));
+        assert!(!text.contains("<script>"));
     }
 }
