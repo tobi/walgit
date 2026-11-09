@@ -712,9 +712,9 @@ async fn ensure_repo(st: &AppState, route: &RepoRoute) -> Result<(), ApiError> {
 
 fn auth_err(e: crate::auth::AuthError) -> ApiError {
     match e {
-        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
-            ApiError::Unauthorized
-        }
+        crate::auth::AuthError::Invalid
+        | crate::auth::AuthError::EmailUnverified
+        | crate::auth::AuthError::Unauthorized => ApiError::Unauthorized,
         crate::auth::AuthError::Forbidden => ApiError::Forbidden,
         crate::auth::AuthError::Unavailable => {
             ApiError::ServiceUnavailable("auth provider unavailable".into())
