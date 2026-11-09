@@ -222,7 +222,9 @@ pub const REPO_API_BASES: [&str; 2] = ["/{owner}/{repo}/api", "/{owner}/{repo}/a
 
 pub(crate) fn auth_err(e: AuthError) -> ApiError {
     match e {
-        AuthError::Invalid | AuthError::Unauthorized => ApiError::Unauthorized,
+        AuthError::Invalid | AuthError::EmailUnverified | AuthError::Unauthorized => {
+            ApiError::Unauthorized
+        }
         AuthError::Forbidden => ApiError::Forbidden,
         AuthError::Unavailable => ApiError::ServiceUnavailable("auth provider unavailable".into()),
     }

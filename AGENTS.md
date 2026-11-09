@@ -79,7 +79,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
   **`token`** (static tokens from the config, as `Authorization: Bearer` or an HTTP Basic password), **`oidc`**
   (any OpenID Connect issuer via discovery). In `oidc` mode `anonymous_read` must be false and an allowlist
   (`allowed_domains`/`allowed_emails`) must exist; three credentials are accepted — an ID token from the issuer
-  (RS256/ES256, `iss`, `exp`, `aud` ∈ `audiences` ∪ {`oauth_client_id`}, `email_verified`), a **walgit access
+  (RS256/ES256/EdDSA, `iss`, `exp`, `aud` ∈ `audiences` ∪ {`oauth_client_id`}, `email_verified`), a **walgit access
   token** (`wgt_…`, HMAC-signed with `session_secret`, minted at `/_auth/tokens` by a signed-in browser, stateless,
   `access_token_ttl`; rotating the secret revokes all), and the HMAC **session cookie** set by `/_auth/login` →
   issuer → `/_auth/callback`. Static `tokens` work in `oidc` mode too (robots). Every path ends in the same

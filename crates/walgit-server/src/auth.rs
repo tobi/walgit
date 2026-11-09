@@ -4,7 +4,7 @@
 //! * **`token`** — static tokens from the config, presented as `Authorization:
 //!   Bearer <token>` or as the password of HTTP Basic (any user name).
 //! * **`oidc`** — any `OpenID` Connect issuer. Three credentials are accepted:
-//!   1. an **ID token** from the issuer in `Authorization: Bearer` (RS256/ES256,
+//!   1. an **ID token** from the issuer in `Authorization: Bearer` (RS256/ES256/EdDSA,
 //!      signature against the issuer's JWKS, `iss`, `exp`, `aud` ∈ `audiences` ∪
 //!      {`oauth_client_id`}, `email_verified`), for CLIs that can mint one;
 //!   2. a **walgit access token** (`wgt_…`, minted at `/_auth/tokens` by a
@@ -72,7 +72,7 @@ impl Principal {
     }
 }
 
-/// A JWKS public key: RSA or EC P-256.
+/// A JWKS public key: RSA, EC P-256, or Ed25519.
 #[derive(Debug, Clone)]
 pub enum JwksKey {
     Rsa {
@@ -86,12 +86,18 @@ pub enum JwksKey {
         x: String,
         y: String,
     },
+    Ed25519 {
+        kid: String,
+        x: String,
+    },
 }
 
 impl JwksKey {
     pub fn kid(&self) -> &str {
         match self {
-            JwksKey::Rsa { kid, .. } | JwksKey::Ec { kid, .. } => kid,
+            JwksKey::Rsa { kid, .. } | JwksKey::Ec { kid, .. } | JwksKey::Ed25519 { kid, .. } => {
+                kid
+            }
         }
     }
 
@@ -108,6 +114,9 @@ impl JwksKey {
                     .map(|k| (k, Algorithm::ES256))
                     .map_err(|err| format!("invalid EC JWKS key {kid}: {err}"))
             }
+            JwksKey::Ed25519 { kid, x } => DecodingKey::from_ed_components(x)
+                .map(|key| (key, Algorithm::EdDSA))
+                .map_err(|err| format!("invalid Ed25519 JWKS key {kid}: {err}")),
         }
     }
 }
@@ -196,6 +205,9 @@ impl Jwk {
                 x: self.x?,
                 y: self.y?,
             }),
+            "OKP" if self.crv.as_deref() == Some("Ed25519") => {
+                Some(JwksKey::Ed25519 { kid, x: self.x? })
+            }
             _ => None,
         }
     }
@@ -763,7 +775,10 @@ impl Authenticator {
             tracing::debug!(error = %e, token_len = token.len(), "ID token header decode failed");
             AuthError::Invalid
         })?;
-        if !matches!(header.alg, Algorithm::RS256 | Algorithm::ES256) {
+        if !matches!(
+            header.alg,
+            Algorithm::RS256 | Algorithm::ES256 | Algorithm::EdDSA
+        ) {
             tracing::debug!(alg = ?header.alg, "ID token algorithm rejected");
             return Err(AuthError::Invalid);
         }
@@ -794,7 +809,7 @@ impl Authenticator {
             .claims;
         if !claims.email_verified {
             tracing::debug!(email = %claims.email, "ID token email is not verified");
-            return Err(AuthError::Invalid);
+            return Err(AuthError::EmailUnverified);
         }
         tracing::debug!(iss = %claims.iss, aud = ?claims.aud, email = %claims.email, "ID token validated");
         self.principal_for_email(claims.email)
@@ -848,6 +863,7 @@ struct IdClaims {
 #[derive(Debug)]
 pub enum AuthError {
     Invalid,
+    EmailUnverified,
     Unauthorized,
     Forbidden,
     Unavailable,
@@ -856,7 +872,9 @@ pub enum AuthError {
 impl AuthError {
     pub fn status(&self) -> StatusCode {
         match self {
-            AuthError::Invalid | AuthError::Unauthorized => StatusCode::UNAUTHORIZED,
+            AuthError::Invalid | AuthError::EmailUnverified | AuthError::Unauthorized => {
+                StatusCode::UNAUTHORIZED
+            }
             AuthError::Forbidden => StatusCode::FORBIDDEN,
             AuthError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
@@ -1230,7 +1248,6 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         for (iss, email, verified, aud) in [
             ("bad", "dev@example.com", true, AUD),
             (ISSUER, "dev@other.com", true, AUD),
-            (ISSUER, "dev@example.com", false, AUD),
             (ISSUER, "dev@example.com", true, "wrong"),
         ] {
             let h = bearer(&token(email, iss, aud, 4_000_000_000, verified));
@@ -1239,6 +1256,10 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                 Err(AuthError::Invalid | AuthError::Forbidden)
             ));
         }
+        let unverified = bearer(&token("dev@example.com", ISSUER, AUD, 4_000_000_000, false));
+        let error = auth.authenticate(&unverified).await.unwrap_err();
+        assert!(matches!(error, AuthError::EmailUnverified));
+        assert_eq!(error.status(), StatusCode::UNAUTHORIZED);
         let expired = bearer(&token("dev@example.com", ISSUER, AUD, 1, true));
         assert!(matches!(
             auth.authenticate(&expired).await,
@@ -1253,6 +1274,77 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             true,
         ));
         assert!(auth.authenticate(&bare).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn ed25519_id_token_verifies_signature_and_claims() {
+        use base64::Engine;
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let jwk: Jwk = serde_json::from_value(serde_json::json!({
+            "kid": "ed25519", "kty": "OKP", "crv": "Ed25519",
+            "x": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.public_key_raw()),
+        }))
+        .unwrap();
+        let source = Arc::new(MockSource {
+            calls: AtomicUsize::new(0),
+            response: Mutex::new(Ok(JwksResponse {
+                keys: vec![jwk.into_key().unwrap()],
+                max_age: Duration::from_hours(1),
+            })),
+        });
+        let auth = Authenticator::with_key_source(&config(), source);
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some("ed25519".into());
+        let claims = TestClaims {
+            iss: ISSUER,
+            aud: AUD,
+            exp: 4_000_000_000,
+            email: "dev@example.com",
+            email_verified: true,
+        };
+        let token = encode(
+            &header,
+            &claims,
+            &EncodingKey::from_ed_der(&key.serialize_der()),
+        )
+        .unwrap();
+        let principal = auth.authenticate(&bearer(&token)).await.unwrap();
+        assert_eq!(principal.name, "dev@example.com");
+        assert!(principal.write);
+        let other = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let forged = encode(
+            &header,
+            &claims,
+            &EncodingKey::from_ed_der(&other.serialize_der()),
+        )
+        .unwrap();
+        assert!(matches!(
+            auth.authenticate(&bearer(&forged)).await,
+            Err(AuthError::Invalid)
+        ));
+        let unverified = TestClaims {
+            email_verified: false,
+            ..claims
+        };
+        let token = encode(
+            &header,
+            &unverified,
+            &EncodingKey::from_ed_der(&key.serialize_der()),
+        )
+        .unwrap();
+        assert!(matches!(
+            auth.authenticate(&bearer(&token)).await,
+            Err(AuthError::EmailUnverified)
+        ));
+    }
+
+    #[test]
+    fn unsupported_okp_curve_is_ignored() {
+        let jwk: Jwk = serde_json::from_value(serde_json::json!({
+            "kid": "x25519", "kty": "OKP", "crv": "X25519", "x": "AAAA",
+        }))
+        .unwrap();
+        assert!(jwk.into_key().is_none());
     }
 
     #[tokio::test]
